@@ -21,10 +21,14 @@
 #include <login_cap.h>
 #include <errno.h>
 
+int _descrypt_checkpass(const char *, const char *);
+int _md5crypt_checkpass(const char *, const char *);
+
 int
 crypt_checkpass(const char *pass, const char *goodhash)
 {
 	char dummy[_PASSWORD_LEN];
+	extern char *md5crypt(const char *, const char *);
 
 	if (goodhash == NULL) {
 		/* fake it */
@@ -35,8 +39,19 @@ crypt_checkpass(const char *pass, const char *goodhash)
 	if (strlen(goodhash) == 0 && strlen(pass) == 0)
 		return 0;
 
-	if (goodhash[0] == '$' && goodhash[1] == '2') {
-		if (bcrypt_checkpass(pass, goodhash))
+	if (goodhash[0] == '$')
+		switch (goodhash[1]) {
+		case '1':
+			if (_md5crypt_checkpass(pass, goodhash))
+				goto fail;
+			return 0;
+		case '2':
+			if (bcrypt_checkpass(pass, goodhash))
+				goto fail;
+			return 0;
+		}
+	else {
+		if (_descrypt_checkpass(pass, goodhash))
 			goto fail;
 		return 0;
 	}
