@@ -25,6 +25,7 @@ int
 crypt_checkpass(const char *pass, const char *goodhash)
 {
 	char dummy[_PASSWORD_LEN];
+	extern char *md5crypt(const char *, const char *);
 
 	if (goodhash == NULL) {
 		/* fake it */
@@ -37,6 +38,10 @@ crypt_checkpass(const char *pass, const char *goodhash)
 
 	if (goodhash[0] == '$' && goodhash[1] == '2') {
 		if (bcrypt_checkpass(pass, goodhash))
+			goto fail;
+		return 0;
+	} else if (goodhash[0] == '$' && goodhash[1] == '1') {
+		if (memcmp(goodhash, md5crypt(pass, goodhash), strlen(goodhash)))
 			goto fail;
 		return 0;
 	}
