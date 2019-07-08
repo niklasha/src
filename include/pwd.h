@@ -113,6 +113,7 @@ char		*bcrypt(const char *, const char *);
 int		bcrypt_newhash(const char *, int, char *, size_t);
 int		bcrypt_checkpass(const char *, const char *);
 struct passwd	*pw_dup(const struct passwd *);
+char		*md5crypt(const char *, const char *);
 #endif
 __END_DECLS
 

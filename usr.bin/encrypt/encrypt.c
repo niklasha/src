@@ -1,4 +1,4 @@
-/*	$OpenBSD: encrypt.c,v 1.52 2022/02/10 13:06:46 robert Exp $	*/
+/*	$OpenBSD: encrypt.c,v 1.30 2013/11/12 13:54:51 deraadt Exp $	*/
 
 /*
  * Copyright (c) 1996, Jason Downs.  All rights reserved.
@@ -49,15 +49,30 @@ static void __dead	usage(void);
 static void		print_passwd(char *, int, char *);
 
 #define DO_BLF		0
+#define DO_MD5		1
 
 static void __dead
 usage(void)
 {
 
 	(void)fprintf(stderr,
-	    "usage: %s [-b rounds] [-c class] [-p | string]\n",
+	    "usage: %s [-m] [-b rounds] [-c class] [-p | string]\n",
 	    __progname);
 	exit(1);
+}
+
+static unsigned char itoa64[] =		/* 0 ... 63 => ascii - 64 */
+	"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+static void to64(char *, u_int32_t, int);
+
+static void
+to64(char *s, u_int32_t v, int n)
+{
+	while (--n >= 0) {
+		*s++ = itoa64[v&0x3f];
+		v >>= 6;
+	}
 }
 
 static void
@@ -66,24 +81,34 @@ print_passwd(char *string, int operation, char *extra)
 	char buffer[_PASSWORD_LEN];
 	const char *pref;
 	char prefbuf[64];
-
-	if (operation == DO_BLF) {
-		if (snprintf(prefbuf, sizeof(prefbuf), "blowfish,%s", extra) >=
-		    sizeof(prefbuf))
-			errx(1, "pref too long");
-		pref = prefbuf;
+	char *pw;
+	
+	if (operation == DO_MD5) {
+		strlcpy(buffer, "$1$", sizeof buffer);
+		to64(&buffer[3], arc4random(), 4);
+		to64(&buffer[7], arc4random(), 4);
+		strlcpy(buffer + 11, "$", sizeof buffer - 11);
+		pw = md5crypt(string, buffer);
+		fputs(pw, stdout);
 	} else {
-		login_cap_t *lc;
+		if (operation == DO_BLF) {
+			if (snprintf(prefbuf, sizeof(prefbuf), "blowfish,%s", extra) >=
+			    sizeof(prefbuf))
+				errx(1, "pref too long");
+			pref = prefbuf;
+		} else {
+			login_cap_t *lc;
 
-		if ((lc = login_getclass(extra)) == NULL)
-			errx(1, "unable to get login class `%s'",
-			    extra ? (char *)extra : "default");
-		pref = login_getcapstr(lc, "localcipher", NULL, NULL);
+			if ((lc = login_getclass(extra)) == NULL)
+				errx(1, "unable to get login class `%s'",
+				    extra ? (char *)extra : "default");
+			pref = login_getcapstr(lc, "localcipher", NULL, NULL);
+		}
+		if (crypt_newhash(string, pref, buffer, sizeof(buffer)) != 0)
+			err(1, "can't generate hash");
+
+		fputs(buffer, stdout);
 	}
-	if (crypt_newhash(string, pref, buffer, sizeof(buffer)) != 0)
-		err(1, "can't generate hash");
-
-	fputs(buffer, stdout);
 }
 
 int
@@ -104,7 +129,7 @@ main(int argc, char **argv)
 	if (pledge("stdio rpath tty", NULL) == -1)
 		err(1, "pledge");
 
-	while ((opt = getopt(argc, argv, "pb:c:")) != -1) {
+	while ((opt = getopt(argc, argv, "mpb:c:")) != -1) {
 		switch (opt) {
 		case 'p':
 			prompt = 1;
@@ -124,6 +149,11 @@ main(int argc, char **argv)
 		case 'c':                       /* user login class */
 			extra = optarg;
 			operation = -1;
+			break;
+		case 'm':
+			if (operation != -1)
+				usage();
+			operation = DO_MD5;
 			break;
 		default:
 			usage();

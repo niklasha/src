@@ -37,7 +37,8 @@
 .Sh NAME
 .Nm crypt ,
 .Nm bcrypt_gensalt ,
-.Nm bcrypt
+.Nm bcrypt ,
+.Nm md5crypt
 .Nd password hashing
 .Sh SYNOPSIS
 .In stdlib.h
@@ -50,6 +51,8 @@
 .Fn bcrypt_gensalt "u_int8_t log_rounds"
 .Ft char *
 .Fn bcrypt "const char *key" "const char *salt"
+.Ft char *
+.Fn md5crypt "const char *key" "const char *salt"
 .Sh DESCRIPTION
 These functions are deprecated in favor of
 .Xr crypt_checkpass 3
@@ -75,9 +78,29 @@ If it begins
 with a string character
 .Pq Ql $
 and a number then a different algorithm is used depending on the number.
-At the moment
+At the moment a
+.Ql $1
+chooses MD5 hashing and a
 .Ql $2
 chooses Blowfish hashing; see below for more information.
+.Ss MD5 crypt
+For
+.Tn MD5
+crypt the version number,
+.Fa salt
+and the hashed password are separated by the
+.Ql $
+character.
+The maximum length of a password is limited by
+the length counter of the MD5 context, which is about
+2**64.
+A valid MD5 password entry looks like this:
+.Pp
+.Dq $1$caeiHQwX$hsKqOjrFRRN6K32OWkCBf1 .
+.Pp
+The whole MD5 password string is passed as
+.Fa setting
+for interpretation.
 .Ss Blowfish crypt
 The Blowfish version of crypt has 128 bits of
 .Fa salt
