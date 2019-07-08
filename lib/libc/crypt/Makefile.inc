@@ -3,6 +3,7 @@
 .PATH: ${LIBCSRCDIR}/arch/${MACHINE_CPU}/crypt ${LIBCSRCDIR}/crypt
 
 SRCS+=	crypt.c cryptutil.c arc4random.c arc4random_uniform.c \
-	blowfish.c bcrypt.c
+	blowfish.c bcrypt.c md5crypt.c descrypt.c
 
 MAN+=	crypt.3 crypt_checkpass.3 blowfish.3 arc4random.3
+MLINKS+=crypt.3 md5crypt.3

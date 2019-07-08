@@ -859,6 +859,7 @@ blf_key
 crypt
 crypt_checkpass
 crypt_newhash
+md5crypt
 
 /* gdtoa */
 __dtoa

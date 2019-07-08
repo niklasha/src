@@ -29,6 +29,7 @@ PROTO_NORMAL(bcrypt);
 PROTO_NORMAL(bcrypt_checkpass);
 PROTO_DEPRECATED(bcrypt_gensalt);
 PROTO_NORMAL(bcrypt_newhash);
+PROTO_NORMAL(md5crypt);
 PROTO_DEPRECATED(endpwent);
 PROTO_DEPRECATED(getpwent);
 PROTO_DEPRECATED(getpwnam);
