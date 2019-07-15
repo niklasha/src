@@ -139,7 +139,7 @@ copy_file(FTSENT *entp, int exists)
 	{
 		int skipholes = 0;
 		struct stat tosb;
-		if (!fstat(to_fd, &tosb) && S_ISREG(tosb.st_mode))
+		if (!fstat(to_fd, &tosb) && S_ISREG(tosb.st_mode) && (tosb.st_mode & S_IWUSR))
 			skipholes = 1;
 		while ((rcount = read(from_fd, buf, MAXBSIZE)) > 0) {
 			if (skipholes && memcmp(buf, zeroes, rcount) == 0)
