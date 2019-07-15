@@ -198,6 +198,12 @@ setup(void)
 
 	/* Statistics timestamp. */
 	clock_gettime(CLOCK_MONOTONIC, &st.start);
+
+	/* Reset service timers. */
+	timespecclear(&st.readts);
+	timespecclear(&st.writets);
+	timespecclear(&st.maxreadts);
+	timespecclear(&st.maxwritets);
 }
 
 static void
@@ -234,6 +240,8 @@ static void
 dd_in(void)
 {
 	ssize_t n;
+	struct timespec startts;
+	struct timespec endts;
 
 	for (;;) {
 		if (cpy_cnt && (st.in_full + st.in_part) >= cpy_cnt)
@@ -250,7 +258,13 @@ dd_in(void)
 				(void)memset(in.dbp, 0, in.dbsz);
 		}
 
+		clock_gettime(CLOCK_MONOTONIC, &startts);
 		n = read(in.fd, in.dbp, in.dbsz);
+		clock_gettime(CLOCK_MONOTONIC, &endts);
+		timespecsub(&endts, &startts, &endts);
+		timespecadd(&endts, &st.readts, &st.readts);
+		if (timespeccmp(&endts, &st.maxreadts, >))
+			st.maxreadts = endts;
 		if (n == 0) {
 			in.dbrcnt = 0;
 			return;
@@ -360,6 +374,8 @@ dd_out(int force)
 	size_t cnt, n;
 	ssize_t nw;
 	u_char *outp;
+	struct timespec startts;
+	struct timespec endts;
 
 	/*
 	 * Write one or more blocks out.  The common case is writing a full
@@ -380,7 +396,13 @@ dd_out(int force)
 	outp = out.db;
 	for (n = force ? out.dbcnt : out.dbsz;; n = out.dbsz) {
 		for (cnt = n;; cnt -= nw) {
+			clock_gettime(CLOCK_MONOTONIC, &startts);
 			nw = write(out.fd, outp, cnt);
+			clock_gettime(CLOCK_MONOTONIC, &endts);
+			timespecsub(&endts, &startts, &endts);
+			timespecadd(&endts, &st.writets, &st.writets);
+			if (timespeccmp(&endts, &st.maxwritets, >))
+				st.maxwritets = endts;
 			if (nw == 0)
 				errx(1, "%s: end of device", out.name);
 			if (nw == -1) {
