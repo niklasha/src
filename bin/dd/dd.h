@@ -69,6 +69,10 @@ typedef struct {
 	size_t	swab;			/* # of odd-length swab blocks */
 	off_t	bytes;			/* # of bytes written */
 	struct	timespec start;		/* start time of dd */
+        struct	timespec readts;	/* read service time of dd */
+        struct	timespec writets;	/* write service time of dd */
+        struct	timespec maxreadts;	/* maximum read service time of dd */
+        struct	timespec maxwritets;	/* maximum write service time of dd */
 } STAT;
 
 /* Flags (in ddflags). */

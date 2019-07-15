@@ -78,6 +78,16 @@ summary(void)
 		    "(%0.0f bytes/sec)\n", (long long)st.bytes,
 		    (long long)elapsed.tv_sec, elapsed.tv_nsec / 1000000,
 		    ((double)st.bytes * 1000000000) / nanosecs);
+
+		/* XXX should be optional, also average times should be
+		   XXX presented */
+		dprintf(STDERR_FILENO,
+			"max read latency %lld.%03ld secs, "
+			"max write latency %lld.%03ld secs\n",
+			(long long)st.maxreadts.tv_sec,
+			st.maxreadts.tv_nsec / 1000000,
+			(long long)st.maxwritets.tv_sec,
+			st.maxwritets.tv_nsec / 1000000);
 	}
 }
 
