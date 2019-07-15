@@ -21,6 +21,7 @@
  * can buy me a beer in return. Poul-Henning Kamp
  */
 
+#include <errno.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
@@ -47,10 +48,21 @@ to64(char *s, u_int32_t v, int n)
  * Use MD5 for what it is best at...
  */
 
-char *md5crypt(const char *pw, const char *salt);
+char		*_md5crypt(const char *pw, const char *salt);
+static int	md5crypt_hashpass(const char *pw, const char *salt,
+    char *passwd, size_t passwdlen);
+int		 _md5crypt_checkpass(const char *pass, const char *goodhash);
 
 char *
-md5crypt(const char *pw, const char *salt)
+_md5crypt(const char *pw, const char *salt) {
+	static char     passwd[120];
+	md5crypt_hashpass(pw, salt, passwd, sizeof passwd);
+	return (passwd);
+}
+
+static int
+md5crypt_hashpass(const char *pw, const char *salt, char *passwd,
+    size_t passwdlen)
 {
 	/*
 	 * This string is the magic for this algorithm.
@@ -58,8 +70,8 @@ md5crypt(const char *pw, const char *salt)
 	 */
 	static unsigned char	*magic = (unsigned char *)"$1$";
 
-	static char     passwd[120], *p;
-	static const unsigned char *sp,*ep;
+	char     *p;
+	const unsigned char *sp,*ep;
 	unsigned char	final[16];
 	int sl,pl,i;
 	MD5_CTX	ctx,ctx1;
@@ -110,7 +122,7 @@ md5crypt(const char *pw, const char *salt)
 		    MD5Update(&ctx, (const unsigned char *)pw, 1);
 
 	/* Now make the output string */
-	snprintf(passwd, sizeof(passwd), "%s%.*s$", (char *)magic,
+	snprintf(passwd, passwdlen, "%s%.*s$", (char *)magic,
 	    sl, (const char *)sp);
 
 	MD5Final(final,&ctx);
@@ -155,6 +167,22 @@ md5crypt(const char *pw, const char *salt)
 	/* Don't leave anything around in vm they could use. */
 	memset(final, 0, sizeof final);
 
-	return passwd;
+	return (0);
 }
 
+int
+_md5crypt_checkpass(const char *pass, const char *goodhash)
+{
+	char hash[120];
+
+	if (md5crypt_hashpass(pass, goodhash, hash, sizeof(hash)) != 0)
+		return (-1);
+	if (strlen(hash) != strlen(goodhash) ||
+	    timingsafe_bcmp(hash, goodhash, strlen(goodhash)) != 0) {
+		errno = EACCES;
+		return (-1);
+	}
+
+	explicit_bzero(hash, sizeof(hash));
+	return (0);
+}
