@@ -148,8 +148,6 @@ usr
 
     # ./usr/lib
     lib
-        debug			gname=bin uname=root mode=0755
-        ..
         locate			gname=bin uname=root mode=0755
         ..
         pkgconfig		gname=bin uname=root mode=0755
