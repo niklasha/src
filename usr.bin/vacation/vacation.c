@@ -88,14 +88,16 @@ int
 main(int argc, char *argv[])
 {
 	int ch, iflag, flags;
-	struct passwd *pw;
+	struct passwd *pw = NULL;
 	time_t interval;
 	struct stat sb;
 	ALIAS *cur;
+	char *dir = NULL;
+	char *name = NULL;
 
 	opterr = iflag = 0;
 	interval = -1;
-	while ((ch = getopt(argc, argv, "a:Iir:")) != -1)
+	while ((ch = getopt(argc, argv, "a:d:Iin:r:")) != -1)
 		switch ((char)ch) {
 		case 'a':			/* alias */
 			if (!(cur = malloc(sizeof(ALIAS))))
@@ -104,9 +106,15 @@ main(int argc, char *argv[])
 			cur->next = names;
 			names = cur;
 			break;
+		case 'd':
+			dir = optarg;
+			break;
 		case 'I':			/* backward compatible */
 		case 'i':			/* init the database */
 			iflag = 1;
+			break;
+		case 'n':
+			name = optarg;
 			break;
 		case 'r':
 			if (isdigit((unsigned char)*optarg)) {
@@ -122,21 +130,33 @@ main(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
+	/* Either both -d and -n must be given, or neither. */
+	if ((dir != NULL) != (name != NULL))
+		usage();
+
 	if (argc != 1) {
-		if (!iflag)
+		if (!iflag && dir == NULL)
 			usage();
-		if (!(pw = getpwuid(getuid()))) {
+		if (dir == NULL && !(pw = getpwuid(getuid()))) {
 			syslog(LOG_ERR,
 			    "no such user uid %u.", getuid());
 			exit(1);
 		}
-	} else if (!(pw = getpwnam(*argv))) {
+	} else {
+		if (dir != NULL)
+			usage();
+		if (!(pw = getpwnam(*argv))) {
 		syslog(LOG_ERR, "no such user %s.", *argv);
 		exit(1);
 	}
-	if (chdir(pw->pw_dir)) {
+	}
+	if (pw != NULL) {
+		name = pw->pw_name;
+		dir = pw->pw_dir;
+	}
+	if (chdir(dir)) {
 		syslog(LOG_NOTICE,
-		    "no such directory %s.", pw->pw_dir);
+		    "no such directory %s.", dir);
 		exit(1);
 	}
 
@@ -164,7 +184,7 @@ main(int argc, char *argv[])
 
 	if (!(cur = malloc(sizeof(ALIAS))))
 		exit(1);
-	cur->name = pw->pw_name;
+	cur->name = name;
 	cur->next = names;
 	names = cur;
 
@@ -172,7 +192,7 @@ main(int argc, char *argv[])
 	if (!recent()) {
 		setreply();
 		(void)(db->close)(db);
-		sendmessage(pw->pw_name);
+		sendmessage(name);
 	} else
 		(void)(db->close)(db);
 	exit(0);
@@ -506,7 +526,7 @@ sendmessage(char *myname)
 void
 usage(void)
 {
-	syslog(LOG_NOTICE, "uid %u: usage: vacation [-i] [-a alias] login",
+	syslog(LOG_NOTICE, "uid %u: usage: vacation [-i] [-a alias] [-d directory -n name | login]",
 	    getuid());
 	exit(1);
 }
