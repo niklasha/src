@@ -1482,7 +1482,6 @@
 ./usr/include/zconf.h
 ./usr/include/zlib.h
 ./usr/lib/crt0.o
-./usr/lib/debug
 ./usr/lib/gcrt0.o
 ./usr/lib/libagentx.a
 ./usr/lib/libagentx_p.a
