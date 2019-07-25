@@ -1494,7 +1494,6 @@
 ./usr/include/wctype.h
 ./usr/include/zconf.h
 ./usr/include/zlib.h
-./usr/lib/debug
 ./usr/lib/libagentx.a
 ./usr/lib/libagentx_p.a
 ./usr/lib/libc.a
