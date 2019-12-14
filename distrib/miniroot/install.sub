@@ -2845,12 +2845,19 @@ finish_up() {
 	make_dev $(bioctl $ROOTDISK 2>/dev/null | sed -n 's/.*<\(.*\)>$/\1/p')
 	md_installboot $ROOTDISK
 
-	chmod og-rwx /mnt/bsd{,.mp,.rd} 2>/dev/null
-	if [[ -f /mnt/bsd.mp ]] && ((NCPU > 1)); then
+	chmod og-rwx /mnt/bsd{,.appli.mp,.mp,.rd} 2>/dev/null
+	if [[ -f /mnt/bsd.appli.mp ]]; then
+		_kernel=${_kernel}_APPLI.MP
+		echo "Applitron machine; using bsd.appli.mp instead of bsd."
+		mv /mnt/bsd /mnt/bsd.sp 2>/dev/null
+		ln /mnt/bsd.appli.mp /mnt/bsd
+	elif [[ -f /mnt/bsd.mp ]] && ((NCPU > 1)); then
 		_kernel=$_kernel.MP
 		echo "Multiprocessor machine; using bsd.mp instead of bsd."
 		mv /mnt/bsd /mnt/bsd.sp 2>/dev/null
-		mv /mnt/bsd.mp /mnt/bsd
+		ln /mnt/bsd.mp /mnt/bsd
+	else
+		ln /mnt/bsd /mnt/bsd.sp
 	fi
 
 	# Write kernel.SHA256 matching the just installed kernel and fix path to
@@ -3433,13 +3440,13 @@ md_consoleinfo
 # Ensure that siteXX.tgz is the *last* set listed so its contents overwrite
 # the contents of the other sets, not the other way around.
 SETS=$(echo {base,comp,man,game,xbase,xshare,xfont,xserv}$VERSION.tgz)
-DEFAULTSETS="${MDSETS:-bsd bsd.rd} $SETS"
-ALLSETS="${MDSETS:-bsd bsd.rd} $SETS site$VERSION.tgz"
-SANESETS="${MDSANESETS:-bsd} base${VERSION}.tgz"
+DEFAULTSETS="${MDSETS:-bsd bsd.appli.mp bsd.rd} $SETS"
+ALLSETS="${MDSETS:-bsd bsd.appli.mp bsd.rd} $SETS site$VERSION.tgz"
+SANESETS="${MDSANESETS:-bsd bsd.appli.mp} base${VERSION}.tgz"
 if ((NCPU > 1)); then
-	DEFAULTSETS="${MDSETS:-bsd bsd.mp bsd.rd} $SETS"
-	ALLSETS="${MDSETS:-bsd bsd.mp bsd.rd} $SETS site$VERSION.tgz"
-	SANESETS="${MDSANESETS:-bsd bsd.mp} base${VERSION}.tgz"
+	DEFAULTSETS="${MDSETS:-bsd bsd.appli.mp bsd.mp bsd.rd} $SETS"
+	ALLSETS="${MDSETS:-bsd bsd.appli.mp bsd.mp bsd.rd} $SETS site$VERSION.tgz"
+	SANESETS="${MDSANESETS:-bsd bsd.appli.mp bsd.mp} base${VERSION}.tgz"
 fi
 
 # Prepare COLUMNS sanely.
