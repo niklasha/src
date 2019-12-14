@@ -123,7 +123,9 @@ run_loadfile(uint64_t *marks, int howto)
 	bcopy(bootdev_dip->disklabel.d_uid, &bootduid.duid, sizeof(bootduid));
 	addbootarg(BOOTARG_BOOTDUID, sizeof(bootduid), &bootduid);
 
+#if 0
 	ucode_load();
+#endif
 
 #ifdef SOFTRAID
 	if (bootdev_dip->sr_vol != NULL) {
