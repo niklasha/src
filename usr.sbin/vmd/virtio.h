@@ -398,7 +398,7 @@ void virtio_update_qs(struct virtio_dev *);
 void virtio_update_qa(struct virtio_dev *);
 
 enum vm_disk_fmt virtio_get_disktype(int);
-ssize_t virtio_qcow2_get_base(int, char *, size_t, const char *);
+ssize_t virtio_qcow2_get_base(int, char *, size_t, const char *, int);
 int virtio_qcow2_create(const char *, const char *, uint64_t);
 int virtio_qcow2_init(struct virtio_backing *, off_t *, int*, size_t);
 int virtio_raw_create(const char *, uint64_t);
