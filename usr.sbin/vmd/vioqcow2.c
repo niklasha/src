@@ -193,6 +193,10 @@ virtio_qcow2_get_base(int fd, char *path, size_t npath, const char *dpath)
 			return -1;
 		}
 		s = dirname(dpathbuf);
+		if (unveil(s, "r") != 0) {
+			log_warn("unveil %s", s);
+			return -1;
+		}
 		if (snprintf(expanded, sizeof(expanded),
 		    "%s/%s", s, path) >= (int)sizeof(expanded)) {
 			log_warnx("path too long: %s/%s", s, path);
