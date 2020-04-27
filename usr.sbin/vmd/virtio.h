@@ -355,7 +355,7 @@ void viornd_update_qs(void);
 void viornd_update_qa(void);
 int viornd_notifyq(void);
 
-ssize_t virtio_qcow2_get_base(int, char *, size_t, const char *);
+ssize_t virtio_qcow2_get_base(int, char *, size_t, const char *, int);
 int virtio_qcow2_create(const char *, const char *, uint64_t);
 int virtio_qcow2_init(struct virtio_backing *, off_t *, int*, size_t);
 int virtio_raw_create(const char *, uint64_t);

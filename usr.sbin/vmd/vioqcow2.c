@@ -143,7 +143,8 @@ virtio_qcow2_init(struct virtio_backing *file, off_t *szp, int *fd, size_t nfd)
  * Called from vmctl.
  */
 ssize_t
-virtio_qcow2_get_base(int fd, char *path, size_t npath, const char *dpath)
+virtio_qcow2_get_base(int fd, char *path, size_t npath, const char *dpath,
+    int do_unveil)
 {
 	char dpathbuf[PATH_MAX];
 	char expanded[PATH_MAX];
@@ -193,6 +194,10 @@ virtio_qcow2_get_base(int fd, char *path, size_t npath, const char *dpath)
 			return -1;
 		}
 		s = dirname(dpathbuf);
+		if (do_unveil && unveil(s, "r") != 0) {
+			log_warn("unveil %s", s);
+			return -1;
+		}
 		if (snprintf(expanded, sizeof(expanded),
 		    "%s/%s", s, path) >= (int)sizeof(expanded)) {
 			log_warnx("path too long: %s/%s", s, path);

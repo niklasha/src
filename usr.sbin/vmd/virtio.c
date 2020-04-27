@@ -481,7 +481,7 @@ virtio_get_base(int fd, char *path, size_t npath, int type, const char *dpath)
 	case VMDF_RAW:
 		return 0;
 	case VMDF_QCOW2:
-		return virtio_qcow2_get_base(fd, path, npath, dpath);
+		return virtio_qcow2_get_base(fd, path, npath, dpath, 0);
 	}
 	log_warnx("%s: invalid disk format", __func__);
 	return -1;

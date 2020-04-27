@@ -899,7 +899,7 @@ open_imagefile(int type, const char *imgfile_path, int flags,
 			return (-1);
 		for (i = 0; i < VM_MAX_BASE_PER_DISK - 1; i++, nfd++) {
 			if ((ret = virtio_qcow2_get_base(basefd[i],
-			    path, sizeof(path), imgfile_path)) == -1) {
+			    path, sizeof(path), imgfile_path, 1)) == -1) {
 				log_debug("%s: failed to get base %d", __func__, i);
 				return -1;
 			} else if (ret == 0)
