@@ -380,7 +380,7 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 
 			/* Resolve the path of the next base image, if any. */
 			n = virtio_qcow2_get_base(diskfds[i][j], base,
-			    sizeof(base), path);
+			    sizeof(base), path, 0);
 			if (n == -1) {
 				log_warnx("vm \"%s\" unable to read "
 				    "base for disk %s", vmc->vmc_name,
