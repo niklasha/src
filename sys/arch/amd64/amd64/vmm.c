@@ -2983,11 +2983,15 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		cr0 |= CR0_NE;
 
 	if ((cr0 & want1) != want1) {
+		DPRINTF("%s: CR0 check 1 failed; cr0 0x%08x want1 0x%08x\n",
+			__func__, cr0, want1);
 		ret = EINVAL;
 		goto exit;
 	}
 
 	if ((~cr0 & want0) != want0) {
+		DPRINTF("%s: CR0 check 2 failed; cr0 0x%08x want0 0x%08x\n",
+			__func__, cr0, want0);
 		ret = EINVAL;
 		goto exit;
 	}
@@ -3008,11 +3012,15 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	cr4 = vrs->vrs_crs[VCPU_REGS_CR4] | CR4_VMXE;
 
 	if ((cr4 & want1) != want1) {
+		DPRINTF("%s: CR4 check 1 failed; cr4 0x%08x want1 0x%08x\n",
+			__func__, cr4, want1);
 		ret = EINVAL;
 		goto exit;
 	}
 
 	if ((~cr4 & want0) != want0) {
+		DPRINTF("%s: CR4 check 1 failed; cr4 0x%08x want1 0x%08x\n",
+			__func__, cr4, want1);
 		ret = EINVAL;
 		goto exit;
 	}
@@ -3024,24 +3032,28 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	    !(vrs->vrs_msrs[VCPU_REGS_EFER] & EFER_LMA)) {
 		if (vmwrite(VMCS_GUEST_PDPTE0,
 		    vrs->vrs_crs[VCPU_REGS_PDPTE0])) {
+			DPRINTF("%s: PDPT0 restore failed\n", __func__);
 			ret = EINVAL;
 			goto exit;
 		}
 
 		if (vmwrite(VMCS_GUEST_PDPTE1,
 		    vrs->vrs_crs[VCPU_REGS_PDPTE1])) {
+			DPRINTF("%s: PDPT1 restore failed\n", __func__);
 			ret = EINVAL;
 			goto exit;
 		}
 
 		if (vmwrite(VMCS_GUEST_PDPTE2,
 		    vrs->vrs_crs[VCPU_REGS_PDPTE2])) {
+			DPRINTF("%s: PDPT2 restore failed\n", __func__);
 			ret = EINVAL;
 			goto exit;
 		}
 
 		if (vmwrite(VMCS_GUEST_PDPTE3,
 		    vrs->vrs_crs[VCPU_REGS_PDPTE3])) {
+			DPRINTF("%s: PDPT3 restore failed\n", __func__);
 			ret = EINVAL;
 			goto exit;
 		}
