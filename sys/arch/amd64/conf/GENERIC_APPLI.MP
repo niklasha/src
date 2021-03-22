@@ -10,6 +10,7 @@ option	UMASS_DEBUG
 option	USB_DEBUG
 option	EHCI_DEBUG
 option	WDCDEBUG
+option	XNF_DEBUG
 
 cpu*		at mainbus?
 com2		at isa? port 0x3e8 irq 4
