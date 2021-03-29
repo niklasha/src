@@ -159,6 +159,13 @@ const struct puc_device_description puc_devs[] = {
 		{ PUC_PORT_COM, 0x10, 0x0000 },
 	    },
 	},
+	{	/* C600 KT */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_C600_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
 	{	/* 82946GZ KT */
 	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82946GZ_KT, 0x0000, 0x0000 },
 	    {	0xffff, 0xffff,					0x0000, 0x0000 },
