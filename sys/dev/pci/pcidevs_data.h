@@ -13996,6 +13996,14 @@ static const struct pci_known_product pci_known_products[] = {
 	    "C600 MEI",
 	},
 	{
+	    PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_C600_IDER,
+	    "C600 IDE-R",
+	},
+	{
+	    PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_C600_KT,
+	    "C600 KT",
+	},
+	{
 	    PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_C600_VPCIE,
 	    "C600 Virtual PCIE",
 	},
