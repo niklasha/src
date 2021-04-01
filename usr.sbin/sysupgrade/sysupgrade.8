@@ -23,7 +23,7 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl fkn
-.Op Fl r | s
+.Op Fl A | r | s
 .Op Fl b Ar base-directory
 .Op Ar installurl
 .Sh DESCRIPTION
@@ -49,6 +49,8 @@ triggering a one-shot upgrade using the files in
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
+.It Fl A
+Upgrade to the next Appli baseline.
 .It Fl b Ar base-directory
 Download files to
 .Ar base-directory Ns / Ns Pa _sysupgrade

@@ -35,7 +35,7 @@ err()
 
 usage()
 {
-	echo "usage: ${0##*/} [-fkn] [-r | -s] [-b base-directory] [installurl]" 1>&2
+	echo "usage: ${0##*/} [-fkn] [-A | -r | -s] [-b base-directory] [installurl]" 1>&2
 	return 1
 }
 
@@ -74,12 +74,14 @@ rmel() {
 
 RELEASE=false
 SNAP=false
+BASELINE=false
 FORCE=false
 KEEP=false
 REBOOT=true
 
-while getopts b:fknrs arg; do
+while getopts Ab:fknrs arg; do
 	case ${arg} in
+	A)	BASELINE=true;;
 	b)	SETSDIR=${OPTARG}/_sysupgrade;;
 	f)	FORCE=true;;
 	k)	KEEP=true;;
@@ -92,7 +94,7 @@ done
 
 (($(id -u) != 0)) && err "need root privileges"
 
-if $RELEASE && $SNAP; then
+if $RELEASE && ($SNAP || $BASELINE) || $SNAP && $BASELINE; then
 	usage
 fi
 
@@ -112,7 +114,7 @@ esac
 [[ $MIRROR == @(file|ftp|http|https)://* ]] ||
 	err "invalid installurl: $MIRROR"
 
-if ! $RELEASE && [[ ${#_KERNV[*]} == 2 ]]; then
+if ! $RELEASE && ! $BASELINE && [[ ${#_KERNV[*]} == 2 ]]; then
 	if [[ ${_KERNV[1]} != '-stable' ]]; then
 		SNAP=true
 	fi
@@ -124,8 +126,17 @@ else
 	NEXT_VERSION=$(echo ${_KERNV[0]} + 0.1 | bc)
 fi
 
-if $SNAP; then
-	URL=${MIRROR}/snapshots/${ARCH}/
+BL=$(($(echo ${_KERNV[0]} | tr -d .) - 37))
+NEXT_BL=$(($(echo $NEXT_VERSION | tr -d .) - 37))
+
+if $SNAP || $BASELINE; then
+	if $SNAP; then
+		URL=${MIRROR}/snapshots/${ARCH}/
+	elif $FORCE; then
+		URL=${MIRROR}/bl$BL/${ARCH}/
+	else
+		URL=${MIRROR}/bl$NEXT_BL/${ARCH}/
+	fi
 else
 	URL=${MIRROR}/${NEXT_VERSION}/${ARCH}/
 fi
@@ -136,9 +147,13 @@ cd ${SETSDIR}
 echo "Fetching from ${URL}"
 unpriv -f SHA256.sig ftp -N sysupgrade -Vmo SHA256.sig ${URL}SHA256.sig
 
-_KEY=openbsd-${_KERNV[0]%.*}${_KERNV[0]#*.}-base.pub
-_NEXTKEY=openbsd-${NEXT_VERSION%.*}${NEXT_VERSION#*.}-base.pub
-
+if ! $BASELINE; then
+	_KEY=openbsd-${_KERNV[0]%.*}${_KERNV[0]#*.}-base.pub
+	_NEXTKEY=openbsd-${NEXT_VERSION%.*}${NEXT_VERSION#*.}-base.pub
+else
+	_KEY=baseline-$BL-base.pub
+	_NEXTKEY=baseline-$NEXT_BL-base.pub
+fi
 read _LINE <SHA256.sig
 case ${_LINE} in
 *\ ${_KEY})	SIGNIFY_KEY=/etc/signify/${_KEY} ;;
