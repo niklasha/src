@@ -35,7 +35,7 @@ err()
 
 usage()
 {
-	echo "usage: ${0##*/} [-fkn] [-r | -s] [installurl]" 1>&2
+	echo "usage: ${0##*/} [-fkn] [-r | -s | -b] [installurl]" 1>&2
 	return 1
 }
 
@@ -74,12 +74,14 @@ rmel() {
 
 RELEASE=false
 SNAP=false
+BASELINE=false
 FORCE=false
 KEEP=false
 REBOOT=true
 
-while getopts fknrs arg; do
+while getopts bfknrs arg; do
 	case ${arg} in
+	b)	BASELINE=true;;
 	f)	FORCE=true;;
 	k)	KEEP=true;;
 	n)	REBOOT=false;;
@@ -91,7 +93,7 @@ done
 
 (($(id -u) != 0)) && err "need root privileges"
 
-if $RELEASE && $SNAP; then
+if $RELEASE && ($SNAP || $BASELINE) || $SNAP && $BASELINE; then
 	usage
 fi
 
@@ -111,7 +113,7 @@ esac
 [[ $MIRROR == @(file|ftp|http|https)://* ]] ||
 	err "invalid installurl: $MIRROR"
 
-if ! $RELEASE && [[ ${#_KERNV[*]} == 2 ]]; then
+if ! $RELEASE && ! $BASELINE && [[ ${#_KERNV[*]} == 2 ]]; then
 	SNAP=true
 fi
 
@@ -121,8 +123,13 @@ else
 	NEXT_VERSION=$(echo ${_KERNV[0]} + 0.1 | bc)
 fi
 
-if $SNAP; then
-	URL=${MIRROR}/snapshots/${ARCH}/
+if $SNAP || $BASELINE; then
+	if $SNAP; then
+		URL=${MIRROR}/snapshots/${ARCH}/
+	else
+		# XXX
+		URL=${MIRROR}/bl32/${ARCH}/
+	fi
 	FW_URL=http://firmware.openbsd.org/firmware/snapshots/
 else
 	URL=${MIRROR}/${NEXT_VERSION}/${ARCH}/
@@ -132,23 +139,27 @@ fi
 install -d -o 0 -g 0 -m 0755 ${SETSDIR}
 cd ${SETSDIR}
 
-echo "Fetching from ${URL}"
-unpriv -f SHA256.sig ftp -N sysupgrade -Vmo SHA256.sig ${URL}SHA256.sig
+if ! $BASELINE; then
+	echo "Fetching from ${URL}"
+	unpriv -f SHA256.sig ftp -N sysupgrade -Vmo SHA256.sig ${URL}SHA256.sig
 
-_KEY=openbsd-${_KERNV[0]%.*}${_KERNV[0]#*.}-base.pub
-_NEXTKEY=openbsd-${NEXT_VERSION%.*}${NEXT_VERSION#*.}-base.pub
+	_KEY=openbsd-${_KERNV[0]%.*}${_KERNV[0]#*.}-base.pub
+	_NEXTKEY=openbsd-${NEXT_VERSION%.*}${NEXT_VERSION#*.}-base.pub
 
-read _LINE <SHA256.sig
-case ${_LINE} in
-*\ ${_KEY})	SIGNIFY_KEY=/etc/signify/${_KEY} ;;
-*\ ${_NEXTKEY})	SIGNIFY_KEY=/etc/signify/${_NEXTKEY} ;;
-*)		err "invalid signing key" ;;
-esac
+	read _LINE <SHA256.sig
+	case ${_LINE} in
+	*\ ${_KEY})	SIGNIFY_KEY=/etc/signify/${_KEY} ;;
+	*\ ${_NEXTKEY})	SIGNIFY_KEY=/etc/signify/${_NEXTKEY} ;;
+	*)		err "invalid signing key" ;;
+	esac
 
-[[ -f ${SIGNIFY_KEY} ]] || err "cannot find ${SIGNIFY_KEY}"
+	[[ -f ${SIGNIFY_KEY} ]] || err "cannot find ${SIGNIFY_KEY}"
 
-unpriv -f SHA256 signify -Ve -p "${SIGNIFY_KEY}" -x SHA256.sig -m SHA256
-rm SHA256.sig
+	unpriv -f SHA256 signify -Ve -p "${SIGNIFY_KEY}" -x SHA256.sig -m SHA256
+	rm SHA256.sig
+else
+	unpriv -f SHA256 ftp -N sysupgrade -Vmo SHA256 ${URL}SHA256
+fi
 
 if cmp -s /var/db/installed.SHA256 SHA256 && ! $FORCE; then
 	echo "Already on latest snapshot."
