@@ -1,6 +1,7 @@
 ./.cshrc
 ./.profile
 ./etc/changelist
+./etc/disktab
 ./etc/dumpdates
 ./etc/fbtab
 ./etc/ftpusers
