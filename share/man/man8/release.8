@@ -265,7 +265,7 @@ are suitable for installs without network connectivity.
 They contain the tarballs and ports built in the previous steps.
 .Bd -literal -offset indent
 # export RELDIR=your-releasedir RELXDIR=your-xenocara-releasedir
-# cd /usr/src/distrib/$(machine)/iso && make
+# cd /usr/src/distrib/$(machine)/iso && make obj && make
 # make install
 .Ed
 .Pp
