@@ -1,4 +1,4 @@
-/*	$OpenBSD: virtio.c,v 1.84 2021/03/29 23:37:01 dv Exp $	*/
+/*	$OpenBSD: virtio.c,v 1.84.2.1 2021/05/03 20:12:10 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -1394,7 +1394,7 @@ vionet_notify_tx(struct vionet_dev *dev)
 	uint32_t vr_sz;
 	uint16_t idx, pkt_desc_idx, hdr_desc_idx, dxx;
 	size_t pktsz;
-	ssize_t dhcpsz;
+	ssize_t dhcpsz = 0;
 	int ret, num_enq, ofs, spc;
 	char *vr, *pkt, *dhcppkt;
 	struct vring_desc *desc, *pkt_desc, *hdr_desc;
