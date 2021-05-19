@@ -23,8 +23,8 @@
 #include <sys/statvfs.h>
 #include <sys/vnode.h>
 #include <sys/lock.h>
-#include <sys/fusebuf.h>
 
+#include "fusebuf.h"
 #include "fusefs_node.h"
 #include "fusefs.h"
 
@@ -74,7 +74,7 @@ fusefs_lookup(void *v)
 
 		/* got a real entry */
 		fbuf = fb_setup(cnp->cn_namelen + 1, dp->ufs_ino.i_number,
-		    FBT_LOOKUP, p);
+		    FUSE_LOOKUP, p);
 
 		memcpy(fbuf->fb_dat, cnp->cn_nameptr, cnp->cn_namelen);
 		fbuf->fb_dat[cnp->cn_namelen] = '\0';
@@ -111,9 +111,16 @@ fusefs_lookup(void *v)
 			return (ENOENT);
 		}
 
-		nid = fbuf->fb_ino;
-		nvtype = IFTOVT(fbuf->fb_attr.st_mode);
+		nid = fbuf->op.out.entry.nodeid;
+		nvtype = IFTOVT(fbuf->op.out.entry.attr.mode);
 		fb_delete(fbuf);
+	}
+
+	if (nid == 0) {
+		/* zero nodeid means ENOENT */
+		printf("fusefs_lookup: file system returned nodeid=0 instead of "
+		    "ENOENT\n");
+		return (ENOENT);
 	}
 
 	if (nameiop == DELETE && (flags & ISLASTCN)) {
@@ -194,11 +201,10 @@ fusefs_lookup(void *v)
 	return (error);
 
 reclaim:
-	if (nid != dp->ufs_ino.i_number && nid != FUSE_ROOTINO) {
-		fbuf = fb_setup(0, nid, FBT_RECLAIM, p);
-		if (fb_queue(fmp->dev, fbuf))
-			printf("fusefs: libfuse vnode reclaim failed\n");
-		fb_delete(fbuf);
+	if (nid != dp->ufs_ino.i_number && nid != FUSE_ROOT_ID) {
+		fbuf = fb_setup(0, nid, FUSE_FORGET, p);
+		fbuf->op.in.forget.nlookup = 1;
+		fuse_device_queue_fbuf(fmp->dev, fbuf); /* no response */
 	}
 	return (error);
 }

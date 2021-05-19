@@ -43,6 +43,9 @@ struct fusefs_node {
 
 	/** meta **/
 	off_t             filesize;
+
+	/** lookup count needed by libfuse FUSE_FORGET **/
+	uint64_t	nlookup;
 };
 
 #ifdef ITOV
