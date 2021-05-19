@@ -28,8 +28,8 @@
 #include <sys/statvfs.h>
 #include <sys/sysctl.h>
 #include <sys/vnode.h>
-#include <sys/fusebuf.h>
 
+#include "fusebuf.h"
 #include "fusefs_node.h"
 #include "fusefs.h"
 
@@ -47,8 +47,7 @@ int	fusefs_vptofh(struct vnode *, struct fid *);
 int	fusefs_init(struct vfsconf *);
 int	fusefs_sysctl(int *, u_int, void *, size_t *, void *, size_t,
 	    struct proc *);
-int	fusefs_checkexp(struct mount *, struct mbuf *, int *,
-	    struct ucred **);
+int	fusefs_checkexp(struct mount *, struct mbuf *, int *, struct ucred **);
 
 const struct vfsops fusefs_vfsops = {
 	.vfs_mount	= fusefs_mount,
@@ -68,7 +67,7 @@ const struct vfsops fusefs_vfsops = {
 
 struct pool fusefs_fbuf_pool;
 
-#define PENDING 2	/* FBT_INIT reply not yet received */
+#define PENDING 2	/* FUSE_INIT reply not yet received */
 
 int
 fusefs_mount(struct mount *mp, const char *path, void *data,
@@ -79,6 +78,7 @@ fusefs_mount(struct mount *mp, const char *path, void *data,
 	struct fusefs_args *args = data;
 	struct vnode *vp;
 	struct file *fp;
+	char fspec[MNAMELEN];
 	int error = 0;
 
 	if (mp->mnt_flag & MNT_UPDATE)
@@ -110,22 +110,34 @@ fusefs_mount(struct mount *mp, const char *path, void *data,
 		fmp->max_read = MIN(args->max_read, FUSEBUFMAXSIZE);
 	else
 		fmp->max_read = FUSEBUFMAXSIZE;
-
 	fmp->allow_other = args->allow_other;
 
 	mp->mnt_data = fmp;
 	mp->mnt_flag |= MNT_LOCAL;
 	vfs_getnewfsid(mp);
 
+	/* If no name is specified default to the FS type. */
+	if (args->fspec == NULL)
+		strlcpy(fspec, MOUNT_FUSEFS, MNAMELEN);
+	else {
+		error = copyinstr(args->fspec, fspec, sizeof(fspec), NULL);
+		if (error)
+			goto bad;
+	}
+
 	memset(mp->mnt_stat.f_mntonname, 0, MNAMELEN);
 	strlcpy(mp->mnt_stat.f_mntonname, path, MNAMELEN);
 	memset(mp->mnt_stat.f_mntfromname, 0, MNAMELEN);
-	strlcpy(mp->mnt_stat.f_mntfromname, "fusefs", MNAMELEN);
+	strlcpy(mp->mnt_stat.f_mntfromname, fspec, MNAMELEN);
 	memset(mp->mnt_stat.f_mntfromspec, 0, MNAMELEN);
-	strlcpy(mp->mnt_stat.f_mntfromspec, "fusefs", MNAMELEN);
+	strlcpy(mp->mnt_stat.f_mntfromspec, fspec, MNAMELEN);
 
 	fuse_device_set_fmp(fmp, 1);
-	fbuf = fb_setup(0, 0, FBT_INIT, p);
+	fbuf = fb_setup(0, 0, FUSE_INIT, p);
+	fbuf->op.in.init.major = FUSE_KERNEL_VERSION;
+	fbuf->op.in.init.minor = FUSE_KERNEL_MINOR_VERSION;
+	fbuf->op.in.init.max_readahead = 0;
+	fbuf->op.in.init.flags = 0; /* OpenBSD supports nothing... */
 
 	/* cannot tsleep on mount */
 	fuse_device_queue_fbuf(fmp->dev, fbuf);
@@ -158,8 +170,7 @@ fusefs_unmount(struct mount *mp, int mntflags, struct proc *p)
 		return (error);
 
 	if (fmp->sess_init && fmp->sess_init != PENDING) {
-		fbuf = fb_setup(0, 0, FBT_DESTROY, p);
-
+		fbuf = fb_setup(0, 0, FUSE_DESTROY, p);
 		error = fb_queue(fmp->dev, fbuf);
 
 		if (error)
@@ -183,7 +194,7 @@ fusefs_root(struct mount *mp, struct vnode **vpp)
 	struct vnode *nvp;
 	int error;
 
-	if ((error = VFS_VGET(mp, FUSE_ROOTINO, &nvp)) != 0)
+	if ((error = VFS_VGET(mp, FUSE_ROOT_ID, &nvp)) != 0)
 		return (error);
 
 	nvp->v_type = VDIR;
@@ -215,10 +226,10 @@ fusefs_statfs(struct mount *mp, struct statfs *sbp, struct proc *p)
 	copy_statfs_info(sbp, mp);
 
 	/*
-	 * Both FBT_INIT and FBT_STATFS are sent to the FUSE file system
+	 * Both FUSE_INIT and FUSE_STATFS are sent to the FUSE file system
 	 * daemon when it is mounted. However, the daemon is the process
 	 * that called mount(2) so to prevent a deadlock return dummy
-	 * values until the response to FBT_INIT init is received. All
+	 * values until the response to FUSE_INIT init is received. All
 	 * other VFS syscalls are queued.
 	 */
 	if (!fmp->sess_init || fmp->sess_init == PENDING) {
@@ -232,7 +243,7 @@ fusefs_statfs(struct mount *mp, struct statfs *sbp, struct proc *p)
 		sbp->f_iosize = 0;
 		sbp->f_namemax = 0;
 	} else {
-		fbuf = fb_setup(0, FUSE_ROOTINO, FBT_STATFS, p);
+		fbuf = fb_setup(0, FUSE_ROOT_ID, FUSE_STATFS, p);
 
 		error = fb_queue(fmp->dev, fbuf);
 
@@ -241,15 +252,15 @@ fusefs_statfs(struct mount *mp, struct statfs *sbp, struct proc *p)
 			return (error);
 		}
 
-		sbp->f_bavail = fbuf->fb_stat.f_bavail;
-		sbp->f_bfree = fbuf->fb_stat.f_bfree;
-		sbp->f_blocks = fbuf->fb_stat.f_blocks;
-		sbp->f_files = fbuf->fb_stat.f_files;
-		sbp->f_ffree = fbuf->fb_stat.f_ffree;
-		sbp->f_favail = fbuf->fb_stat.f_favail;
-		sbp->f_bsize = fbuf->fb_stat.f_frsize;
-		sbp->f_iosize = fbuf->fb_stat.f_bsize;
-		sbp->f_namemax = fbuf->fb_stat.f_namemax;
+		sbp->f_bavail = fbuf->op.out.statfs.st.bavail;
+		sbp->f_bfree = fbuf->op.out.statfs.st.bfree;
+		sbp->f_blocks = fbuf->op.out.statfs.st.blocks;
+		sbp->f_files = fbuf->op.out.statfs.st.files;
+		sbp->f_ffree = fbuf->op.out.statfs.st.ffree;
+		sbp->f_favail = fbuf->op.out.statfs.st.ffree;
+		sbp->f_bsize = fbuf->op.out.statfs.st.frsize;
+		sbp->f_iosize = fbuf->op.out.statfs.st.bsize;
+		sbp->f_namemax = fbuf->op.out.statfs.st.namelen;
 		fb_delete(fbuf);
 	}
 
@@ -277,8 +288,10 @@ retry:
 	/*
 	 * check if vnode is in hash.
 	 */
-	if ((*vpp = ufs_ihashget(fmp->dev, ino)) != NULLVP)
+	if ((*vpp = ufs_ihashget(fmp->dev, ino)) != NULLVP) {
+		VTOI(*vpp)->nlookup++;
 		return (0);
+	}
 
 	/*
 	 * if not create it
@@ -296,6 +309,7 @@ retry:
 	ip->ufs_ino.i_vnode = nvp;
 	ip->ufs_ino.i_dev = fmp->dev;
 	ip->ufs_ino.i_number = ino;
+	ip->nlookup = 1;
 
 	for (i = 0; i < FUFH_MAXTYPE; i++)
 		ip->fufh[i].fh_type = FUFH_INVALID;
@@ -312,7 +326,7 @@ retry:
 
 	ip->ufs_ino.i_ump = (struct ufsmount *)fmp;
 
-	if (ino == FUSE_ROOTINO)
+	if (ino == FUSE_ROOT_ID)
 		nvp->v_flag |= VROOT;
 	else {
 		/*

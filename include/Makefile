@@ -44,7 +44,7 @@ PRDIRS=	../lib/libcrypto ../lib/librpcsvc
 # Directories with an includes target
 RDIRS=	../lib/libagentx ../lib/libcbor ../lib/libcurses ../lib/libedit \
 	../lib/libelf ../lib/libevent ../lib/libexpat ../lib/libfido2 \
-	../lib/libform ../lib/libfuse ../lib/libkeynote ../lib/libmenu \
+	../lib/libform ../lib/libkeynote ../lib/libmenu \
 	../lib/libossaudio ../lib/libpanel ../lib/libpcap \
 	../lib/libradius \
 	../lib/libskey ../lib/libssl  ../lib/libtls \

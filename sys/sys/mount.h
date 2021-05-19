@@ -243,9 +243,9 @@ struct tmpfs_args {
  * Arguments to mount fusefs filesystems
  */
 struct fusefs_args {
-	char *name;
-	int fd;
-	int max_read;
+	char *fspec;		/* optional name to export for statfs */
+	int fd;			/* file descriptor of the open FUSE device */
+	int max_read;		/* optional maximum size of read requests */
 
 	/*
 	 * FUSE does not allow the file system to be accessed by other users

@@ -20,6 +20,7 @@
 #include <sys/dirent.h>
 #include <sys/fcntl.h>
 #include <sys/file.h>
+#include <sys/filedesc.h>
 #include <sys/lockf.h>
 #include <sys/malloc.h>
 #include <sys/mount.h>
@@ -31,8 +32,9 @@
 #include <sys/statvfs.h>
 #include <sys/vnode.h>
 #include <sys/lock.h>
-#include <sys/fusebuf.h>
+#include <sys/fuse_kernel.h>
 
+#include "fusebuf.h"
 #include "fusefs_node.h"
 #include "fusefs.h"
 
@@ -156,7 +158,7 @@ fusefs_kqfilter(void *v)
 
 	kn->kn_hook = (caddr_t)vp;
 
-	klist_insert_locked(&vp->v_selectinfo.si_note, kn);
+	klist_insert(&vp->v_selectinfo.si_note, kn);
 
 	return (0);
 }
@@ -166,7 +168,7 @@ filt_fusefsdetach(struct knote *kn)
 {
 	struct vnode *vp = (struct vnode *)kn->kn_hook;
 
-	klist_remove_locked(&vp->v_selectinfo.si_note, kn);
+	klist_remove(&vp->v_selectinfo.si_note, kn);
 }
 
 int
@@ -274,7 +276,7 @@ fusefs_open(void *v)
 		uvm_vnp_uncache(vp);
 	}
 
-	/* already open i think all is ok */
+	/* already open I think all is ok */
 	if (ip->fufh[fufh_type].fh_type != FUFH_INVALID)
 		return (0);
 
@@ -331,8 +333,8 @@ fusefs_close(void *v)
 	if (ip->fufh[fufh_type].fh_type == FUFH_INVALID)
 		return (EBADF);
 
-	fbuf = fb_setup(0, ip->ufs_ino.i_number, FBT_FLUSH, ap->a_p);
-	fbuf->fb_io_fd = ip->fufh[fufh_type].fh_id;
+	fbuf = fb_setup(0, ip->ufs_ino.i_number, FUSE_FLUSH, ap->a_p);
+	fbuf->op.in.flush.fh = ip->fufh[fufh_type].fh_id;
 	error = fb_queue(fmp->dev, fbuf);
 	fb_delete(fbuf);
 	if (error == ENOSYS) {
@@ -407,7 +409,7 @@ fusefs_getattr(void *v)
 	struct ucred *cred = p->p_ucred;
 	struct fusefs_node *ip;
 	struct fusebuf *fbuf;
-	struct stat *st;
+	struct fuse_attr *st;
 	int error = 0;
 
 	ip = VTOI(vp);
@@ -431,7 +433,7 @@ fusefs_getattr(void *v)
 		vap->va_fsid = fmp->mp->mnt_stat.f_fsid.val[0];
 		vap->va_fileid = ip->ufs_ino.i_number;
 		vap->va_size = S_BLKSIZE;
-		vap->va_blocksize = S_BLKSIZE;
+		vap->va_blocksize = PAGE_SIZE;
 		vap->va_atime.tv_sec = fmp->mp->mnt_stat.f_ctime;
 		vap->va_mtime.tv_sec = fmp->mp->mnt_stat.f_ctime;
 		vap->va_ctime.tv_sec = fmp->mp->mnt_stat.f_ctime;
@@ -443,7 +445,7 @@ fusefs_getattr(void *v)
 	if (!fmp->sess_init)
 		return (ENXIO);
 
-	fbuf = fb_setup(0, ip->ufs_ino.i_number, FBT_GETATTR, p);
+	fbuf = fb_setup(0, ip->ufs_ino.i_number, FUSE_GETATTR, p);
 
 	error = fb_queue(fmp->dev, fbuf);
 	if (error) {
@@ -451,23 +453,27 @@ fusefs_getattr(void *v)
 		return (error);
 	}
 
-	st = &fbuf->fb_attr;
+	st = &fbuf->op.out.attr.attr;
 
 	memset(vap, 0, sizeof(*vap));
-	vap->va_type = IFTOVT(st->st_mode);
-	vap->va_mode = st->st_mode & ~S_IFMT;
-	vap->va_nlink = st->st_nlink;
-	vap->va_uid = st->st_uid;
-	vap->va_gid = st->st_gid;
+	vap->va_type = IFTOVT(st->mode);
+	vap->va_mode = st->mode & ~S_IFMT;
+	vap->va_nlink = st->nlink;
+	vap->va_uid = st->uid;
+	vap->va_gid = st->gid;
 	vap->va_fsid = fmp->mp->mnt_stat.f_fsid.val[0];
-	vap->va_fileid = st->st_ino;
-	vap->va_size = st->st_size;
-	vap->va_blocksize = st->st_blksize;
-	vap->va_atime = st->st_atim;
-	vap->va_mtime = st->st_mtim;
-	vap->va_ctime = st->st_ctim;
-	vap->va_rdev = st->st_rdev;
-	vap->va_bytes = st->st_blocks * S_BLKSIZE;
+	vap->va_fileid = st->ino;
+	vap->va_size = st->size;
+	// XXX check for sanity or rely on VFS?
+	vap->va_blocksize = st->blksize > 0 ? st->blksize : PAGE_SIZE;
+	vap->va_atime.tv_sec = st->atime;
+	vap->va_atime.tv_nsec = st->atimensec;
+	vap->va_mtime.tv_sec = st->mtime;
+	vap->va_mtime.tv_nsec = st->mtimensec;
+	vap->va_ctime.tv_sec = st->ctime;
+	vap->va_ctime.tv_nsec = st->ctimensec;
+	vap->va_rdev = st->rdev;
+	vap->va_bytes = st->blocks * S_BLKSIZE;
 
 	fb_delete(fbuf);
 	return (error);
@@ -484,7 +490,6 @@ fusefs_setattr(void *v)
 	struct proc *p = ap->a_p;
 	struct fusefs_mnt *fmp;
 	struct fusebuf *fbuf;
-	struct fb_io *io;
 	int error = 0;
 
 	fmp = (struct fusefs_mnt *)ip->ufs_ino.i_ump;
@@ -503,17 +508,16 @@ fusefs_setattr(void *v)
 	if (fmp->undef_op & UNDEF_SETATTR)
 		return (ENOSYS);
 
-	fbuf = fb_setup(sizeof(*io), ip->ufs_ino.i_number, FBT_SETATTR, p);
-	io = fbtod(fbuf, struct fb_io *);
-	io->fi_flags = 0;
+	fbuf = fb_setup(0, ip->ufs_ino.i_number, FUSE_SETATTR, p);
+	fbuf->op.in.setattr.valid = 0;
 
 	if (vap->va_uid != (uid_t)VNOVAL) {
 		if (vp->v_mount->mnt_flag & MNT_RDONLY) {
 			error = EROFS;
 			goto out;
 		}
-		fbuf->fb_attr.st_uid = vap->va_uid;
-		io->fi_flags |= FUSE_FATTR_UID;
+		fbuf->op.in.setattr.uid |= vap->va_uid;
+		fbuf->op.in.setattr.valid |= FATTR_UID;
 	}
 
 	if (vap->va_gid != (gid_t)VNOVAL) {
@@ -521,8 +525,8 @@ fusefs_setattr(void *v)
 			error = EROFS;
 			goto out;
 		}
-		fbuf->fb_attr.st_gid = vap->va_gid;
-		io->fi_flags |= FUSE_FATTR_GID;
+		fbuf->op.in.setattr.gid |= vap->va_gid;
+		fbuf->op.in.setattr.valid |= FATTR_GID;
 	}
 
 	if (vap->va_size != VNOVAL) {
@@ -546,8 +550,8 @@ fusefs_setattr(void *v)
 			break;
 		}
 
-		fbuf->fb_attr.st_size = vap->va_size;
-		io->fi_flags |= FUSE_FATTR_SIZE;
+		fbuf->op.in.setattr.size |= vap->va_size;
+		fbuf->op.in.setattr.valid |= FATTR_SIZE;
 	}
 
 	if (vap->va_atime.tv_nsec != VNOVAL) {
@@ -555,8 +559,9 @@ fusefs_setattr(void *v)
 			error = EROFS;
 			goto out;
 		}
-		fbuf->fb_attr.st_atim = vap->va_atime;
-		io->fi_flags |= FUSE_FATTR_ATIME;
+		fbuf->op.in.setattr.atime = vap->va_atime.tv_sec;
+		fbuf->op.in.setattr.atimensec = vap->va_atime.tv_nsec;
+		fbuf->op.in.setattr.valid |= FATTR_ATIME;
 	}
 
 	if (vap->va_mtime.tv_nsec != VNOVAL) {
@@ -564,8 +569,9 @@ fusefs_setattr(void *v)
 			error = EROFS;
 			goto out;
 		}
-		fbuf->fb_attr.st_mtim = vap->va_mtime;
-		io->fi_flags |= FUSE_FATTR_MTIME;
+		fbuf->op.in.setattr.mtime = vap->va_mtime.tv_sec;
+		fbuf->op.in.setattr.mtimensec = vap->va_mtime.tv_nsec;
+		fbuf->op.in.setattr.valid |= FATTR_MTIME;
 	}
 	/* XXX should set a flag if (vap->va_vaflags & VA_UTIMES_CHANGE) */
 
@@ -585,12 +591,11 @@ fusefs_setattr(void *v)
 			error = EFTYPE;
 			goto out;
 		}
-
-		fbuf->fb_attr.st_mode = vap->va_mode & ALLPERMS;
-		io->fi_flags |= FUSE_FATTR_MODE;
+		fbuf->op.in.setattr.mode = vap->va_mode & ALLPERMS;
+		fbuf->op.in.setattr.valid |= FATTR_MODE;
 	}
 
-	if (!io->fi_flags) {
+	if (!fbuf->op.in.setattr.valid) {
 		goto out;
 	}
 
@@ -664,9 +669,9 @@ fusefs_link(void *v)
 	}
 
 	fbuf = fb_setup(cnp->cn_namelen + 1, dip->ufs_ino.i_number,
-	    FBT_LINK, p);
+	    FUSE_LINK, p);
 
-	fbuf->fb_io_ino = ip->ufs_ino.i_number;
+	fbuf->op.in.link.oldnodeid = ip->ufs_ino.i_number;
 	memcpy(fbuf->fb_dat, cnp->cn_nameptr, cnp->cn_namelen);
 	fbuf->fb_dat[cnp->cn_namelen] = '\0';
 
@@ -704,7 +709,7 @@ fusefs_symlink(void *v)
 	struct fusefs_node *dp;
 	struct fusefs_mnt *fmp;
 	struct fusebuf *fbuf;
-	struct vnode *tdp;
+	struct vnode *tvp;
 	int error = 0;
 	int len;
 
@@ -724,7 +729,7 @@ fusefs_symlink(void *v)
 	len = strlen(target) + 1;
 
 	fbuf = fb_setup(len + cnp->cn_namelen + 1, dp->ufs_ino.i_number,
-	    FBT_SYMLINK, p);
+	    FUSE_SYMLINK, p);
 
 	memcpy(fbuf->fb_dat, cnp->cn_nameptr, cnp->cn_namelen);
 	fbuf->fb_dat[cnp->cn_namelen] = '\0';
@@ -739,17 +744,26 @@ fusefs_symlink(void *v)
 		goto bad;
 	}
 
-	if ((error = VFS_VGET(fmp->mp, fbuf->fb_ino, &tdp))) {
+        /* symlink returns a fuse_entry_out with the ino of the new link */
+	if (fbuf->op.out.entry.nodeid == 0 ||
+	    fbuf->op.out.entry.nodeid == FUSE_ROOT_ID) {
+		printf("fusefs_symlink: file system returned invalid nodeid\n");
+		error = EINVAL;
 		fb_delete(fbuf);
 		goto bad;
 	}
 
-	tdp->v_type = VLNK;
+	if ((error = VFS_VGET(fmp->mp, fbuf->op.out.entry.nodeid, &tvp))) {
+		fb_delete(fbuf);
+		goto bad;
+	}
+
+	tvp->v_type = VLNK;
 	VN_KNOTE(ap->a_dvp, NOTE_WRITE);
 
-	*vpp = tdp;
+	*vpp = tvp;
 	fb_delete(fbuf);
-	vput(tdp);
+	vput(tvp);
 bad:
 	vput(dvp);
 	return (error);
@@ -766,17 +780,25 @@ fusefs_readdir(void *v)
 	struct proc *p;
 	struct uio *uio;
 	int error = 0, eofflag = 0, diropen = 0;
+	struct dirent de;
+	struct fuse_dirent *fde;
+	uint64_t fresid;
+	off_t foffset, freclen;
 
 	vp = ap->a_vp;
 	uio = ap->a_uio;
 	p = uio->uio_procp;
+	foffset = uio->uio_offset;
 
 	ip = VTOI(vp);
 	fmp = (struct fusefs_mnt *)ip->ufs_ino.i_ump;
-
 	if (!fmp->sess_init)
 		return (ENXIO);
 
+	/*
+	 * Basic check for ensure buffer is large enough for at least one
+	 * dirent with maximum allowed name length.
+	 */
 	if (uio->uio_resid < sizeof(struct dirent))
 		return (EINVAL);
 
@@ -788,23 +810,16 @@ fusefs_readdir(void *v)
 		diropen = 1;
 	}
 
-	while (uio->uio_resid > 0) {
-		fbuf = fb_setup(0, ip->ufs_ino.i_number, FBT_READDIR, p);
+	while (!error && uio->uio_resid > DIRENT_RECSIZE(1)) {
+		fbuf = fb_setup(0, ip->ufs_ino.i_number, FUSE_READDIR, p);
 
-		fbuf->fb_io_fd = ip->fufh[FUFH_RDONLY].fh_id;
-		fbuf->fb_io_off = uio->uio_offset;
-		fbuf->fb_io_len = MIN(uio->uio_resid, fmp->max_read);
+		fbuf->op.in.read.fh = ip->fufh[FUFH_RDONLY].fh_id;
+		fbuf->op.in.read.offset = foffset;
+		fbuf->op.in.read.size = MIN(uio->uio_resid, fmp->max_read);
 
 		error = fb_queue(fmp->dev, fbuf);
 
 		if (error) {
-			/*
-			 * dirent was larger than residual space left in
-			 * buffer.
-			 */
-			if (error == ENOBUFS)
-				error = 0;
-
 			fb_delete(fbuf);
 			break;
 		}
@@ -814,15 +829,79 @@ fusefs_readdir(void *v)
 			eofflag = 1;
 			fb_delete(fbuf);
 			break;
-		}
-
-		if ((error = uiomove(fbuf->fb_dat, fbuf->fb_len, uio))) {
+		} else if (fbuf->fb_len < FUSE_NAME_OFFSET) {
+			printf("fusefs_readdir: fb_len too small: %llu\n",
+			    fbuf->fb_len);
+			error = EIO;
 			fb_delete(fbuf);
 			break;
 		}
 
+		/* convert FUSE dirents to those expected by userland */
+		fresid = fbuf->fb_len;
+		fde = (struct fuse_dirent *)fbuf->fb_dat;
+		while (uio->uio_resid > 0 && fresid >= FUSE_NAME_OFFSET) {
+			/* basic sanity check */
+			if (fde->namelen == 0 || fde->namelen > MAXNAMLEN) {
+				printf("fusefs_readdir: invalid namelen: %d\n",
+				    fde->namelen);
+				error = EIO;
+				break;
+			}
+
+			freclen = FUSE_DIRENT_SIZE(fde);
+
+			/*
+			 * libfuse will truncate the last fuse_dirent if the
+			 * buffer is too small so ignore it.
+			 */
+			if (freclen > fresid)
+				break;
+
+			/* file names cannot contain a slash */
+			if (memchr(fde->name, '/', fde->namelen) != NULL) {
+				error = EIO;
+				break;
+			}
+
+			de.d_namlen = fde->namelen;
+			de.d_reclen = DIRENT_RECSIZE(de.d_namlen);
+
+			if (uio->uio_resid < de.d_reclen)
+				goto out;
+
+			/*
+			 * d_off is used by telldir, seekdir, readdir libc
+			 * functions and expect the file system's offset. This
+			 * will be passed back to this function so needs to be
+			 * the FUSE offset.
+			 */
+			de.d_off = fde->off;
+			de.d_fileno = fde->ino;
+			de.d_type = fde->type;
+			memcpy(de.d_name, fde->name, de.d_namlen);
+			memset(de.d_name + de.d_namlen, 0, de.d_reclen
+			    - de.d_namlen - offsetof(struct dirent, d_name));
+			if ((error = uiomove(&de, de.d_reclen, uio)))
+				break;
+
+			/* advance to next FUSE dirent */
+			fresid -= freclen;
+			foffset = fde->off;
+			fde = (struct fuse_dirent *)((char *)fde + freclen);
+		}
+
 		fb_delete(fbuf);
+
+		/* avoid unnecessary calls if we know it's EOF */
+		if (!error && fresid == 0 && uio->uio_resid > 0) {
+			eofflag = 1;
+			break;
+		}
 	}
+
+out:
+	uio->uio_offset = foffset;
 
 	if (!error && ap->a_eofflag != NULL)
 		*ap->a_eofflag = eofflag;
@@ -901,7 +980,7 @@ fusefs_readlink(void *v)
 	if (fmp->undef_op & UNDEF_READLINK)
 		return (ENOSYS);
 
-	fbuf = fb_setup(0, ip->ufs_ino.i_number, FBT_READLINK, p);
+	fbuf = fb_setup(0, ip->ufs_ino.i_number, FUSE_READLINK, p);
 
 	error = fb_queue(fmp->dev, fbuf);
 
@@ -929,7 +1008,7 @@ fusefs_reclaim(void *v)
 	struct fusefs_filehandle *fufh = NULL;
 	struct fusefs_mnt *fmp;
 	struct fusebuf *fbuf;
-	int type, error = 0;
+	int type = 0;
 
 	fmp = (struct fusefs_mnt *)ip->ufs_ino.i_ump;
 
@@ -943,20 +1022,14 @@ fusefs_reclaim(void *v)
 		}
 	}
 
-	/*
-	 * If the fuse connection is opened ask libfuse to free the vnodes.
-	 */
-	if (fmp->sess_init && ip->ufs_ino.i_number != FUSE_ROOTINO) {
-		fbuf = fb_setup(0, ip->ufs_ino.i_number, FBT_RECLAIM, p);
-		error = fb_queue(fmp->dev, fbuf);
-		if (error)
-			printf("fusefs: vnode reclaim failed: %d\n", error);
-		fb_delete(fbuf);
+	/* If the fuse connection is opened ask libfuse to free the vnodes. */
+	if (fmp->sess_init && ip->ufs_ino.i_number != FUSE_ROOT_ID) {
+		fbuf = fb_setup(0, ip->ufs_ino.i_number, FUSE_FORGET, p);
+		fbuf->op.in.forget.nlookup = ip->nlookup;
+		fuse_device_queue_fbuf(fmp->dev, fbuf); /* no response */
 	}
 
-	/*
-	 * Remove the inode from its hash chain.
-	 */
+	/* Remove the inode from its hash chain. */
 	ufs_ihashrem(&ip->ufs_ino);
 
 	free(ip, M_FUSEFS, sizeof(*ip));
@@ -988,7 +1061,7 @@ fusefs_create(void *v)
 	struct vnode *dvp = ap->a_dvp;
 	struct vattr *vap = ap->a_vap;
 	struct proc *p = cnp->cn_proc;
-	struct vnode *tdp = NULL;
+	struct vnode *tvp = NULL;
 	struct fusefs_mnt *fmp;
 	struct fusefs_node *ip;
 	struct fusebuf *fbuf;
@@ -1006,9 +1079,10 @@ fusefs_create(void *v)
 		return (ENOSYS);
 
 	fbuf = fb_setup(cnp->cn_namelen + 1, ip->ufs_ino.i_number,
-	    FBT_MKNOD, p);
+	    FUSE_MKNOD, p);
 
-	fbuf->fb_io_mode = mode;
+	fbuf->op.in.mknod.mode = mode;
+	fbuf->op.in.mknod.umask = p->p_p->ps_fd->fd_cmask;
 
 	memcpy(fbuf->fb_dat, cnp->cn_nameptr, cnp->cn_namelen);
 	fbuf->fb_dat[cnp->cn_namelen] = '\0';
@@ -1021,12 +1095,20 @@ fusefs_create(void *v)
 		goto out;
 	}
 
-	if ((error = VFS_VGET(fmp->mp, fbuf->fb_ino, &tdp)))
+        /* mknod returns a fuse_entry_out with the ino of the new file */
+	if (fbuf->op.out.entry.nodeid == 0 ||
+	    fbuf->op.out.entry.nodeid == FUSE_ROOT_ID) {
+		printf("fusefs_create: file system returned invalid nodeid\n");
+		error = EINVAL;
+		goto out;
+	}
+
+        if ((error = VFS_VGET(fmp->mp, fbuf->op.out.entry.nodeid, &tvp)))
 		goto out;
 
-	tdp->v_type = IFTOVT(fbuf->fb_io_mode);
+	tvp->v_type = IFTOVT(mode);
 
-	*vpp = tdp;
+	*vpp = tvp;
 	VN_KNOTE(ap->a_dvp, NOTE_WRITE);
 out:
 	fb_delete(fbuf);
@@ -1042,7 +1124,7 @@ fusefs_mknod(void *v)
 	struct vnode *dvp = ap->a_dvp;
 	struct vattr *vap = ap->a_vap;
 	struct proc *p = cnp->cn_proc;
-	struct vnode *tdp = NULL;
+	struct vnode *tvp = NULL;
 	struct fusefs_mnt *fmp;
 	struct fusefs_node *ip;
 	struct fusebuf *fbuf;
@@ -1058,11 +1140,12 @@ fusefs_mknod(void *v)
 		return (ENOSYS);
 
 	fbuf = fb_setup(cnp->cn_namelen + 1, ip->ufs_ino.i_number,
-	    FBT_MKNOD, p);
+	    FUSE_MKNOD, p);
 
-	fbuf->fb_io_mode = MAKEIMODE(vap->va_type, vap->va_mode);
+	fbuf->op.in.mknod.mode = MAKEIMODE(vap->va_type, vap->va_mode);
+	fbuf->op.in.mknod.umask = p->p_p->ps_fd->fd_cmask;
 	if (vap->va_rdev != VNOVAL)
-		fbuf->fb_io_rdev = vap->va_rdev;
+		fbuf->op.in.mknod.rdev = vap->va_rdev;
 
 	memcpy(fbuf->fb_dat, cnp->cn_nameptr, cnp->cn_namelen);
 	fbuf->fb_dat[cnp->cn_namelen] = '\0';
@@ -1075,12 +1158,20 @@ fusefs_mknod(void *v)
 		goto out;
 	}
 
-	if ((error = VFS_VGET(fmp->mp, fbuf->fb_ino, &tdp)))
+	/* mknod returns a fuse_entry_out with the ino of the new file */
+	if (fbuf->op.out.entry.nodeid == 0 ||
+	    fbuf->op.out.entry.nodeid == FUSE_ROOT_ID) {
+		printf("fusefs_mknod: file system returned invalid nodeid\n");
+		error = EINVAL;
+		goto out;
+	}
+
+	if ((error = VFS_VGET(fmp->mp, fbuf->op.out.entry.nodeid, &tvp)))
 		goto out;
 
-	tdp->v_type = IFTOVT(fbuf->fb_io_mode);
+	tvp->v_type = IFTOVT(fbuf->op.in.mknod.mode);
 
-	*vpp = tdp;
+	*vpp = tvp;
 	VN_KNOTE(ap->a_dvp, NOTE_WRITE);
 
 	/* Remove inode so that it will be reloaded by VFS_VGET and
@@ -1120,12 +1211,12 @@ fusefs_read(void *v)
 		return (EINVAL);
 
 	while (uio->uio_resid > 0) {
-		fbuf = fb_setup(0, ip->ufs_ino.i_number, FBT_READ, p);
+		fbuf = fb_setup(0, ip->ufs_ino.i_number, FUSE_READ, p);
 
 		size = MIN(uio->uio_resid, fmp->max_read);
-		fbuf->fb_io_fd = fusefs_fd_get(ip, FUFH_RDONLY);
-		fbuf->fb_io_off = uio->uio_offset;
-		fbuf->fb_io_len = size;
+		fbuf->op.in.read.fh = fusefs_fd_get(ip, FUFH_RDONLY);
+		fbuf->op.in.read.offset = uio->uio_offset;
+		fbuf->op.in.read.size = size;
 
 		error = fb_queue(fmp->dev, fbuf);
 
@@ -1179,15 +1270,15 @@ fusefs_write(void *v)
 	}
 
 	while (uio->uio_resid > 0) {
-		len = MIN(uio->uio_resid, fmp->max_read);
-		fbuf = fb_setup(len, ip->ufs_ino.i_number, FBT_WRITE, p);
+		len = MIN(uio->uio_resid, fmp->max_write);
+		fbuf = fb_setup(len, ip->ufs_ino.i_number, FUSE_WRITE, p);
 
-		fbuf->fb_io_fd = fusefs_fd_get(ip, FUFH_WRONLY);
-		fbuf->fb_io_off = uio->uio_offset;
-		fbuf->fb_io_len = len;
+		fbuf->op.in.write.fh = fusefs_fd_get(ip, FUFH_WRONLY);
+		fbuf->op.in.write.offset = uio->uio_offset;
+		fbuf->op.in.write.size = len;
 
 		if ((error = uiomove(fbuf->fb_dat, len, uio))) {
-			printf("fusefs: uio error %i\n", error);
+			printf("fusefs_write: uio error %i\n", error);
 			break;
 		}
 
@@ -1196,8 +1287,8 @@ fusefs_write(void *v)
 		if (error)
 			break;
 
-		diff = len - fbuf->fb_io_len;
-		if (fbuf->fb_io_len > len) {
+		diff = len - fbuf->op.out.write.size;
+		if (fbuf->op.out.write.size > len) {
 			error = EINVAL;
 			break;
 		}
@@ -1319,14 +1410,14 @@ abortit:
 	}
 
 	fbuf = fb_setup(fcnp->cn_namelen + tcnp->cn_namelen + 2,
-	    dp->ufs_ino.i_number, FBT_RENAME, p);
+	    dp->ufs_ino.i_number, FUSE_RENAME, p);
 
 	memcpy(fbuf->fb_dat, fcnp->cn_nameptr, fcnp->cn_namelen);
 	fbuf->fb_dat[fcnp->cn_namelen] = '\0';
 	memcpy(fbuf->fb_dat + fcnp->cn_namelen + 1, tcnp->cn_nameptr,
 	    tcnp->cn_namelen);
 	fbuf->fb_dat[fcnp->cn_namelen + tcnp->cn_namelen + 1] = '\0';
-	fbuf->fb_io_ino = VTOI(tdvp)->ufs_ino.i_number;
+	fbuf->op.in.rename.newdir = VTOI(tdvp)->ufs_ino.i_number;
 
 	error = fb_queue(fmp->dev, fbuf);
 
@@ -1365,7 +1456,7 @@ fusefs_mkdir(void *v)
 	struct componentname *cnp = ap->a_cnp;
 	struct vattr *vap = ap->a_vap;
 	struct proc *p = cnp->cn_proc;
-	struct vnode *tdp = NULL;
+	struct vnode *tvp = NULL;
 	struct fusefs_node *ip;
 	struct fusefs_mnt *fmp;
 	struct fusebuf *fbuf;
@@ -1386,9 +1477,10 @@ fusefs_mkdir(void *v)
 	}
 
 	fbuf = fb_setup(cnp->cn_namelen + 1, ip->ufs_ino.i_number,
-	    FBT_MKDIR, p);
+	    FUSE_MKDIR, p);
 
-	fbuf->fb_io_mode = MAKEIMODE(vap->va_type, vap->va_mode);
+	fbuf->op.in.mkdir.mode = MAKEIMODE(vap->va_type, vap->va_mode);
+	fbuf->op.in.mkdir.umask = p->p_p->ps_fd->fd_cmask;
 	memcpy(fbuf->fb_dat, cnp->cn_nameptr, cnp->cn_namelen);
 	fbuf->fb_dat[cnp->cn_namelen] = '\0';
 
@@ -1401,14 +1493,23 @@ fusefs_mkdir(void *v)
 		goto out;
 	}
 
-	if ((error = VFS_VGET(fmp->mp, fbuf->fb_ino, &tdp))) {
+        /* mkdir returns a fuse_entry_out with the ino of the new directory */
+	if (fbuf->op.out.entry.nodeid == 0 ||
+	    fbuf->op.out.entry.nodeid == FUSE_ROOT_ID) {
+		printf("fusefs_mkdir: file sytem returned invalid nodeid\n");
+		error = EINVAL;
 		fb_delete(fbuf);
 		goto out;
 	}
 
-	tdp->v_type = IFTOVT(fbuf->fb_io_mode);
+	if ((error = VFS_VGET(fmp->mp, fbuf->op.out.entry.nodeid, &tvp))) {
+		fb_delete(fbuf);
+		goto out;
+	}
 
-	*vpp = tdp;
+	tvp->v_type = IFTOVT(fbuf->op.in.mkdir.mode);
+
+	*vpp = tvp;
 	VN_KNOTE(ap->a_dvp, NOTE_WRITE | NOTE_LINK);
 	fb_delete(fbuf);
 out:
@@ -1446,7 +1547,7 @@ fusefs_rmdir(void *v)
 	VN_KNOTE(dvp, NOTE_WRITE | NOTE_LINK);
 
 	fbuf = fb_setup(cnp->cn_namelen + 1, dp->ufs_ino.i_number,
-	    FBT_RMDIR, p);
+	    FUSE_RMDIR, p);
 	memcpy(fbuf->fb_dat, cnp->cn_nameptr, cnp->cn_namelen);
 	fbuf->fb_dat[cnp->cn_namelen] = '\0';
 
@@ -1503,7 +1604,7 @@ fusefs_remove(void *v)
 	}
 
 	fbuf = fb_setup(cnp->cn_namelen + 1, dp->ufs_ino.i_number,
-	    FBT_UNLINK, p);
+	    FUSE_UNLINK, p);
 	memcpy(fbuf->fb_dat, cnp->cn_nameptr, cnp->cn_namelen);
 	fbuf->fb_dat[cnp->cn_namelen] = '\0';
 
@@ -1606,8 +1707,8 @@ fusefs_fsync(void *v)
 		if (fufh->fh_type == FUFH_WRONLY ||
 		    fufh->fh_type == FUFH_RDWR) {
 
-			fbuf = fb_setup(0, ip->ufs_ino.i_number, FBT_FSYNC, p);
-			fbuf->fb_io_fd = fufh->fh_id;
+			fbuf = fb_setup(0, ip->ufs_ino.i_number, FUSE_FSYNC, p);
+			fbuf->op.in.fsync.fh = fufh->fh_id;
 
 			/* Always behave as if ap->a_waitfor = MNT_WAIT. */
 			error = fb_queue(fmp->dev, fbuf);
