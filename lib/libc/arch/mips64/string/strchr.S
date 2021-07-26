@@ -1,4 +1,8 @@
+<<<<<<< strchr.S
 /*	$OpenBSD: strchr.S,v 1.3.18.1 2021/07/26 06:09:05 benno Exp $ */
+=======
+/*	$OpenBSD: strchr.S,v 1.3.22.1 2021/07/26 06:10:07 benno Exp $ */
+>>>>>>> 1.3.22.1
 /*-
  * Copyright (c) 1991, 1993
  *	The Regents of the University of California.  All rights reserved.
