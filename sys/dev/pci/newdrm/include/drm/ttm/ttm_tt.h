@@ -62,13 +62,17 @@ struct ttm_operation_ctx;
  * memory.
  */
 struct ttm_tt {
-	struct page **pages;
+	struct vm_page **pages;
 	uint32_t page_flags;
 	uint32_t num_pages;
 	struct sg_table *sg;
 	dma_addr_t *dma_address;
-	struct file *swap_storage;
+	struct uvm_object *swap_storage;
 	enum ttm_caching caching;
+
+	bus_dma_tag_t dmat;
+	bus_dmamap_t map;
+	bus_dma_segment_t *segs;
 };
 
 /**
@@ -205,7 +209,7 @@ struct ttm_kmap_iter *ttm_kmap_iter_tt_init(struct ttm_kmap_iter_tt *iter_tt,
  * bind and unbind memory backing a ttm_tt.
  */
 struct ttm_tt *ttm_agp_tt_create(struct ttm_buffer_object *bo,
-				 struct agp_bridge_data *bridge,
+				 struct drm_agp_head *agp,
 				 uint32_t page_flags);
 int ttm_agp_bind(struct ttm_tt *ttm, struct ttm_resource *bo_mem);
 void ttm_agp_unbind(struct ttm_tt *ttm);

@@ -55,7 +55,7 @@ extern struct ttm_global {
 	 * Constant after init.
 	 */
 
-	struct page *dummy_read_page;
+	struct vm_page *dummy_read_page;
 
 	/**
 	 * Protected by ttm_global_mutex.
@@ -253,6 +253,10 @@ struct ttm_device {
 	 */
 	struct ttm_resource_manager sysman;
 	struct ttm_resource_manager *man_drv[TTM_NUM_MEM_TYPES];
+
+	bus_space_tag_t iot;
+	bus_space_tag_t memt;
+	bus_dma_tag_t dmat;
 
 	/*
 	 * Protected by internal locks.
