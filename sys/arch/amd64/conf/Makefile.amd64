@@ -194,6 +194,8 @@ dcn_calc_math.o: $S/dev/pci/newdrm/amd/display/dc/calcs/dcn_calc_math.c
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
 display_mode_vba.o: $S/dev/pci/newdrm/amd/display/dc/dml/display_mode_vba.c
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
+dcn2x.o: $S/dev/pci/newdrm/amd/display/dc/dml/dcn2x/dcn2x.c
+	${NORMAL_C} ${HARDFLOAT_CFLAGS}
 display_mode_vba_20.o: $S/dev/pci/newdrm/amd/display/dc/dml/dcn20/display_mode_vba_20.c
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
 display_rq_dlg_calc_20.o: $S/dev/pci/newdrm/amd/display/dc/dml/dcn20/display_rq_dlg_calc_20.c
@@ -202,7 +204,11 @@ display_mode_vba_20v2.o: $S/dev/pci/newdrm/amd/display/dc/dml/dcn20/display_mode
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
 display_mode_vba_30.o: $S/dev/pci/newdrm/amd/display/dc/dml/dcn30/display_mode_vba_30.c
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
+display_mode_vba_31.o: $S/dev/pci/newdrm/amd/display/dc/dml/dcn31/display_mode_vba_31.c
+	${NORMAL_C} ${HARDFLOAT_CFLAGS}
 display_rq_dlg_calc_30.o: $S/dev/pci/newdrm/amd/display/dc/dml/dcn30/display_rq_dlg_calc_30.c
+	${NORMAL_C} ${HARDFLOAT_CFLAGS}
+display_rq_dlg_calc_31.o: $S/dev/pci/newdrm/amd/display/dc/dml/dcn31/display_rq_dlg_calc_31.c
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
 display_rq_dlg_calc_20v2.o: $S/dev/pci/newdrm/amd/display/dc/dml/dcn20/display_rq_dlg_calc_20v2.c
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
