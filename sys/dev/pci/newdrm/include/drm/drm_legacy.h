@@ -249,6 +249,7 @@ static inline void drm_legacy_pci_exit(const struct drm_driver *driver,
  * AGP Support
  */
 
+#ifdef __linux__
 struct drm_agp_head {
 	struct agp_kern_info agp_info;
 	struct list_head memory;
@@ -261,6 +262,25 @@ struct drm_agp_head {
 	int cant_use_aperture;
 	unsigned long page_mask;
 };
+#else
+
+#include <dev/pci/pcivar.h>
+#include <dev/pci/agpvar.h>
+
+struct drm_agp_head {
+	struct agp_softc			*agpdev;
+	const char				*chipset;
+	TAILQ_HEAD(agp_memlist, drm_agp_mem)	 memory;
+	struct agp_info				 info;
+	unsigned long				 base;
+	unsigned long				 mode;
+	unsigned long				 page_mask;
+	int					 acquired;
+	int					 cant_use_aperture;
+	int					 enabled;
+   	int					 mtrr;
+};
+#endif
 
 #if IS_ENABLED(CONFIG_DRM_LEGACY) && IS_ENABLED(CONFIG_AGP)
 struct drm_agp_head *drm_legacy_agp_init(struct drm_device *dev);

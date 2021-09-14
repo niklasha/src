@@ -59,7 +59,6 @@
 #include <drm/drm_print.h>
 
 #include <drm/drm_gem.h>
-#include <drm/drm_agpsupport.h>
 
 #include "drm_crtc_internal.h"
 #include "drm_internal.h"
@@ -758,7 +757,6 @@ err:
 	drm_managed_release(dev);
 
 	return ret;
-#endif
 }
 
 #ifdef notyet
@@ -772,6 +770,9 @@ static int devm_drm_dev_init(struct device *parent,
 			     struct drm_device *dev,
 			     const struct drm_driver *driver)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	int ret;
 
 	ret = drm_dev_init(dev, driver, parent);
@@ -780,6 +781,7 @@ static int devm_drm_dev_init(struct device *parent,
 
 	return devm_add_action_or_reset(parent,
 					devm_drm_dev_init_release, dev);
+#endif
 }
 
 void *__devm_drm_dev_alloc(struct device *parent,
@@ -1130,6 +1132,7 @@ static const struct file_operations drm_stub_fops = {
 	.open = drm_stub_open,
 	.llseek = noop_llseek,
 };
+#endif /* __linux__ */
 
 static void drm_core_exit(void)
 {
@@ -1385,6 +1388,7 @@ drm_attach(struct device *parent, struct device *self, void *aux)
 	if (ret)
 		goto error;
 
+#ifdef CONFIG_DRM_LEGACY
 	if (drm_core_check_feature(dev, DRIVER_USE_AGP)) {
 #if IS_ENABLED(CONFIG_AGP)
 		if (da->is_agp)
@@ -1396,6 +1400,7 @@ drm_attach(struct device *parent, struct device *self, void *aux)
 				dev->agp->mtrr = 1;
 		}
 	}
+#endif
 
 	if (dev->driver->gem_size > 0) {
 		KASSERT(dev->driver->gem_size >= sizeof(struct drm_gem_object));
@@ -1441,6 +1446,7 @@ drm_detach(struct device *self, int flags)
 			pool_destroy(&dev->objpl);
 	}
 
+#ifdef CONFIG_DRM_LEGACY
 	if (dev->agp && dev->agp->mtrr) {
 		int retcode;
 
@@ -1450,6 +1456,7 @@ drm_detach(struct device *self, int flags)
 	}
 
 	free(dev->agp, M_DRM, 0);
+#endif
 	if (dev->pdev && dev->pdev->bus)
 		free(dev->pdev->bus->self, M_DRM, sizeof(struct pci_dev));
 
