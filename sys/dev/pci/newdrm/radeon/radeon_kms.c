@@ -81,7 +81,6 @@ irqreturn_t	radeon_driver_irq_handler_kms(void *);
 
 extern const struct pci_device_id radeondrm_pciidlist[];
 extern struct drm_driver kms_driver;
-const struct drm_ioctl_desc radeon_ioctls_kms[];
 extern int radeon_max_kms_ioctl;
 
 /*
@@ -649,7 +648,7 @@ radeondrm_attach_kms(struct device *parent, struct device *self, void *aux)
 #endif
 
 	/* update BUS flag */
-	if (drm_pci_device_is_agp(dev)) {
+	if (pci_get_capability(pa->pa_pc, pa->pa_tag, PCI_CAP_AGP, NULL, NULL)) {
 		rdev->flags |= RADEON_IS_AGP;
 	} else if (pci_get_capability(pa->pa_pc, pa->pa_tag,
 	    PCI_CAP_PCIEXPRESS, NULL, NULL)) {
@@ -974,7 +973,11 @@ int radeon_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 
 	switch (info->request) {
 	case RADEON_INFO_DEVICE_ID:
+#ifdef __linux__
 		*value = to_pci_dev(dev->dev)->device;
+#else
+		*value = dev->pdev->device;
+#endif
 		break;
 	case RADEON_INFO_NUM_GB_PIPES:
 		*value = rdev->num_gb_pipes;
