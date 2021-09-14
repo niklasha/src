@@ -3484,6 +3484,9 @@ EXPORT_SYMBOL(drm_edp_backlight_init);
 
 static int dp_aux_backlight_update_status(struct backlight_device *bd)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	struct dp_aux_backlight *bl = bl_get_data(bd);
 	u16 brightness = backlight_get_brightness(bd);
 	int ret = 0;
@@ -3503,6 +3506,7 @@ static int dp_aux_backlight_update_status(struct backlight_device *bd)
 	}
 
 	return ret;
+#endif
 }
 
 static const struct backlight_ops dp_aux_bl_ops = {

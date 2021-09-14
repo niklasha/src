@@ -2,6 +2,7 @@
 
 #include <sys/param.h>
 
+#define CONFIG_DRM_KMS_HELPER			1
 #define CONFIG_BACKLIGHT_CLASS_DEVICE		1
 #define CONFIG_DRM_FBDEV_EMULATION		1
 #define CONFIG_DRM_PANEL			1
