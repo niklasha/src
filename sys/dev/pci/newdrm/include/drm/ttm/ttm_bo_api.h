@@ -516,6 +516,7 @@ int ttm_bo_vmap(struct ttm_buffer_object *bo, struct dma_buf_map *map);
  */
 void ttm_bo_vunmap(struct ttm_buffer_object *bo, struct dma_buf_map *map);
 
+#ifdef notyet
 /**
  * ttm_bo_mmap_obj - mmap memory backed by a ttm buffer object.
  *
@@ -525,8 +526,8 @@ void ttm_bo_vunmap(struct ttm_buffer_object *bo, struct dma_buf_map *map);
  * Maps a buffer object.
  */
 int ttm_bo_mmap_obj(struct vm_area_struct *vma, struct ttm_buffer_object *bo);
+#endif
 
-#ifdef notyet
 /**
  * ttm_bo_io
  *
@@ -615,6 +616,8 @@ int ttm_bo_vm_fault(struct uvm_faultinfo *, vaddr_t, vm_page_t *,
 #endif /* !__linux__ */
 bool ttm_bo_delayed_delete(struct ttm_device *bdev, bool remove_all);
 
+#ifdef __linux__
 vm_fault_t ttm_bo_vm_dummy_page(struct vm_fault *vmf, pgprot_t prot);
+#endif
 
 #endif
