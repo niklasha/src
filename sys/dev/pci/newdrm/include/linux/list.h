@@ -291,7 +291,7 @@ list_splice_tail_init(struct list_head *list, struct list_head *head)
 }
 
 void	list_sort(void *, struct list_head *,
-	    int (*)(void *, struct list_head *, struct list_head *));
+	    int (*)(void *, const struct list_head *, const struct list_head *));
 
 #define hlist_entry(ptr, type, member) \
 	((ptr) ? container_of(ptr, type, member) : NULL)
