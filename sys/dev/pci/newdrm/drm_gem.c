@@ -205,13 +205,6 @@ udv_attach_drm(dev_t device, vm_prot_t accessprot, voff_t off, vsize_t size)
 		return NULL;
 	}
 
-	if (node->readonly) {
-		if (accessprot & PROT_WRITE) {
-			drm_gem_object_put(obj);
-			return NULL;
-		}
-	}
-
 	return &obj->uobj;
 }
 
@@ -960,6 +953,9 @@ EXPORT_SYMBOL(drm_gem_object_lookup);
 long drm_gem_dma_resv_wait(struct drm_file *filep, u32 handle,
 				    bool wait_all, unsigned long timeout)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	long ret;
 	struct drm_gem_object *obj;
 
@@ -978,6 +974,7 @@ long drm_gem_dma_resv_wait(struct drm_file *filep, u32 handle,
 	drm_gem_object_put(obj);
 
 	return ret;
+#endif
 }
 EXPORT_SYMBOL(drm_gem_dma_resv_wait);
 
@@ -1177,6 +1174,7 @@ drm_gem_object_free(struct kref *kref)
 }
 EXPORT_SYMBOL(drm_gem_object_free);
 
+#ifdef __linux__
 /**
  * drm_gem_vm_open - vma->ops->open implementation for GEM
  * @vma: VM area structure
@@ -1206,8 +1204,6 @@ void drm_gem_vm_close(struct vm_area_struct *vma)
 	drm_gem_object_put(obj);
 }
 EXPORT_SYMBOL(drm_gem_vm_close);
-
-#ifdef __linux__
 
 /**
  * drm_gem_mmap_obj - memory map a GEM object

@@ -32,4 +32,24 @@ dma_buf_map_memcpy_to(struct dma_buf_map *dbm, const void *src, size_t len)
 		memcpy(dbm->vaddr, src, len);
 }
 
+static inline bool
+dma_buf_map_is_null(const struct dma_buf_map *dbm)
+{
+	if (dbm->is_iomem)
+		return (dbm->vaddr_iomem == NULL);
+	else
+		return (dbm->vaddr == NULL);
+}
+
+static inline void
+dma_buf_map_clear(struct dma_buf_map *dbm)
+{
+	if (dbm->is_iomem) {
+		dbm->vaddr_iomem = NULL;
+		dbm->is_iomem = false;
+	} else {
+		dbm->vaddr = NULL;
+	}
+}
+
 #endif
