@@ -1816,6 +1816,17 @@ dma_fence_get_stub(void)
 	return dma_fence_get(&dma_fence_stub);
 }
 
+struct dma_fence *
+dma_fence_allocate_private_stub(void)
+{
+	struct dma_fence *f = malloc(sizeof(*f), M_ZERO | M_WAITOK | M_CANFAIL);
+	if (f == NULL)
+		return ERR_PTR(-ENOMEM);
+	dma_fence_init(f, &dma_fence_stub_ops, &dma_fence_stub_mtx, 0, 0);
+	dma_fence_signal(f);
+	return f;
+}
+
 static const char *
 dma_fence_array_get_driver_name(struct dma_fence *fence)
 {
