@@ -34,4 +34,17 @@ struct dma_fence *dma_fence_chain_next(struct dma_fence *);
 #define dma_fence_chain_for_each(f, h) \
 	for (f = dma_fence_get(h); f != NULL; f = dma_fence_chain_next(f))
 
+static inline struct dma_fence_chain *
+dma_fence_chain_alloc(void)
+{
+	return malloc(sizeof(struct dma_fence_chain), M_DRM,
+	    M_WAITOK | M_CANFAIL);
+}
+
+static inline void
+dma_fence_chain_free(struct dma_fence_chain *dfc)
+{
+	free(dfc, M_DRM, sizeof(struct dma_fence_chain));
+}
+
 #endif
