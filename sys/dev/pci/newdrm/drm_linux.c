@@ -1819,7 +1819,8 @@ dma_fence_get_stub(void)
 struct dma_fence *
 dma_fence_allocate_private_stub(void)
 {
-	struct dma_fence *f = malloc(sizeof(*f), M_ZERO | M_WAITOK | M_CANFAIL);
+	struct dma_fence *f = malloc(sizeof(*f), M_DRM,
+	    M_ZERO | M_WAITOK | M_CANFAIL);
 	if (f == NULL)
 		return ERR_PTR(-ENOMEM);
 	dma_fence_init(f, &dma_fence_stub_ops, &dma_fence_stub_mtx, 0, 0);
