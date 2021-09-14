@@ -1597,7 +1597,11 @@ int radeon_suspend_kms(struct drm_device *dev, bool suspend,
 	}
 
 	rdev = dev->dev_private;
+#ifdef __linux__
 	pdev = to_pci_dev(dev->dev);
+#else
+	pdev = dev->pdev;
+#endif
 
 	if (rdev->shutdown)
 		return 0;
@@ -1697,7 +1701,11 @@ int radeon_resume_kms(struct drm_device *dev, bool resume, bool fbcon)
 {
 	struct drm_connector *connector;
 	struct radeon_device *rdev = dev->dev_private;
+#ifdef __linux__
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+#else
+	struct pci_dev *pdev = dev->pdev;
+#endif
 	struct drm_crtc *crtc;
 	int r;
 
