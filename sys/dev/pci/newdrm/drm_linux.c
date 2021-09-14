@@ -1378,6 +1378,15 @@ backlight_device_unregister(struct backlight_device *bd)
 	free(bd, M_DRM, sizeof(*bd));
 }
 
+struct backlight_device *
+devm_backlight_device_register(void *dev, const char *name, void *parent,
+    void *data, const struct backlight_ops *bo,
+    const struct backlight_properties *bp)
+{
+	STUB();
+	return NULL;
+}
+
 void
 backlight_schedule_update_status(struct backlight_device *bd)
 {
