@@ -32,7 +32,9 @@
 #include <linux/export.h>
 #include <linux/highmem.h>
 #include <linux/mem_encrypt.h>
+#ifdef __linux__
 #include <xen/xen.h>
+#endif
 
 #include <drm/drm_cache.h>
 
@@ -185,6 +187,8 @@ EXPORT_SYMBOL(drm_clflush_virt_range);
 
 bool drm_need_swiotlb(int dma_bits)
 {
+	return false;
+#ifdef notyet
 	struct resource *tmp;
 	resource_size_t max_iomem = 0;
 
@@ -211,6 +215,7 @@ bool drm_need_swiotlb(int dma_bits)
 		max_iomem = max(max_iomem,  tmp->end);
 
 	return max_iomem > ((u64)1 << dma_bits);
+#endif
 }
 EXPORT_SYMBOL(drm_need_swiotlb);
 
@@ -248,7 +253,7 @@ static void memcpy_fallback(struct dma_buf_map *dst,
 	}
 }
 
-#ifdef CONFIG_X86
+#if defined(CONFIG_X86) && defined(__linux__)
 
 static DEFINE_STATIC_KEY_FALSE(has_movntdqa);
 
