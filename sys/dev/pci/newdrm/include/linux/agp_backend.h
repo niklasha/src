@@ -3,6 +3,7 @@
 #ifndef _LINUX_AGP_BACKEND_H
 #define _LINUX_AGP_BACKEND_H
 
+#include <sys/types.h> /* for amd64 machine/pio.h */
 #include <machine/bus.h>
 
 #if defined(__amd64__) || defined(__i386__)
