@@ -3,6 +3,8 @@
 #ifndef _LINUX_LOCKDEP_H
 #define _LINUX_LOCKDEP_H
 
+#include <linux/smp.h>
+
 struct lock_class_key {
 };
 
