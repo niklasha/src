@@ -131,7 +131,11 @@ retry:
 	}
 	*obj = &robj->tbo.base;
 	(*obj)->funcs = &radeon_gem_object_funcs;
+#ifdef __linux__
 	robj->pid = task_pid_nr(current);
+#else
+	robj->pid = curproc->p_p->ps_pid;
+#endif
 
 	mutex_lock(&rdev->gem.mutex);
 	list_add_tail(&robj->list, &rdev->gem.objects);
@@ -360,6 +364,8 @@ int radeon_gem_create_ioctl(struct drm_device *dev, void *data,
 int radeon_gem_userptr_ioctl(struct drm_device *dev, void *data,
 			     struct drm_file *filp)
 {
+	return -ENOSYS;
+#ifdef notyet
 	struct ttm_operation_ctx ctx = { true, false };
 	struct radeon_device *rdev = dev->dev_private;
 	struct drm_radeon_gem_userptr *args = data;
@@ -446,6 +452,7 @@ handle_lockup:
 	r = radeon_gem_handle_lockup(rdev, r);
 
 	return r;
+#endif
 }
 
 int radeon_gem_set_domain_ioctl(struct drm_device *dev, void *data,
@@ -830,7 +837,7 @@ int radeon_mode_dumb_create(struct drm_file *file_priv,
 	args->pitch = radeon_align_pitch(rdev, args->width,
 					 DIV_ROUND_UP(args->bpp, 8), 0);
 	args->size = args->pitch * args->height;
-	args->size = ALIGN(args->size, PAGE_SIZE);
+	args->size = roundup2(args->size, PAGE_SIZE);
 
 	r = radeon_gem_object_create(rdev, args->size, 0,
 				     RADEON_GEM_DOMAIN_VRAM, 0,
