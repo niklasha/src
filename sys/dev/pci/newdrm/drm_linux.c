@@ -1497,6 +1497,13 @@ dma_fence_signal(struct dma_fence *fence)
 	return r;
 }
 
+int
+dma_fence_signal_timestamp(struct dma_fence *fence, ktime_t timestamp)
+{
+	STUB();
+	return -ENOSYS;
+}
+
 bool
 dma_fence_is_signaled(struct dma_fence *fence)
 {

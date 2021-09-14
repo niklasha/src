@@ -59,6 +59,7 @@ void dma_fence_release(struct kref *);
 void dma_fence_put(struct dma_fence *);
 int dma_fence_signal_locked(struct dma_fence *);
 int dma_fence_signal(struct dma_fence *);
+int dma_fence_signal_timestamp(struct dma_fence *, ktime_t);
 bool dma_fence_is_signaled(struct dma_fence *);
 bool dma_fence_is_signaled_locked(struct dma_fence *);
 long dma_fence_default_wait(struct dma_fence *, bool, long);
