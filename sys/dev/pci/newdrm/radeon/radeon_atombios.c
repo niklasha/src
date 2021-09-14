@@ -284,7 +284,11 @@ static bool radeon_atom_apply_quirks(struct drm_device *dev,
 				     uint16_t *line_mux,
 				     struct radeon_hpd *hpd)
 {
+#ifdef __linux__
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+#else
+	struct pci_dev *pdev = dev->pdev;
+#endif
 
 	/* Asus M2A-VM HDMI board lists the DVI port as HDMI */
 	if ((pdev->device == 0x791e) &&
