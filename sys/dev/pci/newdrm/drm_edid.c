@@ -2085,6 +2085,9 @@ EXPORT_SYMBOL(drm_get_edid);
 struct edid *drm_get_edid_switcheroo(struct drm_connector *connector,
 				     struct i2c_adapter *adapter)
 {
+	STUB();
+	return NULL;
+#ifdef notyet
 	struct drm_device *dev = connector->dev;
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
 	struct edid *edid;
@@ -2097,6 +2100,7 @@ struct edid *drm_get_edid_switcheroo(struct drm_connector *connector,
 	vga_switcheroo_unlock_ddc(pdev);
 
 	return edid;
+#endif
 }
 EXPORT_SYMBOL(drm_get_edid_switcheroo);
 
