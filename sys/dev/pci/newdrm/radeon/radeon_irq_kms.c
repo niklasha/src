@@ -202,8 +202,10 @@ static int radeon_irq_install(struct radeon_device *rdev, int irq)
 	struct drm_device *dev = rdev->ddev;
 	int ret;
 
+#ifdef notyet
 	if (irq == IRQ_NOTCONNECTED)
 		return -ENOTCONN;
+#endif
 
 	radeon_driver_irq_preinstall_kms(dev);
 
@@ -221,7 +223,11 @@ static int radeon_irq_install(struct radeon_device *rdev, int irq)
 static void radeon_irq_uninstall(struct radeon_device *rdev)
 {
 	struct drm_device *dev = rdev->ddev;
+#ifdef __linux__
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+#else
+	struct pci_dev *pdev = dev->pdev;
+#endif
 
 	radeon_driver_irq_uninstall_kms(dev);
 	free_irq(pdev->irq, dev);
