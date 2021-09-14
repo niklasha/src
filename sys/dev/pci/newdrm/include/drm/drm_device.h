@@ -93,6 +93,7 @@ struct drm_device {
 
 	struct klist note;
 	struct pci_dev  _pdev;
+	struct pci_dev *pdev;
 
 	struct mutex	quiesce_mtx;
 	int		quiesce;
