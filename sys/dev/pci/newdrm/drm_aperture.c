@@ -134,7 +134,7 @@ struct drm_aperture {
 	void (*detach)(struct drm_device *dev);
 };
 
-static LIST_HEAD(drm_apertures);
+static DRM_LIST_HEAD(drm_apertures);
 static DEFINE_MUTEX(drm_apertures_lock);
 
 static bool overlap(resource_size_t base1, resource_size_t end1,
@@ -160,6 +160,9 @@ static int devm_aperture_acquire(struct drm_device *dev,
 				 resource_size_t base, resource_size_t size,
 				 void (*detach)(struct drm_device *))
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	size_t end = base + size;
 	struct list_head *pos;
 	struct drm_aperture *ap;
@@ -191,10 +194,13 @@ static int devm_aperture_acquire(struct drm_device *dev,
 	mutex_unlock(&drm_apertures_lock);
 
 	return devm_add_action_or_reset(dev->dev, devm_aperture_acquire_release, ap);
+#endif
 }
 
 static void drm_aperture_detach_firmware(struct drm_device *dev)
 {
+	STUB();
+#ifdef notyet
 	struct platform_device *pdev = to_platform_device(dev->dev);
 
 	/*
@@ -210,6 +216,7 @@ static void drm_aperture_detach_firmware(struct drm_device *dev)
 	 * stays around after detachment.
 	 */
 	platform_device_unregister(pdev);
+#endif
 }
 
 /**
@@ -239,10 +246,14 @@ static void drm_aperture_detach_firmware(struct drm_device *dev)
 int devm_aperture_acquire_from_firmware(struct drm_device *dev, resource_size_t base,
 					resource_size_t size)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	if (drm_WARN_ON(dev, !dev_is_platform(dev->dev)))
 		return -EINVAL;
 
 	return devm_aperture_acquire(dev, base, size, drm_aperture_detach_firmware);
+#endif
 }
 EXPORT_SYMBOL(devm_aperture_acquire_from_firmware);
 
@@ -328,6 +339,9 @@ EXPORT_SYMBOL(drm_aperture_remove_conflicting_framebuffers);
 int drm_aperture_remove_conflicting_pci_framebuffers(struct pci_dev *pdev,
 						     const struct drm_driver *req_driver)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	resource_size_t base, size;
 	int bar, ret = 0;
 
@@ -349,5 +363,6 @@ int drm_aperture_remove_conflicting_pci_framebuffers(struct pci_dev *pdev,
 	if (ret == 0)
 		ret = vga_remove_vgacon(pdev);
 	return ret;
+#endif
 }
 EXPORT_SYMBOL(drm_aperture_remove_conflicting_pci_framebuffers);
