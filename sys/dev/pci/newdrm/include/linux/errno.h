@@ -13,5 +13,6 @@
 #define ECHRNG		EINVAL
 #define EHWPOISON	EIO
 #define ENOPKG		ENOENT
+#define EMULTIHOP	EIPSEC
 
 #endif
