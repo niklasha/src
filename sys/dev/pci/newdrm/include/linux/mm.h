@@ -70,8 +70,6 @@ si_mem_available(void)
 	return uvmexp.free;
 }
 
-#define MAX_ORDER	11
-
 static inline unsigned int
 get_order(size_t size)
 {
