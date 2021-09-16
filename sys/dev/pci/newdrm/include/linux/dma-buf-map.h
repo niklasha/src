@@ -52,4 +52,18 @@ dma_buf_map_clear(struct dma_buf_map *dbm)
 	}
 }
 
+static inline void
+dma_buf_map_set_vaddr_iomem(struct dma_buf_map *dbm, void *addr)
+{
+	dbm->vaddr_iomem = addr;
+	dbm->is_iomem = true;
+}
+
+static inline void
+dma_buf_map_set_vaddr(struct dma_buf_map *dbm, void *addr)
+{
+	dbm->vaddr = addr;
+	dbm->is_iomem = false;
+}
+
 #endif

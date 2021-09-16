@@ -289,14 +289,14 @@ static int ttm_bo_ioremap(struct ttm_buffer_object *bo,
 		else
 			flags = 0;
 		if (bus_space_map(bo->bdev->memt,
-		    bo->mem.bus.offset + offset,
+		    bo->resource->bus.offset + offset,
 		    size, BUS_SPACE_MAP_LINEAR | flags,
-		    &bo->mem.bus.bsh)) {
+		    &bo->resource->bus.bsh)) {
 			printf("%s bus_space_map failed\n", __func__);
 			map->virtual = 0;
 		} else {
 			map->virtual = bus_space_vaddr(bo->bdev->memt,
-			    bo->mem.bus.bsh);
+			    bo->resource->bus.bsh);
 		}
 	}
 	return (!map->virtual) ? -ENOMEM : 0;
@@ -377,12 +377,12 @@ void ttm_bo_kunmap(struct ttm_bo_kmap_obj *map)
 		return;
 	switch (map->bo_kmap_type) {
 	case ttm_bo_map_iomap:
-		bus_space_unmap(map->bo->bdev->memt, map->bo->mem.bus.bsh,
-		    (size_t)map->bo->mem.num_pages << PAGE_SHIFT);
+		bus_space_unmap(map->bo->bdev->memt, map->bo->resource->bus.bsh,
+		    (size_t)map->bo->resource->num_pages << PAGE_SHIFT);
 		break;
 	case ttm_bo_map_vmap:
 		vunmap(map->virtual,
-		    (size_t)map->bo->mem.num_pages << PAGE_SHIFT);
+		    (size_t)map->bo->resource->num_pages << PAGE_SHIFT);
 		break;
 	case ttm_bo_map_kmap:
 		kunmap_va(map->virtual);
@@ -422,14 +422,14 @@ int ttm_bo_vmap(struct ttm_buffer_object *bo, struct dma_buf_map *map)
 #endif
 			else
 				flags = 0;
-			if (bus_space_map(bo->bdev->memt, mem.bus.offset,
+			if (bus_space_map(bo->bdev->memt, mem->bus.offset,
 			    bo->base.size, BUS_SPACE_MAP_LINEAR | flags,
 			    &mem->bus.bsh)) {
 				printf("%s bus_space_map failed\n", __func__);
 				return -ENOMEM;
 			}
 			vaddr_iomem = bus_space_vaddr(bo->bdev->memt,
-			    bo->mem.bus.bsh);
+			    mem->bus.bsh);
 		}
 
 		if (!vaddr_iomem)
@@ -474,9 +474,11 @@ void ttm_bo_vunmap(struct ttm_buffer_object *bo, struct dma_buf_map *map)
 		return;
 
 	if (!map->is_iomem)
-		vunmap(map->vaddr);
+		vunmap(map->vaddr,
+		    (size_t)mem->num_pages << PAGE_SHIFT);
 	else if (!mem->bus.addr)
-		iounmap(map->vaddr_iomem);
+		bus_space_unmap(bo->bdev->memt, mem->bus.bsh,
+		    (size_t)mem->num_pages << PAGE_SHIFT);
 	dma_buf_map_clear(map);
 
 	ttm_mem_io_free(bo->bdev, bo->resource);
