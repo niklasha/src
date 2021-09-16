@@ -106,7 +106,7 @@ bool ttm_agp_is_bound(struct ttm_tt *ttm)
 	if (!ttm)
 		return false;
 
-	return (agp_be->mem != NULL);
+	return (agp_be->bound == 1);
 }
 EXPORT_SYMBOL(ttm_agp_is_bound);
 
@@ -114,7 +114,7 @@ void ttm_agp_destroy(struct ttm_tt *ttm)
 {
 	struct ttm_agp_backend *agp_be = container_of(ttm, struct ttm_agp_backend, ttm);
 
-	if (agp_be->mem)
+	if (agp_be->bound)
 		ttm_agp_unbind(ttm);
 	ttm_tt_fini(ttm);
 	kfree(agp_be);
@@ -122,7 +122,7 @@ void ttm_agp_destroy(struct ttm_tt *ttm)
 EXPORT_SYMBOL(ttm_agp_destroy);
 
 struct ttm_tt *ttm_agp_tt_create(struct ttm_buffer_object *bo,
-				 struct agp_bridge_data *bridge,
+				 struct drm_agp_head *agp,
 				 uint32_t page_flags)
 {
 	struct ttm_agp_backend *agp_be;
