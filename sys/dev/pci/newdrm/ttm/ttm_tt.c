@@ -197,44 +197,44 @@ int ttm_sg_tt_init(struct ttm_tt *ttm, struct ttm_buffer_object *bo,
 		return -ENOMEM;
 	}
 
-	ttm_dma->segs = km_alloc(round_page(ttm->num_pages *
+	ttm->segs = km_alloc(round_page(ttm->num_pages *
 	    sizeof(bus_dma_segment_t)), &kv_any, &kp_zero, &kd_waitok);
 
-	ttm_dma->dmat = bo->bdev->dmat;
+	ttm->dmat = bo->bdev->dmat;
 
-	if ((page_flags & TTM_PAGE_FLAG_DMA32) == 0)
+	if (bo->bdev->pool.use_dma32 == false)
 		flags |= BUS_DMA_64BIT;
-	if (bus_dmamap_create(ttm_dma->dmat, ttm->num_pages << PAGE_SHIFT,
+	if (bus_dmamap_create(ttm->dmat, ttm->num_pages << PAGE_SHIFT,
 	    ttm->num_pages, ttm->num_pages << PAGE_SHIFT, 0, flags,
-	    &ttm_dma->map)) {
-		km_free(ttm_dma->segs, round_page(ttm->num_pages *
+	    &ttm->map)) {
+		km_free(ttm->segs, round_page(ttm->num_pages *
 		    sizeof(bus_dma_segment_t)), &kv_any, &kp_zero);
 		kvfree(ttm->pages);
 		ttm->pages = NULL;
-		ttm_dma->dma_address = NULL;
+		ttm->dma_address = NULL;
 		pr_err("Failed allocating page table\n");
 		return -ENOMEM;
 	}
 
 
-	ttm_dma->segs = km_alloc(round_page(ttm->num_pages *
+	ttm->segs = km_alloc(round_page(ttm->num_pages *
 	    sizeof(bus_dma_segment_t)), &kv_any, &kp_zero, &kd_waitok);
 
-	ttm_dma->dmat = bo->bdev->dmat;
+	ttm->dmat = bo->bdev->dmat;
 
-	if ((page_flags & TTM_PAGE_FLAG_DMA32) == 0)
+	if (bo->bdev->pool.use_dma32 == false)
 		flags |= BUS_DMA_64BIT;
-	if (bus_dmamap_create(ttm_dma->dmat, ttm->num_pages << PAGE_SHIFT,
+	if (bus_dmamap_create(ttm->dmat, ttm->num_pages << PAGE_SHIFT,
 	    ttm->num_pages, ttm->num_pages << PAGE_SHIFT, 0, flags,
-	    &ttm_dma->map)) {
-		km_free(ttm_dma->segs, round_page(ttm->num_pages *
+	    &ttm->map)) {
+		km_free(ttm->segs, round_page(ttm->num_pages *
 		    sizeof(bus_dma_segment_t)), &kv_any, &kp_zero);
 		if (ttm->pages)
 			kvfree(ttm->pages);
 		else
-			kvfree(ttm_dma->dma_address);
+			kvfree(ttm->dma_address);
 		ttm->pages = NULL;
-		ttm_dma->dma_address = NULL;
+		ttm->dma_address = NULL;
 		pr_err("Failed allocating page table\n");
 		return -ENOMEM;
 	}
@@ -293,6 +293,9 @@ out_err:
 int ttm_tt_swapout(struct ttm_device *bdev, struct ttm_tt *ttm,
 		   gfp_t gfp_flags)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	loff_t size = (loff_t)ttm->num_pages << PAGE_SHIFT;
 	struct uvm_object *swap_storage;
 	struct vm_page *from_page;
@@ -333,6 +336,7 @@ out_err:
 	uao_detach(swap_storage);
 
 	return ret;
+#endif
 }
 
 static void ttm_tt_add_mapping(struct ttm_device *bdev, struct ttm_tt *ttm)
@@ -482,17 +486,23 @@ static void ttm_kmap_iter_tt_map_local(struct ttm_kmap_iter *iter,
 				       struct dma_buf_map *dmap,
 				       pgoff_t i)
 {
+	STUB();
+#ifdef notyet
 	struct ttm_kmap_iter_tt *iter_tt =
 		container_of(iter, typeof(*iter_tt), base);
 
 	dma_buf_map_set_vaddr(dmap, kmap_local_page_prot(iter_tt->tt->pages[i],
 							 iter_tt->prot));
+#endif
 }
 
 static void ttm_kmap_iter_tt_unmap_local(struct ttm_kmap_iter *iter,
 					 struct dma_buf_map *map)
 {
+	STUB();
+#ifdef notyet
 	kunmap_local(map->vaddr);
+#endif
 }
 
 static const struct ttm_kmap_iter_ops ttm_kmap_iter_tt_ops = {
