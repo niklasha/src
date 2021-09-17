@@ -92,7 +92,7 @@ file	dev/pci/newdrm/ttm/ttm_bo_util.c		ttm
 file	dev/pci/newdrm/ttm/ttm_bo_vm.c			ttm
 file	dev/pci/newdrm/ttm/ttm_device.c			ttm
 file	dev/pci/newdrm/ttm/ttm_execbuf_util.c		ttm
-#file	dev/pci/newdrm/ttm/ttm_module.c			ttm
+file	dev/pci/newdrm/ttm/ttm_module.c			ttm
 file	dev/pci/newdrm/ttm/ttm_pool.c			ttm
 file	dev/pci/newdrm/ttm/ttm_range_manager.c		ttm
 file	dev/pci/newdrm/ttm/ttm_resource.c		ttm

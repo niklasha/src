@@ -1336,6 +1336,15 @@ int drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	return ret;
 }
 EXPORT_SYMBOL(drm_gem_mmap);
+#else /* ! __linux__ */
+
+struct uvm_object *
+drm_gem_mmap(struct file *filp, vm_prot_t accessprot, voff_t off,
+    vsize_t size)
+{
+	STUB();
+	return NULL;
+}
 
 #endif /* __linux__ */
 

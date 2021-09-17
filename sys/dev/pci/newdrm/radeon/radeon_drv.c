@@ -634,7 +634,9 @@ const struct drm_driver kms_driver = {
 
 	.prime_handle_to_fd = drm_gem_prime_handle_to_fd,
 	.prime_fd_to_handle = drm_gem_prime_fd_to_handle,
+#ifdef notyet
 	.gem_prime_import_sg_table = radeon_gem_prime_import_sg_table,
+#endif
 	.gem_prime_mmap = drm_gem_prime_mmap,
 
 	.name = DRIVER_NAME,

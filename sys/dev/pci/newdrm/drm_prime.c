@@ -703,8 +703,7 @@ void drm_gem_dmabuf_vunmap(struct dma_buf *dma_buf, struct dma_buf_map *map)
 }
 EXPORT_SYMBOL(drm_gem_dmabuf_vunmap);
 
-#ifdef notyet
-
+#ifdef __linux__
 /**
  * drm_gem_prime_mmap - PRIME mmap function for GEM drivers
  * @obj: GEM object
@@ -762,6 +761,17 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL(drm_gem_prime_mmap);
+#else
+struct uvm_object *
+drm_gem_prime_mmap(struct file *filp, vm_prot_t accessprot, voff_t off,
+    vsize_t size)
+{
+	STUB();
+	return NULL;
+}
+#endif
+
+#ifdef notyet
 
 /**
  * drm_gem_dmabuf_mmap - dma_buf mmap implementation for GEM
