@@ -42,6 +42,12 @@
 #include "radeon_trace.h"
 #include "radeon_ttm.h"
 
+/* matches ttm_bo_vm.c */
+#define VM_FAULT_NOPAGE		1
+#define VM_FAULT_SIGBUS		2
+#define VM_FAULT_RETRY		3
+#define VM_FAULT_OOM		4
+
 static void radeon_bo_clear_surface_reg(struct radeon_bo *bo);
 
 /*
