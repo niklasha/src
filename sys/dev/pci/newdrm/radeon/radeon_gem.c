@@ -44,6 +44,7 @@ void radeon_gem_prime_unpin(struct drm_gem_object *obj);
 
 const struct drm_gem_object_funcs radeon_gem_object_funcs;
 
+#ifdef __linux__
 static vm_fault_t radeon_gem_fault(struct vm_fault *vmf)
 {
 	struct ttm_buffer_object *bo = vmf->vma->vm_private_data;
@@ -79,6 +80,7 @@ static const struct vm_operations_struct radeon_gem_vm_ops = {
 	.close = ttm_bo_vm_close,
 	.access = ttm_bo_vm_access
 };
+#endif /* __linux__ */
 
 static void radeon_gem_object_free(struct drm_gem_object *gobj)
 {
@@ -266,6 +268,7 @@ static int radeon_gem_handle_lockup(struct radeon_device *rdev, int r)
 	return r;
 }
 
+#ifdef __linux__
 static int radeon_gem_object_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 {
 	struct radeon_bo *bo = gem_to_radeon_bo(obj);
@@ -290,6 +293,7 @@ const struct drm_gem_object_funcs radeon_gem_object_funcs = {
 	.mmap = radeon_gem_object_mmap,
 	.vm_ops = &radeon_gem_vm_ops,
 };
+#endif
 
 /*
  * GEM ioctls.
