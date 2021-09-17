@@ -839,54 +839,6 @@ void radeon_ttm_set_active_vram_size(struct radeon_device *rdev, u64 size)
 	man->size = size >> PAGE_SHIFT;
 }
 
-#ifdef __OpenBSD__
-
-static struct uvm_pagerops radeon_ttm_vm_ops;
-static const struct uvm_pagerops *ttm_vm_ops = NULL;
-
-static int
-radeon_ttm_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
-    int npages, int centeridx, vm_fault_t fault_type,
-    vm_prot_t access_type, int flags)
-{
-	struct drm_gem_object *bo;
-	struct radeon_device *rdev;
-	int r;
-
-	bo = (struct drm_gem_object *)ufi->entry->object.uvm_obj;
-	rdev = bo->dev->dev_private;
-	down_read(&rdev->pm.mclk_lock);
-	r = ttm_vm_ops->pgo_fault(ufi, vaddr, pps, npages, centeridx,
-				  fault_type, access_type, flags);
-	up_read(&rdev->pm.mclk_lock);
-	return r;
-}
-
-struct uvm_object *
-radeon_mmap(struct file *filp, vm_prot_t accessprot, voff_t off,
-	    vsize_t size)
-{
-	struct drm_file *file_priv = (void *)filp;
-	struct radeon_device *rdev = file_priv->minor->dev->dev_private;
-	struct uvm_object *uobj;
-
-	if (rdev == NULL)
-		return NULL;
-
-	uobj = ttm_bo_mmap(filp, off, size, &rdev->mman.bdev);
-	if (unlikely(uobj == NULL)) {
-		return NULL;
-	}
-	if (unlikely(ttm_vm_ops == NULL)) {
-		ttm_vm_ops = uobj->pgops;
-		radeon_ttm_vm_ops = *ttm_vm_ops;
-		radeon_ttm_vm_ops.pgo_fault = &radeon_ttm_fault;
-	}
-	uobj->pgops = &radeon_ttm_vm_ops;
-	return uobj;
-}
-#endif
-
 #if defined(CONFIG_DEBUG_FS)
 
 static int radeon_mm_vram_dump_table_show(struct seq_file *m, void *unused)
