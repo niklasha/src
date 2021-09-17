@@ -353,6 +353,8 @@ struct drm_driver {
 #ifdef __linux__
 	int (*gem_prime_mmap)(struct drm_gem_object *obj,
 				struct vm_area_struct *vma);
+#else
+	struct uvm_object *(*gem_prime_mmap)(struct file *, vm_prot_t, voff_t, vsize_t);
 #endif
 
 #ifdef __OpenBSD__

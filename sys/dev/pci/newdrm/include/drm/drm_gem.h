@@ -365,6 +365,8 @@ void drm_gem_vm_close(struct vm_area_struct *vma);
 int drm_gem_mmap_obj(struct drm_gem_object *obj, unsigned long obj_size,
 		     struct vm_area_struct *vma);
 int drm_gem_mmap(struct file *filp, struct vm_area_struct *vma);
+#else
+struct uvm_object *drm_gem_mmap(struct file *, vm_prot_t, voff_t, vsize_t);
 #endif
 
 /**

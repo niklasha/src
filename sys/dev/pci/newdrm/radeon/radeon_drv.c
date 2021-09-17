@@ -614,7 +614,7 @@ const struct drm_driver kms_driver = {
 #endif
 	.open = radeon_driver_open_kms,
 #ifdef __OpenBSD__
-	.mmap = radeon_mmap,
+	.mmap = drm_gem_mmap,
 #endif
 	.postclose = radeon_driver_postclose_kms,
 	.lastclose = radeon_driver_lastclose_kms,
@@ -645,6 +645,7 @@ const struct drm_driver kms_driver = {
 	.patchlevel = KMS_DRIVER_PATCHLEVEL,
 };
 
+#ifdef __linux__
 static struct pci_driver radeon_kms_pci_driver = {
 	.name = DRIVER_NAME,
 	.id_table = pciidlist,
@@ -653,6 +654,7 @@ static struct pci_driver radeon_kms_pci_driver = {
 	.shutdown = radeon_pci_shutdown,
 	.driver.pm = &radeon_pm_ops,
 };
+#endif
 
 #ifdef notyet
 static int __init radeon_module_init(void)
@@ -672,7 +674,6 @@ static int __init radeon_module_init(void)
 
 	return pci_register_driver(&radeon_kms_pci_driver);
 }
-#endif /* notyet */
 
 static void __exit radeon_module_exit(void)
 {
@@ -680,6 +681,7 @@ static void __exit radeon_module_exit(void)
 	radeon_unregister_atpx_handler();
 	mmu_notifier_synchronize();
 }
+#endif /* notyet */
 
 module_init(radeon_module_init);
 module_exit(radeon_module_exit);

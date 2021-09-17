@@ -89,6 +89,8 @@ void drm_gem_dmabuf_vunmap(struct dma_buf *dma_buf, struct dma_buf_map *map);
 #ifdef __linux__
 int drm_gem_prime_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma);
 int drm_gem_dmabuf_mmap(struct dma_buf *dma_buf, struct vm_area_struct *vma);
+#else
+struct uvm_object *drm_gem_prime_mmap(struct file *, vm_prot_t, voff_t, vsize_t);
 #endif
 
 struct sg_table *drm_prime_pages_to_sg(struct drm_device *dev,
