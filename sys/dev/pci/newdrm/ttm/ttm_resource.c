@@ -163,6 +163,8 @@ static void ttm_kmap_iter_iomap_map_local(struct ttm_kmap_iter *iter,
 					  struct dma_buf_map *dmap,
 					  pgoff_t i)
 {
+	STUB();
+#ifdef notyet
 	struct ttm_kmap_iter_iomap *iter_io =
 		container_of(iter, typeof(*iter_io), base);
 	void __iomem *addr;
@@ -188,12 +190,16 @@ retry:
 				       (((resource_size_t)i - iter_io->cache.i)
 					<< PAGE_SHIFT));
 	dma_buf_map_set_vaddr_iomem(dmap, addr);
+#endif
 }
 
 static void ttm_kmap_iter_iomap_unmap_local(struct ttm_kmap_iter *iter,
 					    struct dma_buf_map *map)
 {
+	STUB();
+#ifdef notyet
 	io_mapping_unmap_local(map->vaddr_iomem);
+#endif
 }
 
 static const struct ttm_kmap_iter_ops ttm_kmap_iter_io_ops = {
@@ -274,6 +280,9 @@ ttm_kmap_iter_linear_io_init(struct ttm_kmap_iter_linear_io *iter_io,
 			     struct ttm_device *bdev,
 			     struct ttm_resource *mem)
 {
+	STUB();
+	return ERR_PTR(-ENOSYS);
+#ifdef notyet
 	int ret;
 
 	ret = ttm_mem_io_reserve(bdev, mem);
@@ -322,6 +331,7 @@ out_io_free:
 	ttm_mem_io_free(bdev, mem);
 out_err:
 	return ERR_PTR(ret);
+#endif
 }
 
 /**
@@ -338,6 +348,8 @@ ttm_kmap_iter_linear_io_fini(struct ttm_kmap_iter_linear_io *iter_io,
 			     struct ttm_device *bdev,
 			     struct ttm_resource *mem)
 {
+	STUB();
+#ifdef notyet
 	if (iter_io->needs_unmap && dma_buf_map_is_set(&iter_io->dmap)) {
 		if (iter_io->dmap.is_iomem)
 			iounmap(iter_io->dmap.vaddr_iomem);
@@ -346,4 +358,5 @@ ttm_kmap_iter_linear_io_fini(struct ttm_kmap_iter_linear_io *iter_io,
 	}
 
 	ttm_mem_io_free(bdev, mem);
+#endif
 }
