@@ -44,6 +44,7 @@
 #include <drm/ttm/ttm_pool.h>
 #include <drm/ttm/ttm_bo_driver.h>
 #include <drm/ttm/ttm_tt.h>
+#include <drm/drm_legacy.h>
 
 #include "ttm_module.h"
 
@@ -56,6 +57,7 @@
 struct ttm_pool_dma {
 	dma_addr_t addr;
 	unsigned long vaddr;
+	struct drm_dmamem *dmah;
 };
 
 static unsigned long page_pool_size;
@@ -77,12 +79,12 @@ static struct shrinker mm_shrinker;
 
 /* Allocate pages of size 1 << order with the given gfp_flags */
 static struct vm_page *ttm_pool_alloc_page(struct ttm_pool *pool, gfp_t gfp_flags,
-					unsigned int order)
+					unsigned int order, bus_dma_tag_t dmat)
 {
-	STUB();
-	return NULL;
-#ifdef notyet
+	int flags = 0;
+#ifdef __linux__
 	unsigned long attr = DMA_ATTR_FORCE_CONTIGUOUS;
+#endif
 	struct ttm_pool_dma *dma;
 	struct vm_page *p;
 	void *vaddr;
@@ -97,8 +99,10 @@ static struct vm_page *ttm_pool_alloc_page(struct ttm_pool *pool, gfp_t gfp_flag
 
 	if (!pool->use_dma_alloc) {
 		p = alloc_pages(gfp_flags, order);
+#ifdef notyet
 		if (p)
 			p->private = order;
+#endif
 		return p;
 	}
 
@@ -106,11 +110,22 @@ static struct vm_page *ttm_pool_alloc_page(struct ttm_pool *pool, gfp_t gfp_flag
 	if (!dma)
 		return NULL;
 
+#ifdef __linux__
 	if (order)
 		attr |= DMA_ATTR_NO_WARN;
 
 	vaddr = dma_alloc_attrs(pool->dev, (1ULL << order) * PAGE_SIZE,
 				&dma->addr, gfp_flags, attr);
+#else
+	dma->dmah = drm_dmamem_alloc(dmat,
+	    (1ULL << order) * PAGE_SIZE,
+	    PAGE_SIZE, 1,
+	    (1ULL << order) * PAGE_SIZE, flags, 0);
+	if (dma->dmah == NULL)
+		goto error_free;
+	dma->addr = dma->dmah->map->dm_segs[0].ds_addr;
+	vaddr = dma->dmah->kva;
+#endif
 	if (!vaddr)
 		goto error_free;
 
@@ -123,22 +138,23 @@ static struct vm_page *ttm_pool_alloc_page(struct ttm_pool *pool, gfp_t gfp_flag
 		p = virt_to_page(vaddr);
 
 	dma->vaddr = (unsigned long)vaddr | order;
+#ifdef notyet
 	p->private = (unsigned long)dma;
+#endif
 	return p;
 
 error_free:
 	kfree(dma);
 	return NULL;
-#endif
 }
 
 /* Reset the caching and pages of size 1 << order */
 static void ttm_pool_free_page(struct ttm_pool *pool, enum ttm_caching caching,
 			       unsigned int order, struct vm_page *p)
 {
-	STUB();
-#ifdef notyet
+#ifdef __linux__
 	unsigned long attr = DMA_ATTR_FORCE_CONTIGUOUS;
+#endif
 	struct ttm_pool_dma *dma;
 	void *vaddr;
 
@@ -155,6 +171,7 @@ static void ttm_pool_free_page(struct ttm_pool *pool, enum ttm_caching caching,
 		return;
 	}
 
+#ifdef __linux__
 	if (order)
 		attr |= DMA_ATTR_NO_WARN;
 
@@ -163,6 +180,8 @@ static void ttm_pool_free_page(struct ttm_pool *pool, enum ttm_caching caching,
 	dma_free_attrs(pool->dev, (1UL << order) * PAGE_SIZE, vaddr, dma->addr,
 		       attr);
 	kfree(dma);
+#else
+	STUB();
 #endif
 }
 
@@ -396,7 +415,9 @@ int ttm_pool_alloc(struct ttm_pool *pool, struct ttm_tt *tt,
 	int r;
 
 	WARN_ON(!num_pages || ttm_tt_is_populated(tt));
+#ifdef __linux__
 	WARN_ON(dma_addr && !pool->dev);
+#endif
 
 	if (tt->page_flags & TTM_PAGE_FLAG_ZERO_ALLOC)
 		gfp_flags |= __GFP_ZERO;
@@ -420,7 +441,7 @@ int ttm_pool_alloc(struct ttm_pool *pool, struct ttm_tt *tt,
 		if (p) {
 			apply_caching = true;
 		} else {
-			p = ttm_pool_alloc_page(pool, gfp_flags, order);
+			p = ttm_pool_alloc_page(pool, gfp_flags, order, tt->dmat);
 			if (p && PageHighMem(p))
 				apply_caching = true;
 		}
