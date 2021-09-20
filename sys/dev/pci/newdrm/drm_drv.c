@@ -100,7 +100,7 @@ struct drm_softc {
 
 struct drm_attach_args {
 	struct drm_device		*drm;
-	struct drm_driver		*driver;
+	const struct drm_driver		*driver;
 	char				*busid;
 	bus_dma_tag_t			 dmat;
 	bus_space_tag_t			 bst;
@@ -1203,7 +1203,7 @@ drm_attach_platform(struct drm_driver *driver, bus_space_tag_t iot,
 }
 
 struct drm_device *
-drm_attach_pci(struct drm_driver *driver, struct pci_attach_args *pa,
+drm_attach_pci(const struct drm_driver *driver, struct pci_attach_args *pa,
     int is_agp, int primary, struct device *dev, struct drm_device *drm)
 {
 	struct drm_attach_args arg;

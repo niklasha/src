@@ -80,7 +80,7 @@ bool		radeon_msi_ok(struct radeon_device *);
 irqreturn_t	radeon_driver_irq_handler_kms(void *);
 
 extern const struct pci_device_id radeondrm_pciidlist[];
-extern struct drm_driver kms_driver;
+extern const struct drm_driver kms_driver;
 
 /*
  * set if the mountroot hook has a fatal error
@@ -669,8 +669,6 @@ radeondrm_attach_kms(struct device *parent, struct device *self, void *aux)
 	    NULL, NULL);
 
 	printf("\n");
-
-	kms_driver.driver_features |= DRIVER_MODESET;
 
 	dev = drm_attach_pci(&kms_driver, pa, is_agp, rdev->primary,
 	    self, NULL);

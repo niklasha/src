@@ -622,7 +622,7 @@ struct drm_device *drm_get_device_from_kdev(dev_t);
 
 void drm_attach_platform(struct drm_driver *, bus_space_tag_t, bus_dma_tag_t,
     struct device *, struct drm_device *);
-struct drm_device *drm_attach_pci(struct drm_driver *,
+struct drm_device *drm_attach_pci(const struct drm_driver *,
     struct pci_attach_args *, int, int, struct device *, struct drm_device *);
 
 int drm_pciprobe(struct pci_attach_args *, const struct pci_device_id * );
