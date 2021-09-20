@@ -20,6 +20,8 @@
 
 #include <sys/types.h>
 #include <sys/param.h>
+#include <lib/libkern/libkern.h>
+
 #include <asm/bitsperlong.h>
 #include <linux/atomic.h>
 
@@ -97,6 +99,12 @@ fls64(long long mask)
 	for (bit = 1; mask != 1; bit++)
 		mask = (unsigned long long)mask >> 1;
 	return (bit);
+}
+
+static inline int
+__fls(long mask)
+{
+	return (flsl(mask) - 1);
 }
 
 static inline uint32_t
