@@ -386,9 +386,6 @@ static unsigned int ttm_pool_page_order(struct ttm_pool *pool, struct vm_page *p
 int ttm_pool_alloc(struct ttm_pool *pool, struct ttm_tt *tt,
 		   struct ttm_operation_ctx *ctx)
 {
-	STUB();
-	return -ENOSYS;
-#ifdef notyet
 	unsigned long num_pages = tt->num_pages;
 	dma_addr_t *dma_addr = tt->dma_address;
 	struct vm_page **caching = tt->pages;
@@ -474,7 +471,6 @@ error_free_all:
 	}
 
 	return r;
-#endif
 }
 EXPORT_SYMBOL(ttm_pool_alloc);
 
