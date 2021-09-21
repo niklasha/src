@@ -297,6 +297,8 @@
 ./etc/rpki/ripe.tal
 ./etc/services
 ./etc/signify
+./etc/signify/baseline-33-base.pub
+./etc/signify/baseline-33-pkg.pub
 ./etc/signify/openbsd-68-base.pub
 ./etc/signify/openbsd-68-fw.pub
 ./etc/signify/openbsd-68-pkg.pub
