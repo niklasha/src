@@ -299,6 +299,8 @@
 ./etc/signify
 ./etc/signify/baseline-33-base.pub
 ./etc/signify/baseline-33-pkg.pub
+./etc/signify/baseline-34-base.pub
+./etc/signify/baseline-34-pkg.pub
 ./etc/signify/openbsd-68-base.pub
 ./etc/signify/openbsd-68-fw.pub
 ./etc/signify/openbsd-68-pkg.pub
