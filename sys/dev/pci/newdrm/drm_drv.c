@@ -1336,6 +1336,9 @@ drm_attach(struct device *parent, struct device *self, void *aux)
 		dev->pdev->subsystem_vendor = PCI_VENDOR(subsys);
 		dev->pdev->subsystem_device = PCI_PRODUCT(subsys);
 		dev->pdev->revision = PCI_REVISION(pa->pa_class);
+		dev->pdev->class = (PCI_CLASS(pa->pa_class) << 16) |
+		    (PCI_SUBCLASS(pa->pa_class) << 8) |
+		    PCI_INTERFACE(pa->pa_class);
 
 		dev->pdev->devfn = PCI_DEVFN(pa->pa_device, pa->pa_function);
 		dev->pdev->bus = &dev->pdev->_bus;

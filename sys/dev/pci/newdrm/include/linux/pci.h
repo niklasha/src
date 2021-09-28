@@ -58,6 +58,7 @@ struct pci_dev {
 	uint16_t	subsystem_vendor;
 	uint16_t	subsystem_device;
 	uint8_t		revision;
+	uint32_t	class;		/* class:subclass:interface */
 
 	pci_chipset_tag_t pc;
 	pcitag_t	tag;
@@ -399,9 +400,9 @@ pci_get_class(pcireg_t class, struct pci_dev *pdev)
 }
 
 #define PCI_CLASS_DISPLAY_VGA \
-    (PCI_CLASS_DISPLAY | PCI_SUBCLASS_DISPLAY_VGA)
+    ((PCI_CLASS_DISPLAY << 8) | PCI_SUBCLASS_DISPLAY_VGA)
 #define PCI_CLASS_DISPLAY_OTHER \
-    (PCI_CLASS_DISPLAY | PCI_SUBCLASS_DISPLAY_MISC)
+    ((PCI_CLASS_DISPLAY << 8) | PCI_SUBCLASS_DISPLAY_MISC)
 
 #if defined(__amd64__) || defined(__arm64__) || \
     defined(__i386__) || defined(__riscv64__)
