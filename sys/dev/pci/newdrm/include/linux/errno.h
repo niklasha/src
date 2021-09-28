@@ -14,5 +14,6 @@
 #define EHWPOISON	EIO
 #define ENOPKG		ENOENT
 #define EMULTIHOP	EIPSEC
+#define EBADSLT		EINVAL
 
 #endif
