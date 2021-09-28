@@ -2249,6 +2249,10 @@ pcie_get_speed_cap(struct pci_dev *pdev)
 			cap = PCIE_SPEED_8_0GT;
 		if (lnkcap2 & 0x10)
 			cap = PCIE_SPEED_16_0GT;
+		if (lnkcap2 & 0x20)
+			cap = PCIE_SPEED_32_0GT;
+		if (lnkcap2 & 0x40)
+			cap = PCIE_SPEED_64_0GT;
 	} else {
 		if (lnkcap & 0x01)
 			cap = PCIE_SPEED_2_5GT;
