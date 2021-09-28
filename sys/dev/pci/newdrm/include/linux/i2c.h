@@ -36,6 +36,9 @@ struct i2c_algorithm;
 
 struct i2c_lock_operations;
 
+struct i2c_adapter_quirks {
+};
+
 struct i2c_adapter {
 	struct i2c_controller ic;
 
@@ -44,6 +47,7 @@ struct i2c_adapter {
 	void *algo_data;
 	int retries;
 	const struct i2c_lock_operations *lock_ops;
+	const struct i2c_adapter_quirks *quirks;
 
 	void *data;
 };

@@ -703,7 +703,9 @@ static const struct i2c_algorithm smu_v11_0_i2c_algo = {
 };
 
 static const struct i2c_adapter_quirks smu_v11_0_i2c_control_quirks = {
+#ifdef notyet
 	.flags = I2C_AQ_NO_ZERO_LEN,
+#endif
 };
 
 int smu_v11_0_i2c_control_init(struct i2c_adapter *control)
@@ -711,7 +713,7 @@ int smu_v11_0_i2c_control_init(struct i2c_adapter *control)
 	struct amdgpu_device *adev = to_amdgpu_device(control);
 	int res;
 
-	mutex_init(&adev->pm.smu_i2c_mutex);
+	rw_init(&adev->pm.smu_i2c_mutex, "smui2c");
 #ifdef __linux__
 	control->owner = THIS_MODULE;
 	control->class = I2C_CLASS_HWMON;
