@@ -54,6 +54,8 @@ static const char *amdgpu_ip_name[AMDGPU_HW_IP_NUM] = {
 
 void amdgpu_show_fdinfo(struct seq_file *m, struct file *f)
 {
+	STUB();
+#ifdef notyet
 	struct amdgpu_fpriv *fpriv;
 	uint32_t bus, dev, fn, i, domain;
 	uint64_t vram_mem = 0, gtt_mem = 0, cpu_mem = 0;
@@ -108,4 +110,5 @@ void amdgpu_show_fdinfo(struct seq_file *m, struct file *f)
 					idx, perc/100, frac);
 		}
 	}
+#endif
 }
