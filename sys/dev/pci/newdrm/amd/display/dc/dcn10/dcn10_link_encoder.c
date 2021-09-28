@@ -959,7 +959,7 @@ void dcn10_link_encoder_enable_tmds_output_with_clk_pattern_wa(
 	struct link_encoder *enc,
 	enum clock_source_id clock_source,
 	enum dc_color_depth color_depth,
-	enum signal_type signal,
+	enum amd_signal_type signal,
 	uint32_t pixel_clock)
 {
 	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);

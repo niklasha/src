@@ -756,7 +756,7 @@ static void build_vrr_infopacket_header_v2(enum amd_signal_type signal,
 	}
 }
 
-static void build_vrr_infopacket_header_v3(enum signal_type signal,
+static void build_vrr_infopacket_header_v3(enum amd_signal_type signal,
 		struct dc_info_packet *infopacket,
 		unsigned int *payload_size)
 {

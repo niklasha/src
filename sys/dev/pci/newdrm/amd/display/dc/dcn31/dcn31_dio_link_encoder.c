@@ -391,7 +391,7 @@ void dcn31_link_encoder_enable_dp_mst_output(
 
 void dcn31_link_encoder_disable_output(
 	struct link_encoder *enc,
-	enum signal_type signal)
+	enum amd_signal_type signal)
 {
 	/* Disable transmitter and encoder. */
 	if (!link_enc_cfg_is_transmitter_mappable(enc->ctx->dc->current_state, enc)) {
