@@ -34,4 +34,10 @@ sysfs_emit(char *str, const char *format, ...)
 	return 0;
 }
 
+static inline int
+sysfs_emit_at(char *str, int pos, const char *format, ...)
+{
+	return 0;
+}
+
 #endif
