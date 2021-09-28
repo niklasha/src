@@ -58,11 +58,13 @@ static int amdgpu_dma_buf_attach(struct dma_buf *dmabuf,
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
 	int r;
 
+#ifdef notyet
 	if (pci_p2pdma_distance_many(adev->pdev, &attach->dev, 1, true) < 0)
 		attach->peer2peer = false;
 
 	if (attach->dev->driver == adev->dev->driver)
 		return 0;
+#endif
 
 	r = pm_runtime_get_sync(adev_to_drm(adev)->dev);
 	if (r < 0)
