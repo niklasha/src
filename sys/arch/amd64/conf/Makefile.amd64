@@ -225,6 +225,8 @@ dcn20_resource.o: $S/dev/pci/newdrm/amd/display/dc/dcn20/dcn20_resource.c
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
 dcn21_resource.o: $S/dev/pci/newdrm/amd/display/dc/dcn21/dcn21_resource.c
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
+dcn31_resource.o: $S/dev/pci/newdrm/amd/display/dc/dcn31/dcn31_resource.c
+	${NORMAL_C} ${HARDFLOAT_CFLAGS}
 dc_dsc.o: $S/dev/pci/newdrm/amd/display/dc/dsc/dc_dsc.c
 	${NORMAL_C} ${HARDFLOAT_CFLAGS}
 rc_calc.o: $S/dev/pci/newdrm/amd/display/dc/dsc/rc_calc.c
