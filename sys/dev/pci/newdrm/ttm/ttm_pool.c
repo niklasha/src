@@ -176,7 +176,7 @@ static void ttm_pool_free_page(struct ttm_pool *pool, enum ttm_caching caching,
 		attr |= DMA_ATTR_NO_WARN;
 
 	dma = (void *)p->private;
-	vaddr = (void *)(dma->vaddr & PAGE_MASK);
+	vaddr = (void *)(dma->vaddr & LINUX_PAGE_MASK);
 	dma_free_attrs(pool->dev, (1UL << order) * PAGE_SIZE, vaddr, dma->addr,
 		       attr);
 	kfree(dma);
@@ -383,7 +383,7 @@ static unsigned int ttm_pool_page_order(struct ttm_pool *pool, struct vm_page *p
 	if (pool->use_dma_alloc) {
 		struct ttm_pool_dma *dma = (void *)p->private;
 
-		return dma->vaddr & ~PAGE_MASK;
+		return dma->vaddr & ~LINUX_PAGE_MASK;
 	}
 
 	return p->private;
