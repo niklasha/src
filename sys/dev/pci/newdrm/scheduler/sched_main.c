@@ -48,7 +48,9 @@
 #include <linux/wait.h>
 #include <linux/sched.h>
 #include <linux/completion.h>
+#ifdef __linux__
 #include <uapi/linux/sched/types.h>
+#endif
 
 #include <drm/drm_print.h>
 #include <drm/gpu_scheduler.h>
@@ -71,7 +73,7 @@
 static void drm_sched_rq_init(struct drm_gpu_scheduler *sched,
 			      struct drm_sched_rq *rq)
 {
-	spin_lock_init(&rq->lock);
+	mtx_init(&rq->lock, IPL_NONE);
 	INIT_LIST_HEAD(&rq->entities);
 	rq->current_entity = NULL;
 	rq->sched = sched;
@@ -264,7 +266,11 @@ unsigned long drm_sched_suspend_timeout(struct drm_gpu_scheduler *sched)
 {
 	unsigned long sched_timeout, now = jiffies;
 
+#ifdef __linux__
 	sched_timeout = sched->work_tdr.timer.expires;
+#else
+	sched_timeout = sched->work_tdr.to.to_time;
+#endif
 
 	/*
 	 * Modify the timeout to an arbitrarily large value. This also prevents
@@ -776,7 +782,9 @@ static int drm_sched_main(void *param)
 	struct drm_gpu_scheduler *sched = (struct drm_gpu_scheduler *)param;
 	int r;
 
+#ifdef __linux__
 	sched_set_fifo_low(current);
+#endif
 
 	while (!kthread_should_stop()) {
 		struct drm_sched_entity *entity = NULL;
@@ -874,7 +882,7 @@ int drm_sched_init(struct drm_gpu_scheduler *sched,
 	init_waitqueue_head(&sched->wake_up_worker);
 	init_waitqueue_head(&sched->job_scheduled);
 	INIT_LIST_HEAD(&sched->pending_list);
-	spin_lock_init(&sched->job_list_lock);
+	mtx_init(&sched->job_list_lock, IPL_NONE);
 	atomic_set(&sched->hw_rq_count, 0);
 	INIT_DELAYED_WORK(&sched->work_tdr, drm_sched_job_timedout);
 	atomic_set(&sched->_score, 0);
