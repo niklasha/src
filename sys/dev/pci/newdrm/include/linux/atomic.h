@@ -220,6 +220,12 @@ atomic64_sub(int i, atomic64_t *v)
 }
 #endif
 
+static inline int64_t
+atomic64_cmpxchg(atomic64_t *p, int64_t o, int64_t n)
+{
+	return atomic_cmpxchg(p, o, n);
+}
+
 #ifdef __LP64__
 typedef int64_t atomic_long_t;
 #define atomic_long_set(p, v)		atomic64_set(p, v)
