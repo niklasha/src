@@ -917,7 +917,7 @@ static bool perform_post_lt_adj_req_sequence(
 				break;
 			}
 
-			msleep(1);
+			drm_msleep(1);
 		}
 
 		if (!req_drv_setting_changed) {
@@ -1199,7 +1199,7 @@ static inline enum link_training_result dp_transition_to_video_idle(
 		 * DPCD 0202h.
 		 */
 		if (link->connector_signal != SIGNAL_TYPE_EDP && status == LINK_TRAINING_SUCCESS) {
-			msleep(5);
+			drm_msleep(5);
 			status = dp_check_link_loss_status(link, lt_settings);
 		}
 		return status;
@@ -1779,7 +1779,7 @@ bool perform_link_training_with_retries(
 	bool skip_video_pattern,
 	int attempts,
 	struct pipe_ctx *pipe_ctx,
-	enum signal_type signal,
+	enum amd_signal_type signal,
 	bool do_fallback)
 {
 	int j;
@@ -1819,7 +1819,7 @@ bool perform_link_training_with_retries(
 		if (stream->sink_patches.dppowerup_delay > 0) {
 			int delay_dp_power_up_in_ms = stream->sink_patches.dppowerup_delay;
 
-			msleep(delay_dp_power_up_in_ms);
+			drm_msleep(delay_dp_power_up_in_ms);
 		}
 
 #ifdef CONFIG_DRM_AMD_DC_HDCP
@@ -1878,7 +1878,7 @@ bool perform_link_training_with_retries(
 				break;
 		}
 
-		msleep(delay_between_attempts);
+		drm_msleep(delay_between_attempts);
 
 		delay_between_attempts += LINK_TRAINING_RETRY_DELAY;
 	}
@@ -2345,7 +2345,7 @@ bool dp_verify_link_cap_with_retries(
 			success = true;
 			break;
 		}
-		msleep(10);
+		drm_msleep(10);
 	}
 	return success;
 }
@@ -3751,7 +3751,7 @@ static bool retrieve_link_cap(struct dc_link *link)
 	/* Sink may need to configure internals based on vendor, so allow some
 	 * time before proceeding with possibly vendor specific transactions
 	 */
-	msleep(post_oui_delay);
+	drm_msleep(post_oui_delay);
 
 	for (i = 0; i < read_dpcd_retry_cnt; i++) {
 		status = core_link_read_dpcd(

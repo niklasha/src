@@ -380,8 +380,8 @@ struct smu_power_gate {
 	bool vce_gated;
 	atomic_t vcn_gated;
 	atomic_t jpeg_gated;
-	struct mutex vcn_gate_lock;
-	struct mutex jpeg_gate_lock;
+	struct rwlock vcn_gate_lock;
+	struct rwlock jpeg_gate_lock;
 };
 
 struct smu_power_context {
@@ -397,7 +397,7 @@ struct smu_feature
 	DECLARE_BITMAP(supported, SMU_FEATURE_MAX);
 	DECLARE_BITMAP(allowed, SMU_FEATURE_MAX);
 	DECLARE_BITMAP(enabled, SMU_FEATURE_MAX);
-	struct mutex mutex;
+	struct rwlock mutex;
 };
 
 struct smu_clocks {
@@ -434,7 +434,7 @@ enum smu_baco_state
 
 struct smu_baco_context
 {
-	struct mutex mutex;
+	struct rwlock mutex;
 	uint32_t state;
 	bool platform_support;
 };
@@ -485,10 +485,10 @@ struct smu_context
 	const struct cmn2asic_mapping	*table_map;
 	const struct cmn2asic_mapping	*pwr_src_map;
 	const struct cmn2asic_mapping	*workload_map;
-	struct mutex			mutex;
-	struct mutex			sensor_lock;
-	struct mutex			metrics_lock;
-	struct mutex			message_lock;
+	struct rwlock			mutex;
+	struct rwlock			sensor_lock;
+	struct rwlock			metrics_lock;
+	struct rwlock			message_lock;
 	uint64_t pool_size;
 
 	struct smu_table_context	smu_table;

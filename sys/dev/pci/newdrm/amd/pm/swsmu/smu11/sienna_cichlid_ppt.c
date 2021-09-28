@@ -2201,7 +2201,7 @@ static int sienna_cichlid_baco_exit(struct smu_context *smu)
 
 	if (adev->in_runpm && smu_cmn_is_audio_func_enabled(adev)) {
 		/* Wait for PMFW handling for the Dstate change */
-		msleep(10);
+		drm_msleep(10);
 		return smu_v11_0_baco_set_armd3_sequence(smu, BACO_SEQ_ULPS);
 	} else {
 		return smu_v11_0_baco_exit(smu);
@@ -3594,9 +3594,11 @@ static int sienna_cichlid_i2c_control_init(struct smu_context *smu, struct i2c_a
 	struct amdgpu_device *adev = to_amdgpu_device(control);
 	int res;
 
+#ifdef __linux__
 	control->owner = THIS_MODULE;
 	control->class = I2C_CLASS_HWMON;
 	control->dev.parent = &adev->pdev->dev;
+#endif
 	control->algo = &sienna_cichlid_i2c_algo;
 	snprintf(control->name, sizeof(control->name), "AMDGPU SMU");
 	control->quirks = &sienna_cichlid_i2c_control_quirks;

@@ -27,7 +27,7 @@
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <asm/div64.h>
-#if IS_ENABLED(CONFIG_X86_64)
+#if IS_ENABLED(CONFIG_X86_64) && defined(__linux__)
 #include <asm/intel-family.h>
 #endif
 #include <drm/amdgpu_drm.h>
@@ -1739,9 +1739,9 @@ static int smu7_disable_dpm_tasks(struct pp_hwmgr *hwmgr)
 static bool intel_core_rkl_chk(void)
 {
 #if IS_ENABLED(CONFIG_X86_64)
-	struct cpuinfo_x86 *c = &cpu_data(0);
+	struct cpu_info *ci = curcpu();
 
-	return (c->x86 == 6 && c->x86_model == INTEL_FAM6_ROCKETLAKE);
+	return (ci->ci_family == 6 && ci->ci_model == 0xa7);
 #else
 	return false;
 #endif
@@ -3941,7 +3941,7 @@ static int smu7_get_gpu_power(struct pp_hwmgr *hwmgr, u32 *query)
 							ixSMU_PM_STATUS_95, 0);
 
 	for (i = 0; i < 10; i++) {
-		msleep(500);
+		drm_msleep(500);
 		smum_send_msg_to_smc(hwmgr, PPSMC_MSG_PmStatusLogSample, NULL);
 		tmp = cgs_read_ind_register(hwmgr->device,
 						CGS_IND_REG__SMC,

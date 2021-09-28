@@ -261,14 +261,14 @@ struct amdgpu_display_manager {
 	 * Guards access to DC functions that can issue register write
 	 * sequences.
 	 */
-	struct mutex dc_lock;
+	struct rwlock dc_lock;
 
 	/**
 	 * @audio_lock:
 	 *
 	 * Guards access to audio instance changes.
 	 */
-	struct mutex audio_lock;
+	struct rwlock audio_lock;
 
 #if defined(CONFIG_DRM_AMD_DC_DCN)
 	/**
@@ -501,7 +501,7 @@ struct amdgpu_dm_connector {
 	/* Audio instance - protected by audio_lock. */
 	int audio_inst;
 
-	struct mutex hpd_lock;
+	struct rwlock hpd_lock;
 
 	bool fake_enable;
 #ifdef CONFIG_DEBUG_FS

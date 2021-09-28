@@ -1348,7 +1348,9 @@ static noinline bool dcn21_validate_bandwidth_fp(struct dc *dc,
 	/*Unsafe due to current pipe merge and split logic*/
 	ASSERT(context != dc->current_state);
 
+	DC_FP_START();
 	out = dcn21_fast_validate_bw(dc, context, pipes, &pipe_cnt, pipe_split_from, &vlevel, fast_validate);
+	DC_FP_END();
 
 	if (pipe_cnt == 0)
 		goto validate_out;

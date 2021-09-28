@@ -62,6 +62,10 @@
 #include <drm/drm_ioctl.h>
 #include <drm/gpu_scheduler.h>
 
+#include <dev/wscons/wsconsio.h>
+#include <dev/wscons/wsdisplayvar.h>
+#include <dev/rasops/rasops.h>
+
 #include <kgd_kfd_interface.h>
 #include "dm_pp_interface.h"
 #include "kgd_pp_interface.h"
@@ -121,7 +125,7 @@ struct amdgpu_gpu_instance
 struct amdgpu_mgpu_info
 {
 	struct amdgpu_gpu_instance	gpu_ins[MAX_GPU_INSTANCE];
-	struct mutex			mutex;
+	struct rwlock			mutex;
 	uint32_t			num_gpu;
 	uint32_t			num_dgpu;
 	uint32_t			num_apu;
@@ -487,7 +491,7 @@ struct amdgpu_fpriv {
 	struct amdgpu_vm	vm;
 	struct amdgpu_bo_va	*prt_va;
 	struct amdgpu_bo_va	*csa_va;
-	struct mutex		bo_list_lock;
+	struct rwlock		bo_list_lock;
 	struct idr		bo_list_handles;
 	struct amdgpu_ctx_mgr	ctx_mgr;
 };
@@ -807,9 +811,32 @@ struct amd_powerplay {
 #define AMDGPU_RESET_MAGIC_NUM 64
 #define AMDGPU_MAX_DF_PERFMONS 4
 struct amdgpu_device {
+	struct device			self;
 	struct device			*dev;
 	struct pci_dev			*pdev;
 	struct drm_device		ddev;
+
+	pci_chipset_tag_t		pc;
+	pcitag_t			pa_tag;
+	pci_intr_handle_t		intrh;
+	bus_space_tag_t			iot;
+	bus_space_tag_t			memt;
+	bus_dma_tag_t			dmat;
+	void				*irqh;
+
+	void				(*switchcb)(void *, int, int);
+	void				*switchcbarg;
+	void				*switchcookie;
+	struct task			switchtask;
+	struct rasops_info		ro;
+	int				console;
+	int				primary;
+
+	struct task			burner_task;
+	int				burner_fblank;
+
+	unsigned long			fb_aper_offset;
+	unsigned long			fb_aper_size;
 
 #ifdef CONFIG_DRM_AMD_ACP
 	struct amdgpu_acp		acp;
@@ -829,10 +856,12 @@ struct amdgpu_device {
 	bool				accel_working;
 	struct notifier_block		acpi_nb;
 	struct amdgpu_i2c_chan		*i2c_bus[AMDGPU_MAX_I2C_BUS];
+#ifdef notyet
 	struct debugfs_blob_wrapper     debugfs_vbios_blob;
-	struct mutex			srbm_mutex;
+#endif
+	struct rwlock			srbm_mutex;
 	/* GRBM index mutex. Protects concurrent access to GRBM index */
-	struct mutex                    grbm_idx_mutex;
+	struct rwlock			grbm_idx_mutex;
 	struct dev_pm_domain		vga_pm_domain;
 	bool				have_disp_power_ref;
 	bool                            have_atomics_support;
@@ -848,6 +877,8 @@ struct amdgpu_device {
 	resource_size_t			rmmio_base;
 	resource_size_t			rmmio_size;
 	void __iomem			*rmmio;
+	bus_space_tag_t			rmmio_bst;
+	bus_space_handle_t		rmmio_bsh;
 	/* protects concurrent MM_INDEX/DATA based register access */
 	spinlock_t mmio_idx_lock;
 	struct amdgpu_mmio_remap        rmmio_remap;
@@ -1016,7 +1047,7 @@ struct amdgpu_device {
 	struct amdgpu_ip_block          ip_blocks[AMDGPU_MAX_IP_NUM];
 	uint32_t		        harvest_ip_mask;
 	int				num_ip_blocks;
-	struct mutex	mn_lock;
+	struct rwlock	mn_lock;
 	DECLARE_HASHTABLE(mn_hash, 7);
 
 	/* tracking pinned memory */
@@ -1034,7 +1065,7 @@ struct amdgpu_device {
 
 	/* link all shadow bo */
 	struct list_head                shadow_list;
-	struct mutex                    shadow_list_lock;
+	struct rwlock                   shadow_list_lock;
 
 	/* record hw reset is performed */
 	bool has_hw_reset;
@@ -1048,10 +1079,10 @@ struct amdgpu_device {
 
 	atomic_t 			in_gpu_reset;
 	enum pp_mp1_state               mp1_state;
-	struct rw_semaphore reset_sem;
+	struct rwlock			reset_sem;
 	struct amdgpu_doorbell_index doorbell_index;
 
-	struct mutex			notifier_lock;
+	struct rwlock			notifier_lock;
 
 	int asic_reset_res;
 	struct work_struct		xgmi_reset_work;
@@ -1081,7 +1112,9 @@ struct amdgpu_device {
 	struct amdgpu_autodump		autodump;
 
 	atomic_t			throttling_logging_enabled;
+#ifdef notyet
 	struct ratelimit_state		throttling_logging_rs;
+#endif
 	uint32_t                        ras_hw_enabled;
 	uint32_t                        ras_enabled;
 
@@ -1274,8 +1307,6 @@ int emu_soc_asic_init(struct amdgpu_device *adev);
 #define amdgpu_asic_query_video_codecs(adev, e, c) (adev)->asic_funcs->query_video_codecs((adev), (e), (c))
 
 #define amdgpu_inc_vram_lost(adev) atomic_inc(&((adev)->vram_lost_counter));
-
-#define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 
 /* Common functions */
 bool amdgpu_device_has_job_running(struct amdgpu_device *adev);

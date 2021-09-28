@@ -96,6 +96,9 @@ static bool __is_ras_eeprom_supported(struct amdgpu_device *adev)
 static bool __get_eeprom_i2c_addr_arct(struct amdgpu_device *adev,
 				       struct amdgpu_ras_eeprom_control *control)
 {
+	STUB();
+	return false;
+#ifdef notyet
 	struct atom_context *atom_ctx = adev->mode_info.atom_context;
 
 	if (!control || !atom_ctx)
@@ -109,6 +112,7 @@ static bool __get_eeprom_i2c_addr_arct(struct amdgpu_device *adev,
 		control->i2c_address = EEPROM_I2C_MADDR_ARCTURUS;
 
 	return true;
+#endif
 }
 
 static bool __get_eeprom_i2c_addr(struct amdgpu_device *adev,
@@ -1054,7 +1058,7 @@ int amdgpu_ras_eeprom_init(struct amdgpu_ras_eeprom_control *control,
 	control->ras_header_offset = RAS_HDR_START;
 	control->ras_record_offset = RAS_RECORD_START;
 	control->ras_max_record_count  = RAS_MAX_RECORD_COUNT;
-	mutex_init(&control->ras_tbl_mutex);
+	rw_init(&control->tbl_mutex, "rastbl");
 
 	/* Read the table header from EEPROM address */
 	res = amdgpu_eeprom_read(&adev->pm.smu_i2c,

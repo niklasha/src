@@ -36,7 +36,7 @@ struct amdgpu_bo_list_entry {
 	struct amdgpu_bo_va		*bo_va;
 	struct dma_fence_chain		*chain;
 	uint32_t			priority;
-	struct page			**user_pages;
+	struct vm_page			**user_pages;
 	bool				user_invalidated;
 };
 

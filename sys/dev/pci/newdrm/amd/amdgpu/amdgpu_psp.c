@@ -1606,7 +1606,7 @@ static int psp_hdcp_load(struct psp_context *psp)
 	if (!ret) {
 		psp->hdcp_context.context.initialized = true;
 		psp->hdcp_context.context.session_id = cmd->resp.session_id;
-		mutex_init(&psp->hdcp_context.mutex);
+		rw_init(&psp->hdcp_context.mutex, "pspcp");
 	}
 
 	release_psp_cmd_buf(psp);
@@ -1739,7 +1739,7 @@ static int psp_dtm_load(struct psp_context *psp)
 	if (!ret) {
 		psp->dtm_context.context.initialized = true;
 		psp->dtm_context.context.session_id = cmd->resp.session_id;
-		mutex_init(&psp->dtm_context.mutex);
+		rw_init(&psp->dtm_context.mutex, "pspdtm");
 	}
 
 	release_psp_cmd_buf(psp);
@@ -1867,7 +1867,7 @@ static int psp_rap_load(struct psp_context *psp)
 	if (!ret) {
 		psp->rap_context.context.initialized = true;
 		psp->rap_context.context.session_id = cmd->resp.session_id;
-		mutex_init(&psp->rap_context.mutex);
+		rw_init(&psp->rap_context.mutex, "psprap");
 	}
 
 	release_psp_cmd_buf(psp);
@@ -3396,6 +3396,9 @@ static ssize_t psp_usbc_pd_fw_sysfs_read(struct device *dev,
 					 struct device_attribute *attr,
 					 char *buf)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	struct drm_device *ddev = dev_get_drvdata(dev);
 	struct amdgpu_device *adev = drm_to_adev(ddev);
 	uint32_t fw_ver;
@@ -3472,6 +3475,7 @@ fail:
 
 	drm_dev_exit(idx);
 	return count;
+#endif
 }
 
 void psp_copy_fw(struct psp_context *psp, uint8_t *start_addr, uint32_t bin_size)

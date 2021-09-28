@@ -2306,7 +2306,7 @@ static int navi10_baco_exit(struct smu_context *smu)
 
 	if (adev->in_runpm && smu_cmn_is_audio_func_enabled(adev)) {
 		/* Wait for PMFW handling for the Dstate change */
-		msleep(10);
+		drm_msleep(10);
 		return smu_v11_0_baco_set_armd3_sequence(smu, BACO_SEQ_ULPS);
 	} else {
 		return smu_v11_0_baco_exit(smu);

@@ -110,7 +110,13 @@ static int vcn_v1_0_sw_init(void *handle)
 		return r;
 
 	/* Override the work func */
+#ifdef __linux__
 	adev->vcn.idle_work.work.func = vcn_v1_0_idle_work_handler;
+#else
+	task_set(&adev->vcn.idle_work.work.task,
+	    (void (*)(void *))vcn_v1_0_idle_work_handler,
+	    &adev->vcn.idle_work.work);
+#endif
 
 	if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) {
 		const struct common_firmware_header *hdr;
@@ -118,7 +124,7 @@ static int vcn_v1_0_sw_init(void *handle)
 		adev->firmware.ucode[AMDGPU_UCODE_ID_VCN].ucode_id = AMDGPU_UCODE_ID_VCN;
 		adev->firmware.ucode[AMDGPU_UCODE_ID_VCN].fw = adev->vcn.fw;
 		adev->firmware.fw_size +=
-			ALIGN(le32_to_cpu(hdr->ucode_size_bytes), PAGE_SIZE);
+			roundup2(le32_to_cpu(hdr->ucode_size_bytes), PAGE_SIZE);
 		dev_info(adev->dev, "Will use PSP to load VCN firmware\n");
 	}
 
@@ -127,7 +133,7 @@ static int vcn_v1_0_sw_init(void *handle)
 		return r;
 
 	ring = &adev->vcn.inst->ring_dec;
-	sprintf(ring->name, "vcn_dec");
+	snprintf(ring->name, sizeof(ring->name), "vcn_dec");
 	r = amdgpu_ring_init(adev, ring, 512, &adev->vcn.inst->irq, 0,
 			     AMDGPU_RING_PRIO_DEFAULT, NULL);
 	if (r)
@@ -146,7 +152,7 @@ static int vcn_v1_0_sw_init(void *handle)
 
 	for (i = 0; i < adev->vcn.num_enc_rings; ++i) {
 		ring = &adev->vcn.inst->ring_enc[i];
-		sprintf(ring->name, "vcn_enc%d", i);
+		snprintf(ring->name, sizeof(ring->name), "vcn_enc%d", i);
 		r = amdgpu_ring_init(adev, ring, 512, &adev->vcn.inst->irq, 0,
 				     AMDGPU_RING_PRIO_DEFAULT, NULL);
 		if (r)

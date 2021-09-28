@@ -538,6 +538,9 @@ int amdgpu_vram_mgr_alloc_sgt(struct amdgpu_device *adev,
 			      enum dma_data_direction dir,
 			      struct sg_table **sgt)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	struct amdgpu_res_cursor cursor;
 	struct scatterlist *sg;
 	int num_entries = 0;
@@ -603,6 +606,7 @@ error_unmap:
 error_free:
 	kfree(*sgt);
 	return r;
+#endif
 }
 
 /**
@@ -618,6 +622,8 @@ void amdgpu_vram_mgr_free_sgt(struct device *dev,
 			      enum dma_data_direction dir,
 			      struct sg_table *sgt)
 {
+	STUB();
+#ifdef notyet
 	struct scatterlist *sg;
 	int i;
 
@@ -627,6 +633,7 @@ void amdgpu_vram_mgr_free_sgt(struct device *dev,
 				   DMA_ATTR_SKIP_CPU_SYNC);
 	sg_free_table(sgt);
 	kfree(sgt);
+#endif
 }
 
 /**
@@ -702,7 +709,7 @@ int amdgpu_vram_mgr_init(struct amdgpu_device *adev)
 	man->func = &amdgpu_vram_mgr_func;
 
 	drm_mm_init(&mgr->mm, 0, man->size);
-	spin_lock_init(&mgr->lock);
+	mtx_init(&mgr->lock, IPL_NONE);
 	INIT_LIST_HEAD(&mgr->reservations_pending);
 	INIT_LIST_HEAD(&mgr->reserved_pages);
 
