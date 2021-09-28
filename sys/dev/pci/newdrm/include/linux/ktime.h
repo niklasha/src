@@ -120,6 +120,12 @@ ktime_ms_delta(ktime_t a, ktime_t b)
 }
 
 static inline bool
+ktime_before(ktime_t a, ktime_t b)
+{
+	return a < b;
+}
+
+static inline bool
 ktime_after(ktime_t a, ktime_t b)
 {
 	return a > b;
