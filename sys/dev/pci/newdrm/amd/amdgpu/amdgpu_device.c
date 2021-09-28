@@ -1001,7 +1001,11 @@ void amdgpu_device_pci_config_reset(struct amdgpu_device *adev)
  */
 int amdgpu_device_pci_reset(struct amdgpu_device *adev)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	return pci_reset_function(adev->pdev);
+#endif
 }
 
 /*
@@ -3865,6 +3869,8 @@ failed:
 
 static void amdgpu_device_unmap_mmio(struct amdgpu_device *adev)
 {
+	STUB();
+#ifdef notyet
 	/* Clear all CPU mappings pointing to this device */
 	unmap_mapping_range(adev->ddev.anon_inode->i_mapping, 0, 0, 1);
 
@@ -3886,6 +3892,7 @@ static void amdgpu_device_unmap_mmio(struct amdgpu_device *adev)
 		drm_mtrr_del(0, adev->gmc.aper_base, adev->gmc.aper_size, DRM_MTRR_WC);
 #endif
 	}
+#endif
 }
 
 /**
