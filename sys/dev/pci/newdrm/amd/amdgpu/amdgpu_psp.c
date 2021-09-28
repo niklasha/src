@@ -2012,7 +2012,7 @@ static int psp_securedisplay_load(struct psp_context *psp)
 	if (!ret) {
 		psp->securedisplay_context.context.initialized = true;
 		psp->securedisplay_context.context.session_id = cmd->resp.session_id;
-		mutex_init(&psp->securedisplay_context.mutex);
+		rw_init(&psp->securedisplay_context.mutex, "pscm");
 	}
 
 	release_psp_cmd_buf(psp);
