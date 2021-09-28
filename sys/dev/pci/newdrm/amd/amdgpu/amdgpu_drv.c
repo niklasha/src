@@ -176,7 +176,7 @@ int amdgpu_reset_method = -1; /* auto */
 int amdgpu_num_kcq = -1;
 int amdgpu_smartshift_bias;
 
-static void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work);
+void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work);
 
 struct amdgpu_mgpu_info mgpu_info = {
 	.mutex = RWLOCK_INITIALIZER("mgpu_info"),
@@ -1401,7 +1401,7 @@ amdgpu_pci_shutdown(struct pci_dev *pdev)
  *
  * @work: work_struct.
  */
-static void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work)
+void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work)
 {
 	struct list_head device_list;
 	struct amdgpu_device *adev;
@@ -1811,7 +1811,7 @@ const struct drm_driver amdgpu_kms_driver = {
 	    DRIVER_SYNCOBJ_TIMELINE,
 	.open = amdgpu_driver_open_kms,
 #ifdef __OpenBSD__
-	.mmap = amdgpu_mmap,
+	.mmap = drm_gem_mmap,
 #endif
 	.postclose = amdgpu_driver_postclose_kms,
 	.lastclose = amdgpu_driver_lastclose_kms,
