@@ -117,7 +117,7 @@ int smu_v13_0_init_microcode(struct smu_context *smu)
 		ucode->fw = adev->pm.fw;
 		header = (const struct common_firmware_header *)ucode->fw->data;
 		adev->firmware.fw_size +=
-			ALIGN(le32_to_cpu(header->ucode_size_bytes), PAGE_SIZE);
+			roundup2(le32_to_cpu(header->ucode_size_bytes), PAGE_SIZE);
 	}
 
 out:
@@ -1429,7 +1429,7 @@ int smu_v13_0_mode1_reset(struct smu_context *smu)
 		ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_GfxDeviceDriverReset, SMU_RESET_MODE_1, NULL);
 
 	if (!ret)
-		msleep(SMU13_MODE1_RESET_WAIT_TIME_IN_MS);
+		drm_msleep(SMU13_MODE1_RESET_WAIT_TIME_IN_MS);
 
 	return ret;
 }
@@ -1469,7 +1469,7 @@ int smu_v13_0_mode2_reset(struct smu_context *smu)
 			SMU_RESET_MODE_2, NULL);
 	/*TODO: mode2 reset wait time should be shorter, add ASIC specific func if required */
 	if (!ret)
-		msleep(SMU13_MODE1_RESET_WAIT_TIME_IN_MS);
+		drm_msleep(SMU13_MODE1_RESET_WAIT_TIME_IN_MS);
 
 	return ret;
 }
