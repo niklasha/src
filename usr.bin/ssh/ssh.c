@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh.c,v 1.567 2021/09/10 10:26:02 dtucker Exp $ */
+/* $OpenBSD: ssh.c,v 1.569 2021/09/20 04:02:13 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -243,6 +243,7 @@ resolve_host(const char *name, int port, int logerr, char *cname, size_t clen)
 		port = default_ssh_port();
 	if (cname != NULL)
 		*cname = '\0';
+	debug3_f("lookup %s:%d", name, port);
 
 	snprintf(strport, sizeof strport, "%d", port);
 	memset(&hints, 0, sizeof(hints));
@@ -366,7 +367,7 @@ check_follow_cname(int direct, char **namep, const char *cname)
 	int i;
 	struct allowed_cname *rule;
 
-	if (*cname == '\0' || options.num_permitted_cnames == 0 ||
+	if (*cname == '\0' || !config_has_permitted_cnames(&options) ||
 	    strcmp(*namep, cname) == 0)
 		return 0;
 	if (options.canonicalize_hostname == SSH_CANONICALISE_NO)
@@ -1165,7 +1166,7 @@ main(int ac, char **av)
 	 */
 	direct = option_clear_or_none(options.proxy_command) &&
 	    options.jump_host == NULL;
-	if (addrs == NULL && options.num_permitted_cnames != 0 && (direct ||
+	if (addrs == NULL && config_has_permitted_cnames(&options) && (direct ||
 	    options.canonicalize_hostname == SSH_CANONICALISE_ALWAYS)) {
 		if ((addrs = resolve_host(host, options.port,
 		    direct, cname, sizeof(cname))) == NULL) {
@@ -1771,7 +1772,8 @@ ssh_confirm_remote_forward(struct ssh *ssh, int type, u_int32_t seq, void *ctxt)
 				rfwd->allocated_port = (int)port;
 				logit("Allocated port %u for remote "
 				    "forward to %s:%d",
-				    rfwd->allocated_port, rfwd->connect_host,
+				    rfwd->allocated_port, rfwd->connect_path ?
+				    rfwd->connect_path : rfwd->connect_host,
 				    rfwd->connect_port);
 				channel_update_permission(ssh,
 				    rfwd->handle, rfwd->allocated_port);

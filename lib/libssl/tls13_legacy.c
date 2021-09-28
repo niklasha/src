@@ -1,4 +1,4 @@
-/*	$OpenBSD: tls13_legacy.c,v 1.29 2021/09/04 16:26:12 jsing Exp $ */
+/*	$OpenBSD: tls13_legacy.c,v 1.31 2021/09/16 19:25:30 jsing Exp $ */
 /*
  * Copyright (c) 2018, 2019 Joel Sing <jsing@openbsd.org>
  *
@@ -94,6 +94,30 @@ tls13_legacy_wire_write_cb(const void *buf, size_t n, void *arg)
 	struct tls13_ctx *ctx = arg;
 
 	return tls13_legacy_wire_write(ctx->ssl, buf, n);
+}
+
+static ssize_t
+tls13_legacy_wire_flush(SSL *ssl)
+{
+	if (BIO_flush(ssl->wbio) <= 0) {
+		if (BIO_should_write(ssl->wbio))
+			return TLS13_IO_WANT_POLLOUT;
+
+		if (ERR_peek_error() == 0 && errno != 0)
+			SYSerror(errno);
+
+		return TLS13_IO_FAILURE;
+	}
+
+	return TLS13_IO_SUCCESS;
+}
+
+ssize_t
+tls13_legacy_wire_flush_cb(void *arg)
+{
+	struct tls13_ctx *ctx = arg;
+
+	return tls13_legacy_wire_flush(ctx->ssl);
 }
 
 static void
@@ -407,7 +431,12 @@ tls13_legacy_accept(SSL *ssl)
 	if (ret == TLS13_IO_USE_LEGACY)
 		return ssl->method->ssl_accept(ssl);
 
-	return tls13_legacy_return_code(ssl, ret);
+	ret = tls13_legacy_return_code(ssl, ret);
+
+	if (ctx->info_cb != NULL)
+		ctx->info_cb(ctx, TLS13_INFO_ACCEPT_EXIT, ret);
+
+	return ret;
 }
 
 int
@@ -446,7 +475,12 @@ tls13_legacy_connect(SSL *ssl)
 	if (ret == TLS13_IO_USE_LEGACY)
 		return ssl->method->ssl_connect(ssl);
 
-	return tls13_legacy_return_code(ssl, ret);
+	ret = tls13_legacy_return_code(ssl, ret);
+
+	if (ctx->info_cb != NULL)
+		ctx->info_cb(ctx, TLS13_INFO_CONNECT_EXIT, ret);
+
+	return ret;
 }
 
 int

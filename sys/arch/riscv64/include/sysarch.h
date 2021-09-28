@@ -1,8 +1,7 @@
-/*	$OpenBSD: parser.h,v 1.2 2021/07/26 09:26:36 florian Exp $	*/
+/*	$OpenBSD: sysarch.h,v 1.1 2021/09/14 12:03:49 jca Exp $	*/
 
 /*
- * Copyright (c) 2004 Esben Norby <norby@openbsd.org>
- * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
+ * Copyright (c) 2021 Jeremie Courreges-Anglas <jca@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,19 +16,28 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-enum actions {
-	NONE,
-	LOG_VERBOSE,
-	LOG_BRIEF,
-	SHOW,
-	SHOW_INTERFACE,
-	SEND_REQUEST,
-	RELOAD
+#ifndef	_RISCV64_SYSARCH_H_
+#define	_RISCV64_SYSARCH_H_
+
+/*
+ * Architecture specific syscalls (riscv64)
+ */
+
+#define	RISCV_SYNC_ICACHE	0
+
+struct riscv_sync_icache_args {
+	u_int64_t	addr;		/* Virtual start address */
+	size_t		len;		/* Region size */
 };
 
-struct parse_result {
-	enum actions	action;
-	uint32_t	if_index;
-};
+#ifndef _KERNEL
 
-struct parse_result	*parse(int, char *[]);
+#include <sys/cdefs.h>
+
+__BEGIN_DECLS
+int	sysarch(int, void *);
+__END_DECLS
+
+#endif	/* _KERNEL */
+
+#endif	/* _RISCV64_SYSARCH_H_ */

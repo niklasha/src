@@ -1,4 +1,4 @@
-/* $OpenBSD: scp.c,v 1.234 2021/09/11 00:40:24 djm Exp $ */
+/* $OpenBSD: scp.c,v 1.239 2021/09/20 06:53:56 djm Exp $ */
 /*
  * scp - secure remote copy.  This is basically patched BSD rcp which
  * uses ssh to do the data transfer (instead of using rcmd).
@@ -422,7 +422,7 @@ main(int argc, char **argv)
 	const char *errstr;
 	extern char *optarg;
 	extern int optind;
-	enum scp_mode_e mode = MODE_SFTP;
+	enum scp_mode_e mode = MODE_SCP;
 	char *sftp_direct = NULL;
 
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
@@ -437,7 +437,7 @@ main(int argc, char **argv)
 		newargv[n] = xstrdup(argv[n]);
 	argv = newargv;
 
-	log_init(argv0, log_level, SYSLOG_FACILITY_USER, 1);
+	log_init(argv0, log_level, SYSLOG_FACILITY_USER, 2);
 
 	memset(&args, '\0', sizeof(args));
 	memset(&remote_remote_args, '\0', sizeof(remote_remote_args));
@@ -555,7 +555,7 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	log_init(argv0, log_level, SYSLOG_FACILITY_USER, 1);
+	log_init(argv0, log_level, SYSLOG_FACILITY_USER, 2);
 
 	/* Do this last because we want the user to be able to override it */
 	addargs(&args, "-oForwardAgent=no");
@@ -1180,8 +1180,7 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 			conn = do_sftp_connect(host, suser, sport,
 			    sftp_direct, &remin, &remout, &do_cmd_pid);
 			if (conn == NULL) {
-				error("Couldn't make sftp connection "
-				    "to server");
+				error("sftp connection failed");
 				++errs;
 				continue;
 			}
@@ -1228,7 +1227,8 @@ prepare_remote_path(struct sftp_conn *conn, const char *path)
 	if (can_expand_path(conn))
 		return do_expand_path(conn, path);
 	/* No protocol extension */
-	error("~user paths are not currently supported");
+	error("server expand-path extension is required "
+	    "for ~user paths in SFTP mode");
 	return NULL;
 }
 
@@ -1460,9 +1460,9 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 	debug3_f("copying remote %s to local %s", abs_src, dst);
 	if ((r = remote_glob(conn, abs_src, GLOB_MARK, NULL, &g)) != 0) {
 		if (r == GLOB_NOSPACE)
-			error("Too many glob matches for \"%s\".", abs_src);
+			error("%s: too many glob matches", abs_src);
 		else
-			error("File \"%s\" not found.", abs_src);
+			error("%s: %s", abs_src, strerror(ENOENT));
 		err = -1;
 		goto out;
 	}
@@ -1507,10 +1507,8 @@ out:
 	free(abs_src);
 	free(tmp);
 	globfree(&g);
-	if (err == -1) {
-		error("Failed to download '%s'", src);
+	if (err == -1)
 		errs = 1;
-	}
 }
 
 
@@ -1850,7 +1848,7 @@ throughlocal_sftp(struct sftp_conn *from, struct sftp_conn *to,
 
 	targetisdir = remote_is_dir(to, target);
 	if (!targetisdir && targetshouldbedirectory) {
-		error("Destination path \"%s\" is not a directory", target);
+		error("%s: destination is not a directory", target);
 		err = -1;
 		goto out;
 	}
@@ -1858,9 +1856,9 @@ throughlocal_sftp(struct sftp_conn *from, struct sftp_conn *to,
 	debug3_f("copying remote %s to remote %s", abs_src, target);
 	if ((r = remote_glob(from, abs_src, GLOB_MARK, NULL, &g)) != 0) {
 		if (r == GLOB_NOSPACE)
-			error("Too many glob matches for \"%s\".", abs_src);
+			error("%s: too many glob matches", abs_src);
 		else
-			error("File \"%s\" not found.", abs_src);
+			error("%s: %s", abs_src, strerror(ENOENT));
 		err = -1;
 		goto out;
 	}
@@ -1901,7 +1899,7 @@ out:
 	free(tmp);
 	globfree(&g);
 	if (err == -1)
-		fatal("Failed to download file '%s'", src);
+		errs = 1;
 }
 
 int
@@ -1946,7 +1944,7 @@ void
 usage(void)
 {
 	(void) fprintf(stderr,
-	    "usage: scp [-346ABCOpqRrTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n"
+	    "usage: scp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n"
 	    "           [-i identity_file] [-J destination] [-l limit]\n"
 	    "           [-o ssh_option] [-P port] [-S program] source ... target\n");
 	exit(1);

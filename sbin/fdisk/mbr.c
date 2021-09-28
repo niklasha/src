@@ -1,4 +1,4 @@
-/*	$OpenBSD: mbr.c,v 1.99 2021/09/10 15:26:36 krw Exp $	*/
+/*	$OpenBSD: mbr.c,v 1.101 2021/09/26 13:13:16 krw Exp $	*/
 
 /*
  * Copyright (c) 1997 Tobias Weingartner

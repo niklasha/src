@@ -1,4 +1,4 @@
-/*	$OpenBSD: fdisk.c,v 1.135 2021/08/28 11:55:17 krw Exp $	*/
+/*	$OpenBSD: fdisk.c,v 1.137 2021/09/26 13:13:16 krw Exp $	*/
 
 /*
  * Copyright (c) 1997 Tobias Weingartner
