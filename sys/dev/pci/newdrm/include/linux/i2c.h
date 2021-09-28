@@ -37,6 +37,8 @@ struct i2c_algorithm;
 struct i2c_lock_operations;
 
 struct i2c_adapter_quirks {
+	uint16_t max_read_len;
+	uint16_t max_write_len;
 };
 
 struct i2c_adapter {
