@@ -28,4 +28,10 @@ struct attribute_group {
 #define sysfs_create_files(x, y)	0
 #define sysfs_remove_files(x, y)
 
+static inline int
+sysfs_emit(char *str, const char *format, ...)
+{
+	return 0;
+}
+
 #endif
