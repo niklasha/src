@@ -183,7 +183,7 @@ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
  * Returns:
  * result of handling the IRQ, as defined by &irqreturn_t
  */
-static irqreturn_t amdgpu_irq_handler(void *arg)
+irqreturn_t amdgpu_irq_handler(void *arg)
 {
 	struct drm_device *dev = (struct drm_device *) arg;
 	struct amdgpu_device *adev = drm_to_adev(dev);

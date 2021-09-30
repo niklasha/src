@@ -178,6 +178,8 @@ void amdgpu_register_gpu_instance(struct amdgpu_device *adev)
 
 static void amdgpu_get_audio_func(struct amdgpu_device *adev)
 {
+	STUB();
+#ifdef notyet
 	struct pci_dev *p = NULL;
 
 	p = pci_get_domain_bus_and_slot(pci_domain_nr(adev->pdev->bus),
@@ -190,6 +192,7 @@ static void amdgpu_get_audio_func(struct amdgpu_device *adev)
 
 		pci_dev_put(p);
 	}
+#endif
 }
 
 #ifdef __linux__
@@ -1713,6 +1716,7 @@ int amdgpu_refcnt;
 
 int __init drm_sched_fence_slab_init(void);
 void __exit drm_sched_fence_slab_fini(void);
+irqreturn_t amdgpu_irq_handler(void *);
 
 void
 amdgpu_attach(struct device *parent, struct device *self, void *aux)
@@ -2008,7 +2012,7 @@ amdgpu_wsioctl(void *v, u_long cmd, caddr_t data, int flag, struct proc *p)
 {
 	struct rasops_info *ri = v;
 	struct amdgpu_device *adev = ri->ri_hw;
-	struct backlight_device *bd = adev->dm.backlight_dev;
+	struct backlight_device *bd = adev->dm.backlight_dev[0];
 	struct wsdisplay_param *dp = (struct wsdisplay_param *)data;
 	struct wsdisplay_fbinfo *wdf;
 
@@ -2272,8 +2276,7 @@ amdgpu_detach(struct device *self, int flags)
 	}
 
 	amdgpu_acpi_fini(adev);
-
-	amdgpu_device_fini(adev);
+	amdgpu_device_fini_hw(adev);
 
 	if (amdgpu_refcnt == 0) {
 		amdgpu_unregister_atpx_handler();
