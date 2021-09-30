@@ -34,11 +34,18 @@ struct i2c_algorithm;
 #define I2C_FUNC_SMBUS_BLOCK_PROC_CALL	0
 #define I2C_FUNC_10BIT_ADDR		0
 
+#define I2C_AQ_COMB			0
+#define I2C_AQ_COMB_SAME_ADDR		0
+#define I2C_AQ_NO_ZERO_LEN		0
+
 struct i2c_lock_operations;
 
 struct i2c_adapter_quirks {
+	unsigned int flags;
 	uint16_t max_read_len;
 	uint16_t max_write_len;
+	uint16_t max_comb_1st_msg_len;
+	uint16_t max_comb_2nd_msg_len;
 };
 
 struct i2c_adapter {
