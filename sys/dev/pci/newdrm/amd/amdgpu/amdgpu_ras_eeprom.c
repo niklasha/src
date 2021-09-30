@@ -766,6 +766,7 @@ uint32_t amdgpu_ras_eeprom_max_record_count(void)
 	return RAS_MAX_RECORD_COUNT;
 }
 
+#ifdef __linux__
 static ssize_t
 amdgpu_ras_debugfs_eeprom_size_read(struct file *f, char __user *buf,
 				    size_t size, loff_t *pos)
@@ -988,6 +989,8 @@ const struct file_operations amdgpu_ras_debugfs_eeprom_table_ops = {
 	.write = NULL,
 	.llseek = default_llseek,
 };
+#endif /* __linux__ */
+
 
 /**
  * __verify_ras_table_checksum -- verify the RAS EEPROM table checksum
@@ -1058,7 +1061,7 @@ int amdgpu_ras_eeprom_init(struct amdgpu_ras_eeprom_control *control,
 	control->ras_header_offset = RAS_HDR_START;
 	control->ras_record_offset = RAS_RECORD_START;
 	control->ras_max_record_count  = RAS_MAX_RECORD_COUNT;
-	rw_init(&control->tbl_mutex, "rastbl");
+	rw_init(&control->ras_tbl_mutex, "rastbl");
 
 	/* Read the table header from EEPROM address */
 	res = amdgpu_eeprom_read(&adev->pm.smu_i2c,
