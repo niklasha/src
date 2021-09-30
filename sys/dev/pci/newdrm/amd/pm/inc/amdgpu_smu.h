@@ -1353,7 +1353,6 @@ enum smu_cmn2asic_mapping_type {
 	size_t __dst_offset = offsetof(typeof(*(dst)), first_dst_member);  \
 	size_t __dst_size = offsetofend(typeof(*(dst)), last_dst_member) - \
 			    __dst_offset;				   \
-	BUILD_BUG_ON(__src_size != __dst_size);				   \
 	__builtin_memcpy((u8 *)(dst) + __dst_offset,			   \
 			 (u8 *)(src) + __src_offset,			   \
 			 __dst_size);					   \

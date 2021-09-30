@@ -40,7 +40,9 @@
 #include "amdgpu_xgmi.h"
 #include "amdgpu_dma_buf.h"
 #include "amdgpu_res_cursor.h"
+#ifdef notyet
 #include "kfd_svm.h"
+#endif
 
 /**
  * DOC: GPUVM
