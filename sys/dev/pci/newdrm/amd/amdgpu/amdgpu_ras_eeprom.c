@@ -989,8 +989,11 @@ const struct file_operations amdgpu_ras_debugfs_eeprom_table_ops = {
 	.write = NULL,
 	.llseek = default_llseek,
 };
-#endif /* __linux__ */
-
+#else /* !__linux__ */
+void amdgpu_ras_debugfs_set_ret_size(struct amdgpu_ras_eeprom_control *control)
+{
+}
+#endif
 
 /**
  * __verify_ras_table_checksum -- verify the RAS EEPROM table checksum
