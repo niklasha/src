@@ -1102,10 +1102,10 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 	memset(&init_params, 0, sizeof(init_params));
 #endif
 
-	rw_init(&adev->dm.dc_lock);
-	rw_init(&adev->dm.audio_lock);
+	rw_init(&adev->dm.dc_lock, "dmdc");
+	rw_init(&adev->dm.audio_lock, "dmaud");
 #if defined(CONFIG_DRM_AMD_DC_DCN)
-	spin_lock_init(&adev->dm.vblank_lock);
+	mtx_init(&adev->dm.vblank_lock, IPL_TTY);
 #endif
 
 	if(amdgpu_dm_irq_init(adev)) {
