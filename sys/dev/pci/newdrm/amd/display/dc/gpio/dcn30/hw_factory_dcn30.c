@@ -22,6 +22,8 @@
  * Authors: AMD
  *
  */
+#include <generated/autoconf.h>
+
 #if defined(CONFIG_DRM_AMD_DC_DCN)
 #include "dm_services.h"
 #include "include/gpio_types.h"
