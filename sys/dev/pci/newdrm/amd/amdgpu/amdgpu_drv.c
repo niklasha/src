@@ -176,7 +176,7 @@ int amdgpu_reset_method = -1; /* auto */
 int amdgpu_num_kcq = -1;
 int amdgpu_smartshift_bias;
 
-void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work);
+static void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work);
 
 struct amdgpu_mgpu_info mgpu_info = {
 	.mutex = RWLOCK_INITIALIZER("mgpu_info"),
@@ -1395,13 +1395,14 @@ amdgpu_pci_shutdown(struct pci_dev *pdev)
 	amdgpu_device_ip_suspend(adev);
 	adev->mp1_state = PP_MP1_STATE_NONE;
 }
+#endif
 
 /**
  * amdgpu_drv_delayed_reset_work_handler - work handler for reset
  *
  * @work: work_struct.
  */
-void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work)
+static void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work)
 {
 	struct list_head device_list;
 	struct amdgpu_device *adev;
@@ -1468,6 +1469,8 @@ void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work)
 	}
 	return;
 }
+
+#ifdef notyet
 
 static int amdgpu_pmops_prepare(struct device *dev)
 {
