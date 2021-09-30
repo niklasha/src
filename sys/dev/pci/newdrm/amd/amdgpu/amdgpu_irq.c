@@ -282,6 +282,8 @@ bool amdgpu_msi_ok(struct amdgpu_device *adev)
 
 static void amdgpu_restore_msix(struct amdgpu_device *adev)
 {
+	STUB();
+#ifdef notyet
 	u16 ctrl;
 
 	pci_read_config_word(adev->pdev, adev->pdev->msix_cap + PCI_MSIX_FLAGS, &ctrl);
@@ -293,6 +295,7 @@ static void amdgpu_restore_msix(struct amdgpu_device *adev)
 	pci_write_config_word(adev->pdev, adev->pdev->msix_cap + PCI_MSIX_FLAGS, ctrl);
 	ctrl |= PCI_MSIX_FLAGS_ENABLE;
 	pci_write_config_word(adev->pdev, adev->pdev->msix_cap + PCI_MSIX_FLAGS, ctrl);
+#endif
 }
 
 /**
