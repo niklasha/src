@@ -137,6 +137,12 @@ ns_to_ktime(uint64_t ns)
 	return ns;
 }
 
+static inline int64_t
+ktime_divns(ktime_t a, int64_t ns)
+{
+	return a / ns;
+}
+
 #include <linux/timekeeping.h>
 
 #endif
