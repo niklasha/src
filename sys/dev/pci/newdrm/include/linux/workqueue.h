@@ -141,7 +141,7 @@ INIT_DELAYED_WORK_ONSTACK(struct delayed_work *dwork, work_func_t func)
 	.to = TIMEOUT_INITIALIZER(__delayed_work_tick, &(dw)),		\
 	.tq = NULL,							\
 	.work.tq = NULL,						\
-	.work.task = TASK_INITIALIZER((void (*)(void *))fn, &(dw).work)	\
+	.work.task = TASK_INITIALIZER((void (*)(void *))(fn), &(dw).work)	\
 }
 
 static inline bool
