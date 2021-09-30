@@ -44,7 +44,9 @@
  * management.
  */
 
+#ifdef notyet
 static DEFINE_PER_CPU(int, fpu_recursion_depth);
+#endif
 
 /**
  * dc_assert_fp_enabled - Check if FPU protection is enabled
@@ -56,6 +58,8 @@ static DEFINE_PER_CPU(int, fpu_recursion_depth);
  */
 inline void dc_assert_fp_enabled(void)
 {
+	STUB();
+#ifdef notyet
 	int *pcpu, depth = 0;
 
 	pcpu = get_cpu_ptr(&fpu_recursion_depth);
@@ -63,6 +67,7 @@ inline void dc_assert_fp_enabled(void)
 	put_cpu_ptr(&fpu_recursion_depth);
 
 	ASSERT(depth >= 1);
+#endif
 }
 
 /**
@@ -80,6 +85,8 @@ inline void dc_assert_fp_enabled(void)
  */
 void dc_fpu_begin(const char *function_name, const int line)
 {
+	STUB();
+#ifdef notyet
 	int *pcpu;
 
 	pcpu = get_cpu_ptr(&fpu_recursion_depth);
@@ -104,6 +111,7 @@ void dc_fpu_begin(const char *function_name, const int line)
 
 	TRACE_DCN_FPU(true, function_name, line, *pcpu);
 	put_cpu_ptr(&fpu_recursion_depth);
+#endif
 }
 
 /**
@@ -118,6 +126,8 @@ void dc_fpu_begin(const char *function_name, const int line)
  */
 void dc_fpu_end(const char *function_name, const int line)
 {
+	STUB();
+#ifdef notyet
 	int *pcpu;
 
 	pcpu = get_cpu_ptr(&fpu_recursion_depth);
@@ -141,4 +151,5 @@ void dc_fpu_end(const char *function_name, const int line)
 
 	TRACE_DCN_FPU(false, function_name, line, *pcpu);
 	put_cpu_ptr(&fpu_recursion_depth);
+#endif
 }
