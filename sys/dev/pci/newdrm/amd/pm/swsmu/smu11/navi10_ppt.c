@@ -2877,9 +2877,11 @@ static int navi10_i2c_control_init(struct smu_context *smu, struct i2c_adapter *
 	struct amdgpu_device *adev = to_amdgpu_device(control);
 	int res;
 
+#ifdef __linux__
 	control->owner = THIS_MODULE;
 	control->class = I2C_CLASS_HWMON;
 	control->dev.parent = &adev->pdev->dev;
+#endif
 	control->algo = &navi10_i2c_algo;
 	snprintf(control->name, sizeof(control->name), "AMDGPU SMU");
 	control->quirks = &navi10_i2c_control_quirks;
