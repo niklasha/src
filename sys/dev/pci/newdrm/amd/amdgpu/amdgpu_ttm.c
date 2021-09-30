@@ -1426,6 +1426,8 @@ static bool amdgpu_ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
 static void amdgpu_ttm_vram_mm_access(struct amdgpu_device *adev, loff_t pos,
 				      void *buf, size_t size, bool write)
 {
+	STUB();
+#ifdef notyet
 	while (size) {
 		uint64_t aligned_pos = ALIGN_DOWN(pos, 4);
 		uint64_t bytes = 4 - (pos & 0x3);
@@ -1456,6 +1458,7 @@ static void amdgpu_ttm_vram_mm_access(struct amdgpu_device *adev, loff_t pos,
 		buf += bytes;
 		size -= bytes;
 	}
+#endif
 }
 
 /**
@@ -1725,28 +1728,26 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
 
 	/* Change the size here instead of the init above so only lpfn is affected */
 	amdgpu_ttm_set_buffer_funcs_status(adev, false);
-#ifdef CONFIG_64BIT
+#if defined(CONFIG_64BIT) && defined(__linux__)
 #ifdef CONFIG_X86
 	if (adev->gmc.xgmi.connected_to_cpu)
-#ifdef __linux__
 		adev->mman.aper_base_kaddr = ioremap_cache(adev->gmc.aper_base,
 				adev->gmc.visible_vram_size);
-#else
-		if (bus_space_map(adev->memt, adev->gmc.aper_base,
-		    adev->gmc.visible_vram_size,
-		    BUS_SPACE_MAP_LINEAR | BUS_SPACE_MAP_PREFETCHABLE,
-		    &adev->mman.aper_bsh)) {
-			adev->mman.aper_base_kaddr = NULL;
-		} else {
-			adev->mman.aper_base_kaddr = bus_space_vaddr(adev->memt,
-			    adev->mman.aper_bsh);
-		}
-#endif
 
 	else
 #endif
 		adev->mman.aper_base_kaddr = ioremap_wc(adev->gmc.aper_base,
 				adev->gmc.visible_vram_size);
+#else
+	if (bus_space_map(adev->memt, adev->gmc.aper_base,
+	    adev->gmc.visible_vram_size,
+	    BUS_SPACE_MAP_LINEAR | BUS_SPACE_MAP_PREFETCHABLE,
+	    &adev->mman.aper_bsh)) {
+		adev->mman.aper_base_kaddr = NULL;
+	} else {
+		adev->mman.aper_base_kaddr = bus_space_vaddr(adev->memt,
+		    adev->mman.aper_bsh);
+	}
 #endif
 
 	/*
@@ -1930,18 +1931,6 @@ void amdgpu_ttm_set_buffer_funcs_status(struct amdgpu_device *adev, bool enable)
 		size = adev->gmc.visible_vram_size;
 	man->size = size >> PAGE_SHIFT;
 	adev->mman.buffer_funcs_enabled = enable;
-}
-
-struct uvm_object *
-amdgpu_mmap(struct file *filp, vm_prot_t accessprot, voff_t off, vsize_t size)
-{
-	struct drm_file *file_priv = (void *)filp;
-	struct amdgpu_device *adev = drm_to_adev(file_priv->minor->dev);
-
-	if (adev == NULL)
-		return NULL;
-
-	return ttm_bo_mmap(filp, off, size, &adev->mman.bdev);
 }
 
 int amdgpu_copy_buffer(struct amdgpu_ring *ring, uint64_t src_offset,
