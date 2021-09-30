@@ -404,31 +404,4 @@ pci_get_class(pcireg_t class, struct pci_dev *pdev)
 #define PCI_CLASS_DISPLAY_OTHER \
     ((PCI_CLASS_DISPLAY << 8) | PCI_SUBCLASS_DISPLAY_MISC)
 
-#if defined(__amd64__) || defined(__arm64__) || \
-    defined(__i386__) || defined(__riscv64__)
-
-#define PCI_DMA_BIDIRECTIONAL	0
-
-static inline dma_addr_t
-pci_map_page(struct pci_dev *pdev, struct vm_page *page, unsigned long offset, size_t size, int direction)
-{
-	return VM_PAGE_TO_PHYS(page);
-}
-
-static inline void
-pci_unmap_page(struct pci_dev *pdev, dma_addr_t dma_address, size_t size, int direction)
-{
-}
-
-static inline int
-pci_dma_mapping_error(struct pci_dev *pdev, dma_addr_t dma_addr)
-{
-	return 0;
-}
-
-#define pci_set_dma_mask(x, y)			0
-#define pci_set_consistent_dma_mask(x, y)	0
-
-#endif
-
 #endif /* _LINUX_PCI_H_ */
