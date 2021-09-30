@@ -42,6 +42,7 @@
 
 static const struct drm_gem_object_funcs amdgpu_gem_object_funcs;
 
+#ifdef __linux__
 static vm_fault_t amdgpu_gem_fault(struct vm_fault *vmf)
 {
 	struct ttm_buffer_object *bo = vmf->vma->vm_private_data;
@@ -81,6 +82,7 @@ static const struct vm_operations_struct amdgpu_gem_vm_ops = {
 	.close = ttm_bo_vm_close,
 	.access = ttm_bo_vm_access
 };
+#endif /* __linux__ */
 
 static void amdgpu_gem_object_free(struct drm_gem_object *gobj)
 {
@@ -253,6 +255,7 @@ out_unlock:
 	ttm_eu_backoff_reservation(&ticket, &list);
 }
 
+#ifdef __linux__
 static int amdgpu_gem_object_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 {
 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
@@ -284,6 +287,7 @@ static const struct drm_gem_object_funcs amdgpu_gem_object_funcs = {
 	.mmap = amdgpu_gem_object_mmap,
 	.vm_ops = &amdgpu_gem_vm_ops,
 };
+#endif /* __linux__ */
 
 /*
  * GEM ioctls.
