@@ -25,6 +25,8 @@
 	const __typeof( ((type *)0)->member ) *__mptr = (ptr);	\
 	(type *)( (char *)__mptr - offsetof(type,member) );})
 
+#define offsetofend(s, e) (offsetof(s, e) + sizeof((((s *)0)->e)))
+
 #define S8_MAX		INT8_MAX
 #define S16_MAX		INT16_MAX
 #define S32_MAX		INT32_MAX
