@@ -421,7 +421,7 @@ retry:
 EXPORT_SYMBOL(dma_resv_copy_fences);
 
 /**
- * dma_resv_get_fences_rcu - Get an object's shared and exclusive
+ * dma_resv_get_fences - Get an object's shared and exclusive
  * fences without update side lock held
  * @obj: the reservation object
  * @pfence_excl: the returned exclusive fence (or NULL)
@@ -433,7 +433,7 @@ EXPORT_SYMBOL(dma_resv_copy_fences);
  * exclusive fence is not specified the fence is put into the array of the
  * shared fences as well. Returns either zero or -ENOMEM.
  */
-int dma_resv_get_fences_rcu(struct dma_resv *obj,
+int dma_resv_get_fences(struct dma_resv *obj,
 			    struct dma_fence **pfence_excl,
 			    unsigned *pshared_count,
 			    struct dma_fence ***pshared)
@@ -537,7 +537,7 @@ unlock:
 	*pshared = shared;
 	return ret;
 }
-EXPORT_SYMBOL_GPL(dma_resv_get_fences_rcu);
+EXPORT_SYMBOL_GPL(dma_resv_get_fences);
 
 /**
  * dma_resv_wait_timeout - Wait on reservation's objects
