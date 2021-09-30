@@ -1862,7 +1862,6 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 			return;
 		}
 
-		amdgpu_kms_driver.num_ioctls = amdgpu_max_kms_ioctl;
 		amdgpu_register_atpx_handler();
 	}
 	amdgpu_refcnt++;
