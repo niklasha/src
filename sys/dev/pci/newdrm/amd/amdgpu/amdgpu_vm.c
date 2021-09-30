@@ -165,6 +165,9 @@ struct amdgpu_prt_cb {
 int amdgpu_vm_set_pasid(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 			u32 pasid)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	int r;
 
 	if (vm->pasid == pasid)
@@ -189,6 +192,7 @@ int amdgpu_vm_set_pasid(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 
 
 	return 0;
+#endif
 }
 
 /*
@@ -217,7 +221,9 @@ static inline int amdgpu_vm_eviction_trylock(struct amdgpu_vm *vm)
 
 static inline void amdgpu_vm_eviction_unlock(struct amdgpu_vm *vm)
 {
+#ifdef notyet
 	memalloc_noreclaim_restore(vm->saved_flags);
+#endif
 	mutex_unlock(&vm->eviction_lock);
 }
 
@@ -3275,6 +3281,8 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
  */
 void amdgpu_vm_manager_init(struct amdgpu_device *adev)
 {
+	STUB();
+#ifdef notyet
 	unsigned i;
 
 	/* Concurrent flushes are only possible starting with Vega10 and
@@ -3310,6 +3318,7 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
 #endif
 
 	xa_init_flags(&adev->vm_manager.pasids, XA_FLAGS_LOCK_IRQ);
+#endif
 }
 
 /**
@@ -3321,10 +3330,13 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
  */
 void amdgpu_vm_manager_fini(struct amdgpu_device *adev)
 {
+	STUB();
+#ifdef notyet
 	WARN_ON(!xa_empty(&adev->vm_manager.pasids));
 	xa_destroy(&adev->vm_manager.pasids);
 
 	amdgpu_vmid_mgr_fini(adev);
+#endif
 }
 
 /**
@@ -3388,6 +3400,8 @@ int amdgpu_vm_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 void amdgpu_vm_get_task_info(struct amdgpu_device *adev, u32 pasid,
 			 struct amdgpu_task_info *task_info)
 {
+	STUB();
+#ifdef notyet
 	struct amdgpu_vm *vm;
 	unsigned long flags;
 
@@ -3398,6 +3412,7 @@ void amdgpu_vm_get_task_info(struct amdgpu_device *adev, u32 pasid,
 		*task_info = vm->task_info;
 
 	xa_unlock_irqrestore(&adev->vm_manager.pasids, flags);
+#endif
 }
 
 /**
@@ -3439,6 +3454,9 @@ void amdgpu_vm_set_task_info(struct amdgpu_vm *vm)
 bool amdgpu_vm_handle_fault(struct amdgpu_device *adev, u32 pasid,
 			    uint64_t addr, bool write_fault)
 {
+	STUB();
+	return true;
+#ifdef notyet
 	bool is_compute_context = false;
 	struct amdgpu_bo *root;
 	unsigned long irqflags;
@@ -3524,6 +3542,7 @@ error_unref:
 	amdgpu_bo_unref(&root);
 
 	return false;
+#endif
 }
 
 #if defined(CONFIG_DEBUG_FS)
