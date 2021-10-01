@@ -12,8 +12,9 @@
 #define CONFIG_DRM_AMD_DC_DCN			1
 #endif
 #if 0
-#define CONFIG_DRM_AMDGPU_CIK			1
 #define CONFIG_DRM_AMDGPU_SI			1
+#define CONFIG_DRM_AMD_DC_SI			1
+#define CONFIG_DRM_AMDGPU_CIK			1
 #endif
 
 #define CONFIG_DRM_FBDEV_OVERALLOC		100
