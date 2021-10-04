@@ -620,7 +620,7 @@ static void ring_context_cancel_request(struct intel_context *ce,
 	if (engine && intel_engine_pulse(engine))
 		intel_gt_handle_error(engine->gt, engine->mask, 0,
 				      "request cancellation by %s",
-				      current->comm);
+				      curproc->p_p->ps_comm);
 }
 
 static const struct intel_context_ops ring_context_ops = {
