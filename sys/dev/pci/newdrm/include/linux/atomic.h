@@ -51,6 +51,7 @@
 #define atomic_or(n, p)		atomic_setbits_int(p, n)
 #define atomic_add_return(n, p) __sync_add_and_fetch(p, n)
 #define atomic_sub_return(n, p) __sync_sub_and_fetch(p, n)
+#define atomic_sub_and_test(n, p)	(atomic_sub_return(n, p) == 0)
 #define atomic_inc_return(v)	atomic_add_return(1, (v))
 #define atomic_dec_return(v)	atomic_sub_return(1, (v))
 #define atomic_dec_and_test(v)	(atomic_dec_return(v) == 0)
