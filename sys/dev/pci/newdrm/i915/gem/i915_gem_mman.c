@@ -566,8 +566,6 @@ vm_fault_cpu(struct i915_mmap_offset *mmo, struct uvm_faultinfo *ufi,
 	if (err)
 		goto out;
 
-	KASSERT(i915_gem_object_type_has(obj, I915_GEM_OBJECT_HAS_STRUCT_PAGE));
-
 	flags = mapprot = entry->protection;
 	if (write == 0)
 		flags &= ~PROT_WRITE;
