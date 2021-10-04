@@ -483,7 +483,7 @@ i915_sched_engine_create(unsigned int subclass)
 	INIT_LIST_HEAD(&sched_engine->requests);
 	INIT_LIST_HEAD(&sched_engine->hold);
 
-	spin_lock_init(&sched_engine->lock);
+	mtx_init(&sched_engine->lock, IPL_NONE);
 	lockdep_set_subclass(&sched_engine->lock, subclass);
 
 	/*
