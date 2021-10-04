@@ -96,6 +96,12 @@ ktime_add_us(ktime_t k, uint64_t us)
 }
 
 static inline ktime_t
+ktime_add_ms(ktime_t k, uint64_t ms)
+{
+	return k + (ms * NSEC_PER_MSEC);
+}
+
+static inline ktime_t
 ktime_add_ns(ktime_t k, int64_t ns)
 {
 	return k + ns;
@@ -141,6 +147,15 @@ static inline int64_t
 ktime_divns(ktime_t a, int64_t ns)
 {
 	return a / ns;
+}
+
+static inline ktime_t
+ktime_set(time_t s, long ns)
+{
+	struct timespec ts;
+	ts.tv_sec = s;
+	ts.tv_nsec = ns;
+	return TIMESPEC_TO_NSEC(&ts);
 }
 
 #include <linux/timekeeping.h>
