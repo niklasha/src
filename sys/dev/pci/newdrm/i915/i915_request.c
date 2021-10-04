@@ -279,8 +279,10 @@ i915_request_active_engine(struct i915_request *rq,
 
 static void __rq_init_watchdog(struct i915_request *rq)
 {
-	rq->watchdog.timer.function = NULL;
+	rq->watchdog.timer.to_func = NULL;
 }
+
+#ifdef __linux__
 
 static enum hrtimer_restart __rq_watchdog_expired(struct hrtimer *hrtimer)
 {
@@ -298,6 +300,24 @@ static enum hrtimer_restart __rq_watchdog_expired(struct hrtimer *hrtimer)
 	return HRTIMER_NORESTART;
 }
 
+#else
+
+static void
+__rq_watchdog_expired(void *arg)
+{
+	struct i915_request *rq = (struct i915_request *)arg;
+	struct intel_gt *gt = rq->engine->gt;
+
+	if (!i915_request_completed(rq)) {
+		if (llist_add(&rq->watchdog.link, &gt->watchdog.list))
+			schedule_work(&gt->watchdog.work);
+	} else {
+		i915_request_put(rq);
+	}
+}
+
+#endif
+
 static void __rq_arm_watchdog(struct i915_request *rq)
 {
 	struct i915_request_watchdog *wdg = &rq->watchdog;
@@ -308,6 +328,7 @@ static void __rq_arm_watchdog(struct i915_request *rq)
 
 	i915_request_get(rq);
 
+#ifdef __linux__
 	hrtimer_init(&wdg->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	wdg->timer.function = __rq_watchdog_expired;
 	hrtimer_start_range_ns(&wdg->timer,
@@ -315,14 +336,21 @@ static void __rq_arm_watchdog(struct i915_request *rq)
 					   NSEC_PER_USEC),
 			       NSEC_PER_MSEC,
 			       HRTIMER_MODE_REL);
+#else
+	timeout_set(&wdg->timer, __rq_watchdog_expired, rq);
+	timeout_add_msec(&wdg->timer, 1);
+#endif
 }
 
 static void __rq_cancel_watchdog(struct i915_request *rq)
 {
+	STUB();
+#ifdef notyet
 	struct i915_request_watchdog *wdg = &rq->watchdog;
 
-	if (wdg->timer.function && hrtimer_try_to_cancel(&wdg->timer) > 0)
+	if (wdg->timer.to_func && hrtimer_try_to_cancel(&wdg->timer) > 0)
 		i915_request_put(rq);
+#endif
 }
 
 bool i915_request_retire(struct i915_request *rq)
@@ -894,7 +922,9 @@ __i915_request_create(struct intel_context *ce, gfp_t gfp)
 	u32 seqno;
 	int ret;
 
+#ifdef notyet
 	might_alloc(gfp);
+#endif
 
 	/* Check that the caller provided an already pinned context */
 	__intel_context_pin(ce);
