@@ -58,6 +58,7 @@
 #define atomic_inc_and_test(v)	(atomic_inc_return(v) == 0)
 #define atomic_cmpxchg(p, o, n)	__sync_val_compare_and_swap(p, o, n)
 #define cmpxchg(p, o, n)	__sync_val_compare_and_swap(p, o, n)
+#define cmpxchg64(p, o, n)	__sync_val_compare_and_swap(p, o, n)
 #define atomic_set_release(p, v)	atomic_set((p), (v))
 #define atomic_andnot(bits, p)		atomic_clearbits_int(p,bits)
 #define atomic_fetch_inc(p)		__sync_fetch_and_add(p, 1)
