@@ -401,10 +401,10 @@ intel_context_init(struct intel_context *ce, struct intel_engine_cs *engine)
 
 	rw_init(&ce->pin_mutex, "cepin");
 
-	spin_lock_init(&ce->guc_state.lock);
+	mtx_init(&ce->guc_state.lock, IPL_NONE);
 	INIT_LIST_HEAD(&ce->guc_state.fences);
 
-	spin_lock_init(&ce->guc_active.lock);
+	mtx_init(&ce->guc_active.lock, IPL_NONE);
 	INIT_LIST_HEAD(&ce->guc_active.requests);
 
 	ce->guc_id = GUC_INVALID_LRC_ID;

@@ -282,7 +282,7 @@ struct i915_request {
 	/** Watchdog support fields. */
 	struct i915_request_watchdog {
 		struct llist_node link;
-		struct hrtimer timer;
+		struct timeout timer;
 	} watchdog;
 
 	/*

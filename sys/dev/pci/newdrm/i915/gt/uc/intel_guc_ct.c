@@ -108,7 +108,11 @@ void intel_guc_ct_init_early(struct intel_guc_ct *ct)
 	INIT_LIST_HEAD(&ct->requests.pending);
 	INIT_LIST_HEAD(&ct->requests.incoming);
 	INIT_WORK(&ct->requests.worker, ct_incoming_request_worker_func);
+#ifdef notyet
 	tasklet_setup(&ct->receive_tasklet, ct_receive_tasklet_func);
+#else
+	STUB();
+#endif
 	init_waitqueue_head(&ct->wq);
 }
 
