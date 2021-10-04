@@ -204,6 +204,8 @@ static int guc_mmio_reg_cmp(const void *a, const void *b)
 static void guc_mmio_reg_add(struct temp_regset *regset,
 			     u32 offset, u32 flags)
 {
+	STUB();
+#ifdef notyet
 	u32 count = regset->used;
 	struct guc_mmio_reg reg = {
 		.offset = offset,
@@ -234,6 +236,7 @@ static void guc_mmio_reg_add(struct temp_regset *regset,
 
 		swap(slot[1], slot[0]);
 	}
+#endif
 }
 
 #define GUC_MMIO_REG_ADD(regset, reg, masked) \
@@ -480,8 +483,13 @@ static void guc_init_golden_context(struct intel_guc *guc)
 		GEM_BUG_ON(blob->ads.golden_context_lrca[guc_class] != addr_ggtt);
 		addr_ggtt += alloc_size;
 
+#ifdef __linux__
 		shmem_read(engine->default_state, skip_size, ptr + skip_size,
 			   real_size - skip_size);
+#else
+		uao_read(engine->default_state, skip_size, ptr + skip_size,
+			   real_size - skip_size);
+#endif
 		ptr += alloc_size;
 	}
 
