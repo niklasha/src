@@ -11,6 +11,7 @@
 #define SZ_64K	(1024 * 64)
 #define SZ_128K	(1024 * 128)
 #define SZ_256K	(1024 * 256)
+#define SZ_512K	(1024 * 512)
 #define SZ_1M	(1024 * 1024 * 1)
 #define SZ_2M	(1024 * 1024 * 2)
 #define SZ_8M	(1024 * 1024 * 8)
