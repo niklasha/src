@@ -921,7 +921,7 @@ static int ggtt_probe_common(struct i915_ggtt *ggtt, u64 size)
 	 * resort to an uncached mapping. The WC issue is easily caught by the
 	 * readback check when writing GTT PTE entries.
 	 */
-	if (IS_GEN9_LP(i915) || INTEL_GEN(i915) >= 10)
+	if (IS_GEN9_LP(i915) || GRAPHICS_VER(i915) >= 11)
 		flags = 0;
 	else
 		flags = BUS_SPACE_MAP_PREFETCHABLE;
