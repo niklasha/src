@@ -14,6 +14,9 @@
 
 static int init_fake_lmem_bar(struct intel_memory_region *mem)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	struct drm_i915_private *i915 = mem->i915;
 	struct i915_ggtt *ggtt = &i915->ggtt;
 	unsigned long n;
@@ -50,10 +53,13 @@ static int init_fake_lmem_bar(struct intel_memory_region *mem)
 						      mem->fake_mappable.size);
 
 	return 0;
+#endif
 }
 
 static void release_fake_lmem_bar(struct intel_memory_region *mem)
 {
+	STUB();
+#ifdef notyet
 	if (!drm_mm_node_allocated(&mem->fake_mappable))
 		return;
 
@@ -64,19 +70,26 @@ static void release_fake_lmem_bar(struct intel_memory_region *mem)
 			   mem->fake_mappable.size,
 			   PCI_DMA_BIDIRECTIONAL,
 			   DMA_ATTR_FORCE_CONTIGUOUS);
+#endif
 }
 
 static void
 region_lmem_release(struct intel_memory_region *mem)
 {
 	intel_region_ttm_fini(mem);
+	STUB();
+#ifdef notyet
 	io_mapping_fini(&mem->iomap);
 	release_fake_lmem_bar(mem);
+#endif
 }
 
 static int
 region_lmem_init(struct intel_memory_region *mem)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	int ret;
 
 	if (mem->i915->params.fake_lmem_start) {
@@ -103,6 +116,7 @@ out_no_io:
 	release_fake_lmem_bar(mem);
 
 	return ret;
+#endif
 }
 
 static const struct intel_memory_region_ops intel_region_lmem_ops = {
@@ -114,6 +128,9 @@ static const struct intel_memory_region_ops intel_region_lmem_ops = {
 struct intel_memory_region *
 intel_gt_setup_fake_lmem(struct intel_gt *gt)
 {
+	STUB();
+	return NULL;
+#ifdef notyet
 	struct drm_i915_private *i915 = gt->i915;
 	struct pci_dev *pdev = to_pci_dev(i915->drm.dev);
 	struct intel_memory_region *mem;
@@ -153,6 +170,7 @@ intel_gt_setup_fake_lmem(struct intel_gt *gt)
 	}
 
 	return mem;
+#endif
 }
 
 static bool get_legacy_lowmem_region(struct intel_uncore *uncore,

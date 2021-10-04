@@ -34,9 +34,15 @@ void intel_vga_disable(struct drm_i915_private *dev_priv)
 
 	/* WaEnableVGAAccessThroughIOPort:ctg,elk,ilk,snb,ivb,vlv,hsw */
 	vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
+#ifdef __linux__
 	outb(SR01, VGA_SR_INDEX);
 	sr1 = inb(VGA_SR_DATA);
 	outb(sr1 | 1 << 5, VGA_SR_DATA);
+#else
+	outb(VGA_SR_INDEX, SR01);
+	sr1 = inb(VGA_SR_DATA);
+	outb(VGA_SR_DATA, sr1 | 1 << 5);
+#endif
 	vga_put(pdev, VGA_RSRC_LEGACY_IO);
 	udelay(300);
 
@@ -92,7 +98,11 @@ void intel_vga_reset_io_mem(struct drm_i915_private *i915)
 	 * and error messages.
 	 */
 	vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
+#ifdef __linux__
 	outb(inb(VGA_MSR_READ), VGA_MSR_WRITE);
+#else
+	outb(VGA_MSR_WRITE, inb(VGA_MSR_READ));
+#endif
 	vga_put(pdev, VGA_RSRC_LEGACY_IO);
 }
 
@@ -126,6 +136,9 @@ intel_vga_set_state(struct drm_i915_private *i915, bool enable_decode)
 static unsigned int
 intel_vga_set_decode(struct pci_dev *pdev, bool enable_decode)
 {
+	STUB();
+	return 0;
+#ifdef notyet
 	struct drm_i915_private *i915 = pdev_to_i915(pdev);
 
 	intel_vga_set_state(i915, enable_decode);
@@ -135,6 +148,7 @@ intel_vga_set_decode(struct pci_dev *pdev, bool enable_decode)
 		       VGA_RSRC_NORMAL_IO | VGA_RSRC_NORMAL_MEM;
 	else
 		return VGA_RSRC_NORMAL_IO | VGA_RSRC_NORMAL_MEM;
+#endif
 }
 
 int intel_vga_register(struct drm_i915_private *i915)

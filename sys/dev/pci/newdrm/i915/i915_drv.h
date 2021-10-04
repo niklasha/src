@@ -61,6 +61,11 @@
 #include <drm/i915_mei_hdcp_interface.h>
 #include <drm/ttm/ttm_device.h>
 
+#include "vga.h"
+
+struct inteldrm_softc;
+#define drm_i915_private inteldrm_softc
+
 #include "i915_params.h"
 #include "i915_reg.h"
 #include "i915_utils.h"
@@ -106,6 +111,20 @@
 #include "i915_vma.h"
 #include "i915_irq.h"
 
+
+#include "drm.h"
+#include "vga.h"
+
+#include <dev/ic/mc6845reg.h>
+#include <dev/ic/pcdisplayvar.h>
+#include <dev/ic/vgareg.h>
+#include <dev/ic/vgavar.h>
+
+#include <sys/task.h>
+#include <dev/pci/vga_pcivar.h>
+#include <dev/wscons/wsconsio.h>
+#include <dev/wscons/wsdisplayvar.h>
+#include <dev/rasops/rasops.h>
 
 /* General customization:
  */
@@ -211,7 +230,7 @@ struct drm_i915_file_private {
 	 *
 	 * See i915_gem_proto_context.
 	 */
-	struct mutex proto_context_lock;
+	struct rwlock proto_context_lock;
 
 	/** @proto_context_xa: xarray of struct i915_gem_proto_context
 	 *
@@ -400,7 +419,7 @@ struct drm_i915_display_funcs {
 struct intel_fbc {
 	/* This is always the inner lock when overlapping with struct_mutex and
 	 * it's the outer lock when overlapping with stolen_lock. */
-	struct mutex lock;
+	struct rwlock lock;
 	unsigned int possible_framebuffer_bits;
 	unsigned int busy_bits;
 	struct intel_crtc *crtc;
@@ -509,7 +528,7 @@ enum drrs_support_type {
 
 struct intel_dp;
 struct i915_drrs {
-	struct mutex mutex;
+	struct rwlock mutex;
 	struct delayed_work work;
 	struct intel_dp *dp;
 	unsigned busy_frontbuffer_bits;
@@ -567,7 +586,7 @@ struct i915_gem_mm {
 	struct drm_mm stolen;
 	/** Protects the usage of the GTT stolen memory allocator. This is
 	 * always the inner lock when overlapping with struct_mutex. */
-	struct mutex stolen_lock;
+	struct rwlock stolen_lock;
 
 	/* Protects bound_list/unbound_list and #drm_i915_gem_object.mm.link */
 	spinlock_t obj_lock;
@@ -811,7 +830,7 @@ struct i915_frontbuffer_tracking {
 };
 
 struct i915_virtual_gpu {
-	struct mutex lock; /* serialises sending of g2v_notify command pkts */
+	struct rwlock lock; /* serialises sending of g2v_notify command pkts */
 	bool active;
 	u32 caps;
 };
@@ -826,7 +845,18 @@ struct i915_selftest_stash {
 	struct ida mock_region_instances;
 };
 
-struct drm_i915_private {
+
+struct inteldrm_softc {
+#ifdef __OpenBSD__
+	struct device sc_dev;
+	bus_dma_tag_t dmat;
+	bus_space_tag_t bst;
+	struct agp_map *agph;
+	bus_space_handle_t opregion_ioh;
+	bus_space_handle_t opregion_rvda_ioh;
+	bus_size_t opregion_rvda_size;
+#endif
+
 	struct drm_device drm;
 
 	/* FIXME: Device release actions should all be moved to drmm_ */
@@ -863,6 +893,46 @@ struct drm_i915_private {
 	 */
 	resource_size_t stolen_usable_size;	/* Total size minus reserved ranges */
 
+#ifdef __OpenBSD__
+	pci_chipset_tag_t pc;
+	pcitag_t tag;
+	struct extent *memex;
+	pci_intr_handle_t ih;
+	irqreturn_t(*irq_handler) (int, void *);
+	void *irqh;
+
+	struct vga_pci_bar bar;
+	struct vga_pci_bar *vga_regs;
+
+	const struct pci_device_id *id;
+
+	int console;
+	int primary;
+	int nscreens;
+	void (*switchcb)(void *, int, int);
+	void *switchcbarg;
+	void *switchcookie;
+	struct task switchtask;
+	struct rasops_info ro;
+
+	struct task burner_task;
+	int burner_fblank;
+
+	struct backlight_device *backlight;
+
+	union flush {
+		struct {
+			bus_space_tag_t		bst;
+			bus_space_handle_t	bsh;
+		} i9xx;
+		struct {
+			bus_dma_segment_t	seg;
+			caddr_t			kva;
+		} i8xx;
+	}			 ifp;
+	struct vm_page *pgs;
+#endif
+
 	struct intel_uncore uncore;
 	struct intel_uncore_mmio_debug mmio_debug;
 
@@ -878,7 +948,7 @@ struct drm_i915_private {
 
 	/** gmbus_mutex protects against concurrent usage of the single hw gmbus
 	 * controller on different i2c buses. */
-	struct mutex gmbus_mutex;
+	struct rwlock gmbus_mutex;
 
 	/**
 	 * Base address of where the gmbus and gpio blocks are located (either
@@ -907,7 +977,7 @@ struct drm_i915_private {
 	bool display_irqs_enabled;
 
 	/* Sideband mailbox protection */
-	struct mutex sb_lock;
+	struct rwlock sb_lock;
 	struct pm_qos_request sb_qos;
 
 	/** Cached value of IMR to avoid reads in updating the bitfield */
@@ -929,10 +999,10 @@ struct drm_i915_private {
 	struct intel_overlay *overlay;
 
 	/* backlight registers and fields in struct intel_panel */
-	struct mutex backlight_lock;
+	struct rwlock backlight_lock;
 
 	/* protects panel power sequencer state */
-	struct mutex pps_mutex;
+	struct rwlock pps_mutex;
 
 	unsigned int fsb_freq, mem_freq, is_ddr3;
 	unsigned int skl_preferred_vco_freq;
@@ -1002,7 +1072,7 @@ struct drm_i915_private {
 	 * share registers.
 	 */
 	struct {
-		struct mutex lock;
+		struct rwlock lock;
 
 		int num_shared_dpll;
 		struct intel_shared_dpll shared_dplls[I915_NUM_PLLS];
@@ -1069,7 +1139,7 @@ struct drm_i915_private {
 	 * av_mutex - mutex for audio/video sync
 	 *
 	 */
-	struct mutex av_mutex;
+	struct rwlock av_mutex;
 	int audio_power_refcount;
 	u32 audio_freq_cntrl;
 
@@ -1132,7 +1202,7 @@ struct drm_i915_private {
 		 * protects * intel_crtc->wm.active and
 		 * crtc_state->wm.need_postvbl_update.
 		 */
-		struct mutex wm_mutex;
+		struct rwlock wm_mutex;
 	} wm;
 
 	struct dram_info {
@@ -1220,7 +1290,7 @@ struct drm_i915_private {
 	bool hdcp_comp_added;
 
 	/* Mutex to protect the above hdcp component related values. */
-	struct mutex hdcp_comp_mutex;
+	struct rwlock hdcp_comp_mutex;
 
 	/* The TTM device structure. */
 	struct ttm_device bdev;
@@ -1245,7 +1315,11 @@ static inline struct drm_i915_private *kdev_to_i915(struct device *kdev)
 
 static inline struct drm_i915_private *pdev_to_i915(struct pci_dev *pdev)
 {
+	STUB();
+	return NULL;
+#ifdef notyet
 	return pci_get_drvdata(pdev);
+#endif
 }
 
 /* Simple iterator over all initialised engines */
@@ -1375,7 +1449,9 @@ IS_PLATFORM(const struct drm_i915_private *i915, enum intel_platform p)
 	const unsigned int pi = __platform_mask_index(info, p);
 	const unsigned int pb = __platform_mask_bit(info, p);
 
+#ifdef notyet
 	BUILD_BUG_ON(!__builtin_constant_p(p));
+#endif
 
 	return info->platform_mask[pi] & BIT(pb);
 }
@@ -1390,9 +1466,11 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 	const unsigned int msb = BITS_PER_TYPE(info->platform_mask[0]) - 1;
 	const u32 mask = info->platform_mask[pi];
 
+#ifdef notyet
 	BUILD_BUG_ON(!__builtin_constant_p(p));
 	BUILD_BUG_ON(!__builtin_constant_p(s));
 	BUILD_BUG_ON((s) >= INTEL_SUBPLATFORM_BITS);
+#endif
 
 	/* Shift and test on the MSB position so sign flag can be used. */
 	return ((mask << (msb - pb)) & (mask << (msb - s))) & BIT(msb);
@@ -1764,7 +1842,9 @@ intel_vm_no_concurrent_access_wa(struct drm_i915_private *i915)
 /* i915_drv.c */
 extern const struct dev_pm_ops i915_pm_ops;
 
+#ifdef __linux__
 int i915_driver_probe(struct pci_dev *pdev, const struct pci_device_id *ent);
+#endif
 void i915_driver_remove(struct drm_i915_private *i915);
 void i915_driver_shutdown(struct drm_i915_private *i915);
 
@@ -1922,6 +2002,10 @@ u32 i915_gem_fence_alignment(struct drm_i915_private *dev_priv, u32 size,
 
 const char *i915_cache_level_str(struct drm_i915_private *i915, int type);
 
+int i915_gem_fault(struct drm_gem_object *gem_obj, struct uvm_faultinfo *ufi,
+		   off_t offset, vaddr_t vaddr, vm_page_t *pps, int npages,
+		   int centeridx, vm_prot_t access_type, int flags);
+
 /* i915_cmd_parser.c */
 int i915_cmd_parser_get_version(struct drm_i915_private *dev_priv);
 int intel_engine_init_cmd_parser(struct intel_engine_cs *engine);
@@ -1945,12 +2029,14 @@ int i915_reg_read_ioctl(struct drm_device *dev, void *data,
 			struct drm_file *file);
 
 /* i915_mm.c */
+#ifdef notyet
 int remap_io_mapping(struct vm_area_struct *vma,
 		     unsigned long addr, unsigned long pfn, unsigned long size,
 		     struct io_mapping *iomap);
 int remap_io_sg(struct vm_area_struct *vma,
 		unsigned long addr, unsigned long size,
 		struct scatterlist *sgl, resource_size_t iobase);
+#endif
 
 static inline int intel_hws_csb_write_index(struct drm_i915_private *i915)
 {

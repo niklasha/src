@@ -27,10 +27,10 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
 	gt->i915 = i915;
 	gt->uncore = &i915->uncore;
 
-	spin_lock_init(&gt->irq_lock);
+	mtx_init(&gt->irq_lock, IPL_TTY);
 
 	INIT_LIST_HEAD(&gt->closed_vma);
-	spin_lock_init(&gt->closed_lock);
+	mtx_init(&gt->closed_lock, IPL_TTY);
 
 	init_llist_head(&gt->watchdog.list);
 	INIT_WORK(&gt->watchdog.work, intel_gt_watchdog_work);
@@ -317,7 +317,7 @@ static void gen6_check_faults(struct intel_gt *gt)
 				"\tAddress space: %s\n"
 				"\tSource ID: %d\n"
 				"\tType: %d\n",
-				fault & PAGE_MASK,
+				(unsigned long)(fault & LINUX_PAGE_MASK),
 				fault & RING_FAULT_GTTSEL_MASK ?
 				"GGTT" : "PPGTT",
 				RING_FAULT_SRCID(fault),
@@ -554,7 +554,7 @@ err:
 
 	for (id = 0; id < ARRAY_SIZE(requests); id++) {
 		struct i915_request *rq;
-		struct file *state;
+		struct uvm_object *state;
 
 		rq = requests[id];
 		if (!rq)
@@ -570,7 +570,11 @@ err:
 			continue;
 
 		/* Keep a copy of the state's backing pages; free the obj */
+#ifdef __linux__
 		state = shmem_create_from_object(rq->context->state->obj);
+#else
+		state = uao_create_from_object(rq->context->state->obj);
+#endif
 		if (IS_ERR(state)) {
 			err = PTR_ERR(state);
 			goto out;

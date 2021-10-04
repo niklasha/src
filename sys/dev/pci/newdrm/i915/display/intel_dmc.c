@@ -640,7 +640,11 @@ static void dmc_load_work_fn(struct work_struct *work)
 	dev_priv = container_of(work, typeof(*dev_priv), dmc.work);
 	dmc = &dev_priv->dmc;
 
+#ifdef __linux__
 	request_firmware(&fw, dev_priv->dmc.fw_path, dev_priv->drm.dev);
+#else
+	request_firmware(&fw, dev_priv->dmc.fw_path, NULL);
+#endif
 	parse_dmc_fw(dev_priv, fw);
 
 	if (intel_dmc_has_payload(dev_priv)) {
@@ -656,8 +660,10 @@ static void dmc_load_work_fn(struct work_struct *work)
 			   "Failed to load DMC firmware %s."
 			   " Disabling runtime power management.\n",
 			   dmc->fw_path);
+#ifdef __linux__
 		drm_notice(&dev_priv->drm, "DMC firmware homepage: %s",
 			   INTEL_UC_FIRMWARE_URL);
+#endif
 	}
 
 	release_firmware(fw);

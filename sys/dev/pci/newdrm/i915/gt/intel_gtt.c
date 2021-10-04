@@ -6,6 +6,7 @@
 #include <linux/slab.h> /* fault-inject.h is not standalone! */
 
 #include <linux/fault-inject.h>
+#include <asm/set_memory.h>
 
 #include "gem/i915_gem_lmem.h"
 #include "i915_trace.h"
@@ -193,7 +194,7 @@ void i915_address_space_init(struct i915_address_space *vm, int subclass)
 	 * Do a dummy acquire now under fs_reclaim so that any allocation
 	 * attempt holding the lock is immediately reported by lockdep.
 	 */
-	mutex_init(&vm->mutex);
+	rw_init(&vm->mutex, "vmlk");
 	lockdep_set_subclass(&vm->mutex, subclass);
 
 	if (!intel_vm_no_concurrent_access_wa(vm->i915)) {
@@ -247,7 +248,7 @@ dma_addr_t __px_dma(struct drm_i915_gem_object *p)
 	return sg_dma_address(p->mm.pages->sgl);
 }
 
-struct page *__px_page(struct drm_i915_gem_object *p)
+struct vm_page *__px_page(struct drm_i915_gem_object *p)
 {
 	GEM_BUG_ON(!i915_gem_object_has_pages(p));
 	return sg_page(p->mm.pages->sgl);

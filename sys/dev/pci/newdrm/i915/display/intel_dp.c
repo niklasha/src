@@ -1887,7 +1887,7 @@ void intel_dp_set_power(struct intel_dp *intel_dp, u8 mode)
 			ret = drm_dp_dpcd_writeb(&intel_dp->aux, DP_SET_POWER, mode);
 			if (ret == 1)
 				break;
-			msleep(1);
+			drm_msleep(1);
 		}
 
 		if (ret == 1 && lspcon->active)
@@ -4388,8 +4388,10 @@ intel_dp_connector_register(struct drm_connector *connector)
 	if (ret)
 		return ret;
 
+#ifdef notyet
 	drm_dbg_kms(&i915->drm, "registering %s bus for %s\n",
 		    intel_dp->aux.name, connector->kdev->kobj.name);
+#endif
 
 	intel_dp->aux.dev = connector->kdev;
 	ret = drm_dp_aux_register(&intel_dp->aux);
@@ -5111,7 +5113,7 @@ intel_dp_drrs_init(struct intel_connector *connector,
 	struct drm_display_mode *downclock_mode = NULL;
 
 	INIT_DELAYED_WORK(&dev_priv->drrs.work, intel_edp_drrs_downclock_work);
-	mutex_init(&dev_priv->drrs.mutex);
+	rw_init(&dev_priv->drrs.mutex, "drrs");
 
 	if (DISPLAY_VER(dev_priv) <= 6) {
 		drm_dbg_kms(&dev_priv->drm,

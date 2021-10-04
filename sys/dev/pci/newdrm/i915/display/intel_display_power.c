@@ -588,12 +588,12 @@ static void icl_tc_cold_exit(struct drm_i915_private *i915)
 						      0, 250, 1);
 		if (ret != -EAGAIN || ++tries == 3)
 			break;
-		msleep(1);
+		drm_msleep(1);
 	}
 
 	/* Spec states that TC cold exit can take up to 1ms to complete */
 	if (!ret)
-		msleep(1);
+		drm_msleep(1);
 
 	/* TODO: turn failure into a error as soon i915 CI updates ICL IFWI */
 	drm_dbg_kms(&i915->drm, "TC cold block %s\n", ret ? "failed" :
@@ -1463,7 +1463,11 @@ static void vlv_display_power_well_deinit(struct drm_i915_private *dev_priv)
 	intel_pps_reset_all(dev_priv);
 
 	/* Prevent us from re-enabling polling on accident in late suspend */
+#ifdef __linux__
 	if (!dev_priv->drm.dev->power.is_suspended)
+#else
+	if (!cold)
+#endif
 		intel_hpd_poll_enable(dev_priv);
 }
 
@@ -3965,7 +3969,7 @@ tgl_tc_cold_request(struct drm_i915_private *i915, bool block)
 		if (++tries == 3)
 			break;
 
-		msleep(1);
+		drm_msleep(1);
 	}
 
 	if (ret)
@@ -5116,7 +5120,7 @@ int intel_power_domains_init(struct drm_i915_private *dev_priv)
 
 	BUILD_BUG_ON(POWER_DOMAIN_NUM > 64);
 
-	mutex_init(&power_domains->lock);
+	rw_init(&power_domains->lock, "ipdl");
 
 	INIT_DELAYED_WORK(&power_domains->async_put_work,
 			  intel_display_power_put_async_work);
@@ -6006,6 +6010,7 @@ static void assert_ved_power_gated(struct drm_i915_private *dev_priv)
 
 static void assert_isp_power_gated(struct drm_i915_private *dev_priv)
 {
+#ifdef notyet
 	static const struct pci_device_id isp_ids[] = {
 		{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x0f38)},
 		{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x22b8)},
@@ -6015,6 +6020,7 @@ static void assert_isp_power_gated(struct drm_i915_private *dev_priv)
 	drm_WARN(&dev_priv->drm, !pci_dev_present(isp_ids) &&
 		 !vlv_punit_is_power_gated(dev_priv, PUNIT_REG_ISPSSPM0),
 		 "ISP not power gated\n");
+#endif
 }
 
 static void intel_power_domains_verify_state(struct drm_i915_private *dev_priv);

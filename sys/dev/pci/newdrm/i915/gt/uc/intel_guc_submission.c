@@ -1003,7 +1003,7 @@ int intel_guc_submission_init(struct intel_guc *guc)
 
 	xa_init_flags(&guc->context_lookup, XA_FLAGS_LOCK_IRQ);
 
-	spin_lock_init(&guc->contexts_lock);
+	mtx_init(&guc->contexts_lock, IPL_NONE);
 	INIT_LIST_HEAD(&guc->guc_id_list);
 	ida_init(&guc->guc_ids);
 

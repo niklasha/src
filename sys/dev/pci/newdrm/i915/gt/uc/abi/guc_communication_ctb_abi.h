@@ -54,7 +54,9 @@ struct guc_ct_buffer_desc {
 #define GUC_CTB_STATUS_MISMATCH				(1 << 2)
 	u32 reserved[13];
 } __packed;
+#ifdef notyet
 static_assert(sizeof(struct guc_ct_buffer_desc) == 64);
+#endif
 
 /**
  * DOC: CTB Message

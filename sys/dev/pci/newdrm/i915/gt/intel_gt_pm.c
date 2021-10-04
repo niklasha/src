@@ -299,6 +299,7 @@ void intel_gt_suspend_prepare(struct intel_gt *gt)
 	intel_uc_suspend(&gt->uc);
 }
 
+#ifdef notyet
 static suspend_state_t pm_suspend_target(void)
 {
 #if IS_ENABLED(CONFIG_SUSPEND) && IS_ENABLED(CONFIG_PM_SLEEP)
@@ -307,6 +308,7 @@ static suspend_state_t pm_suspend_target(void)
 	return PM_SUSPEND_TO_IDLE;
 #endif
 }
+#endif
 
 void intel_gt_suspend_late(struct intel_gt *gt)
 {
@@ -330,8 +332,10 @@ void intel_gt_suspend_late(struct intel_gt *gt)
 	 * powermanagement enabled, but we also retain system state and so
 	 * it remains safe to keep on using our allocated memory.
 	 */
+#ifdef notyet
 	if (pm_suspend_target() == PM_SUSPEND_TO_IDLE)
 		return;
+#endif
 
 	with_intel_runtime_pm(gt->uncore->rpm, wakeref) {
 		intel_rps_disable(&gt->rps);

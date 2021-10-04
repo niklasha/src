@@ -73,7 +73,9 @@ static int i915_adjust_stolen(struct drm_i915_private *i915,
 {
 	struct i915_ggtt *ggtt = &i915->ggtt;
 	struct intel_uncore *uncore = ggtt->vm.gt->uncore;
+#ifdef notyet
 	struct resource *r;
+#endif
 
 	if (dsm->start == 0 || dsm->end <= dsm->start)
 		return -EINVAL;
@@ -122,6 +124,7 @@ static int i915_adjust_stolen(struct drm_i915_private *i915,
 		}
 	}
 
+#ifdef __linux__
 	/*
 	 * With stolen lmem, we don't need to check if the address range
 	 * overlaps with the non-stolen system memory range, since lmem is local
@@ -164,6 +167,7 @@ static int i915_adjust_stolen(struct drm_i915_private *i915,
 			return -EBUSY;
 		}
 	}
+#endif
 
 	return 0;
 }
@@ -390,7 +394,7 @@ static int i915_gem_init_stolen(struct intel_memory_region *mem)
 	resource_size_t reserved_base, stolen_top;
 	resource_size_t reserved_total, reserved_size;
 
-	mutex_init(&i915->mm.stolen_lock);
+	rw_init(&i915->mm.stolen_lock, "stln");
 
 	if (intel_vgpu_active(i915)) {
 		drm_notice(&i915->drm,
@@ -481,12 +485,14 @@ static int i915_gem_init_stolen(struct intel_memory_region *mem)
 	i915->dsm_reserved =
 		(struct resource)DEFINE_RES_MEM(reserved_base, reserved_size);
 
+#ifdef notyet
 	if (!resource_contains(&i915->dsm, &i915->dsm_reserved)) {
 		drm_err(&i915->drm,
 			"Stolen reserved area %pR outside stolen memory %pR\n",
 			&i915->dsm_reserved, &i915->dsm);
 		return 0;
 	}
+#endif
 
 	/* It is possible for the reserved area to end before the end of stolen
 	 * memory, so just consider the start. */
@@ -553,7 +559,7 @@ i915_pages_create_for_stolen(struct drm_device *dev,
 
 	GEM_BUG_ON(range_overflows(offset, size, resource_size(&i915->dsm)));
 
-	/* We hide that we have no struct page backing our stolen object
+	/* We hide that we have no struct vm_page backing our stolen object
 	 * by wrapping the contiguous physical allocation with a fake
 	 * dma mapping in a single scatterlist.
 	 */

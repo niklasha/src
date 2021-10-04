@@ -38,16 +38,26 @@
 #include "i915_trace.h"
 #include "i915_vma.h"
 
-static struct kmem_cache *slab_vmas;
+#include <dev/pci/agpvar.h>
+
+static struct pool slab_vmas;
 
 struct i915_vma *i915_vma_alloc(void)
 {
+#ifdef __linux__
 	return kmem_cache_zalloc(slab_vmas, GFP_KERNEL);
+#else
+	return pool_get(&slab_vmas, PR_WAITOK | PR_ZERO);
+#endif
 }
 
 void i915_vma_free(struct i915_vma *vma)
 {
+#ifdef __linux__
 	return kmem_cache_free(slab_vmas, vma);
+#else
+	pool_put(&slab_vmas, vma);
+#endif
 }
 
 #if IS_ENABLED(CONFIG_DRM_I915_ERRLOG_GEM) && IS_ENABLED(CONFIG_DRM_DEBUG_MM)
@@ -112,7 +122,7 @@ vma_create(struct drm_i915_gem_object *obj,
 		return ERR_PTR(-ENOMEM);
 
 	kref_init(&vma->ref);
-	mutex_init(&vma->pages_mutex);
+	rw_init(&vma->pages_mutex, "vmapg");
 	vma->vm = i915_vm_get(vm);
 	vma->ops = &vm->vma_ops;
 	vma->obj = obj;
@@ -122,12 +132,14 @@ vma_create(struct drm_i915_gem_object *obj,
 
 	i915_active_init(&vma->active, __i915_vma_active, __i915_vma_retire, 0);
 
+#ifdef notyet
 	/* Declare ourselves safe for use inside shrinkers */
 	if (IS_ENABLED(CONFIG_LOCKDEP)) {
 		fs_reclaim_acquire(GFP_KERNEL);
 		might_lock(&vma->active.mutex);
 		fs_reclaim_release(GFP_KERNEL);
 	}
+#endif
 
 	INIT_LIST_HEAD(&vma->closed_link);
 
@@ -465,16 +477,31 @@ void __iomem *i915_vma_pin_iomap(struct i915_vma *vma)
 			ptr = i915_gem_object_lmem_io_map(vma->obj, 0,
 							  vma->obj->base.size);
 		else
+#ifdef __linux__
 			ptr = io_mapping_map_wc(&i915_vm_to_ggtt(vma->vm)->iomap,
 						vma->node.start,
 						vma->node.size);
+#else
+		{
+			struct drm_i915_private *dev_priv = vma->vm->i915;
+			err = agp_map_subregion(dev_priv->agph, vma->node.start,
+                                 vma->node.size, &vma->bsh);
+			if (err) {
+				err = -err;
+				goto err;
+			}
+			ptr = bus_space_vaddr(dev_priv->bst, vma->bsh);
+		}
+#endif
 		if (ptr == NULL) {
 			err = -ENOMEM;
 			goto err;
 		}
 
 		if (unlikely(cmpxchg(&vma->iomap, NULL, ptr))) {
+#ifdef __linux__
 			io_mapping_unmap(ptr);
+#endif
 			ptr = vma->iomap;
 		}
 	}
@@ -1146,7 +1173,7 @@ void i915_vma_release(struct kref *ref)
 void i915_vma_parked(struct intel_gt *gt)
 {
 	struct i915_vma *vma, *next;
-	LIST_HEAD(closed);
+	DRM_LIST_HEAD(closed);
 
 	spin_lock_irq(&gt->closed_lock);
 	list_for_each_entry_safe(vma, next, &gt->closed_vma, closed_link) {
@@ -1187,7 +1214,12 @@ static void __i915_vma_iounmap(struct i915_vma *vma)
 	if (vma->iomap == NULL)
 		return;
 
+#ifdef __linux__
 	io_mapping_unmap(vma->iomap);
+#else
+	struct drm_i915_private *dev_priv = vma->vm->i915;
+	agp_unmap_subregion(dev_priv->agph, vma->bsh, vma->node.size);
+#endif
 	vma->iomap = NULL;
 }
 
@@ -1204,10 +1236,20 @@ void i915_vma_revoke_mmap(struct i915_vma *vma)
 
 	node = &vma->mmo->vma_node;
 	vma_offset = vma->ggtt_view.partial.offset << PAGE_SHIFT;
+#ifdef __linux__
 	unmap_mapping_range(vma->vm->i915->drm.anon_inode->i_mapping,
 			    drm_vma_node_offset_addr(node) + vma_offset,
 			    vma->size,
 			    1);
+#else
+	struct drm_i915_private *dev_priv = vma->obj->base.dev->dev_private;
+	struct vm_page *pg;
+
+	for (pg = &dev_priv->pgs[atop(vma->node.start)];
+	     pg != &dev_priv->pgs[atop(vma->node.start + vma->size)];
+	     pg++)
+		pmap_page_protect(pg, PROT_NONE);
+#endif
 
 	i915_vma_unset_userfault(vma);
 	if (!--vma->obj->userfault_count)
@@ -1412,14 +1454,23 @@ void i915_vma_make_purgeable(struct i915_vma *vma)
 
 void i915_vma_module_exit(void)
 {
+#ifdef __linux__
 	kmem_cache_destroy(slab_vmas);
+#else
+	pool_destroy(&slab_vmas);
+#endif
 }
 
 int __init i915_vma_module_init(void)
 {
+#ifdef __linux__
 	slab_vmas = KMEM_CACHE(i915_vma, SLAB_HWCACHE_ALIGN);
 	if (!slab_vmas)
 		return -ENOMEM;
+#else
+	pool_init(&slab_vmas, sizeof(struct i915_vma),
+	    CACHELINESIZE, IPL_NONE, 0, "drmvma", NULL);
+#endif
 
 	return 0;
 }

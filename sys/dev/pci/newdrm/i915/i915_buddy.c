@@ -10,7 +10,7 @@
 #include "i915_gem.h"
 #include "i915_utils.h"
 
-static struct kmem_cache *slab_blocks;
+static struct pool slab_blocks;
 
 static struct i915_buddy_block *i915_block_alloc(struct i915_buddy_mm *mm,
 						 struct i915_buddy_block *parent,
@@ -21,7 +21,11 @@ static struct i915_buddy_block *i915_block_alloc(struct i915_buddy_mm *mm,
 
 	GEM_BUG_ON(order > I915_BUDDY_MAX_ORDER);
 
+#ifdef __linux__
 	block = kmem_cache_zalloc(slab_blocks, GFP_KERNEL);
+#else
+	block = pool_get(&slab_blocks, PR_WAITOK | PR_ZERO);
+#endif
 	if (!block)
 		return NULL;
 
@@ -36,7 +40,11 @@ static struct i915_buddy_block *i915_block_alloc(struct i915_buddy_mm *mm,
 static void i915_block_free(struct i915_buddy_mm *mm,
 			    struct i915_buddy_block *block)
 {
+#ifdef __linux__
 	kmem_cache_free(slab_blocks, block);
+#else
+	pool_put(&slab_blocks, block);
+#endif
 }
 
 static void mark_allocated(struct i915_buddy_block *block)
@@ -318,8 +326,8 @@ int i915_buddy_alloc_range(struct i915_buddy_mm *mm,
 {
 	struct i915_buddy_block *block;
 	struct i915_buddy_block *buddy;
-	LIST_HEAD(allocated);
-	LIST_HEAD(dfs);
+	DRM_LIST_HEAD(allocated);
+	DRM_LIST_HEAD(dfs);
 	u64 end;
 	int err;
 	int i;
@@ -408,14 +416,23 @@ err_free:
 
 void i915_buddy_module_exit(void)
 {
+#ifdef __linux__
 	kmem_cache_destroy(slab_blocks);
+#else
+	pool_destroy(&slab_blocks);
+#endif
 }
 
 int __init i915_buddy_module_init(void)
 {
+#ifdef __linux__
 	slab_blocks = KMEM_CACHE(i915_buddy_block, 0);
 	if (!slab_blocks)
 		return -ENOMEM;
+#else
+	pool_init(&slab_blocks, sizeof(struct i915_buddy_block),
+	    CACHELINESIZE, IPL_NONE, 0, "i915bb", NULL);
+#endif
 
 	return 0;
 }

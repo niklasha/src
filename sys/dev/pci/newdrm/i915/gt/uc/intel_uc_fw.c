@@ -390,8 +390,10 @@ fail:
 
 	drm_notice(&i915->drm, "%s firmware %s: fetch failed with error %d\n",
 		   intel_uc_fw_type_repr(uc_fw->type), uc_fw->path, err);
+#ifdef __linux__
 	drm_info(&i915->drm, "%s firmware(s) can be downloaded from %s\n",
 		 intel_uc_fw_type_repr(uc_fw->type), INTEL_UC_FIRMWARE_URL);
+#endif
 
 	release_firmware(fw);		/* OK even if fw is NULL */
 	return err;
@@ -585,6 +587,9 @@ void intel_uc_fw_cleanup_fetch(struct intel_uc_fw *uc_fw)
  */
 size_t intel_uc_fw_copy_rsa(struct intel_uc_fw *uc_fw, void *dst, u32 max_len)
 {
+	STUB();
+	return 0;
+#ifdef notyet
 	struct sg_table *pages = uc_fw->obj->mm.pages;
 	u32 size = min_t(u32, uc_fw->rsa_size, max_len);
 	u32 offset = sizeof(struct uc_css_header) + uc_fw->ucode_size;
@@ -592,6 +597,7 @@ size_t intel_uc_fw_copy_rsa(struct intel_uc_fw *uc_fw, void *dst, u32 max_len)
 	GEM_BUG_ON(!intel_uc_fw_is_available(uc_fw));
 
 	return sg_pcopy_to_buffer(pages->sgl, pages->nents, dst, size, offset);
+#endif
 }
 
 /**
