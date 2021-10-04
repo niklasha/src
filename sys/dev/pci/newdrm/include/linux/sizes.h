@@ -4,6 +4,7 @@
 #define _LINUX_SIZES_H
 
 #define SZ_1K	(1024 * 1)
+#define SZ_2K	(1024 * 2)
 #define SZ_4K	(1024 * 4)
 #define SZ_8K	(1024 * 8)
 #define SZ_16K	(1024 * 16)
