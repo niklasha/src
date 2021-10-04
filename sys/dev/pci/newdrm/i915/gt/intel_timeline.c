@@ -64,7 +64,7 @@ intel_timeline_pin_map(struct intel_timeline *timeline)
 
 	timeline->hwsp_map = vaddr;
 	timeline->hwsp_seqno = memset(vaddr + ofs, 0, TIMELINE_SEQNO_BYTES);
-	clflush(vaddr + ofs);
+	clflush((vaddr_t)(vaddr + ofs));
 
 	return 0;
 }
@@ -225,7 +225,7 @@ void intel_timeline_reset_seqno(const struct intel_timeline *tl)
 
 	memset(hwsp_seqno + 1, 0, TIMELINE_SEQNO_BYTES - sizeof(*hwsp_seqno));
 	WRITE_ONCE(*hwsp_seqno, tl->seqno);
-	clflush(hwsp_seqno);
+	clflush((vaddr_t)hwsp_seqno);
 }
 
 void intel_timeline_enter(struct intel_timeline *tl)
@@ -413,7 +413,7 @@ void intel_gt_show_timelines(struct intel_gt *gt,
 {
 	struct intel_gt_timelines *timelines = &gt->timelines;
 	struct intel_timeline *tl, *tn;
-	LIST_HEAD(free);
+	DRM_LIST_HEAD(free);
 
 	spin_lock(&timelines->lock);
 	list_for_each_entry_safe(tl, tn, &timelines->active_list, link) {
