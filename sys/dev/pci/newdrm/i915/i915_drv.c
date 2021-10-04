@@ -1995,8 +1995,6 @@ static const struct drm_driver driver = {
 #include <drm/drm_agpsupport.h>
 #include <drm/drm_utils.h>
 
-#include "i915_globals.h"
-
 #ifdef __amd64__
 #include "efifb.h"
 #include <machine/biosvar.h>
