@@ -479,7 +479,7 @@ intel_dp_link_down(struct intel_encoder *encoder,
 		intel_set_pch_fifo_underrun_reporting(dev_priv, PIPE_A, true);
 	}
 
-	msleep(intel_dp->pps.panel_power_down_delay);
+	drm_msleep(intel_dp->pps.panel_power_down_delay);
 
 	intel_dp->DP = DP;
 
