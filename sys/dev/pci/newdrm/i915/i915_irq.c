@@ -4500,7 +4500,7 @@ static void intel_irq_postinstall(struct drm_i915_private *dev_priv)
  */
 int intel_irq_install(struct drm_i915_private *dev_priv)
 {
-	int irq = to_pci_dev(dev_priv->drm.dev)->irq;
+	int irq = dev_priv->drm.pdev->irq;
 	int ret;
 
 	/*
@@ -4538,7 +4538,7 @@ int intel_irq_install(struct drm_i915_private *dev_priv)
  */
 void intel_irq_uninstall(struct drm_i915_private *dev_priv)
 {
-	int irq = to_pci_dev(dev_priv->drm.dev)->irq;
+	int irq = dev_priv->drm.pdev->irq;
 
 	/*
 	 * FIXME we can get called twice during driver probe

@@ -597,7 +597,7 @@ static u32 i9xx_get_backlight(struct intel_connector *connector, enum pipe unuse
 	if (panel->backlight.combination_mode) {
 		u8 lbpc;
 
-		pci_read_config_byte(to_pci_dev(dev_priv->drm.dev), LBPC, &lbpc);
+		pci_read_config_byte(dev_priv->drm.pdev, LBPC, &lbpc);
 		val *= lbpc;
 	}
 
@@ -669,7 +669,7 @@ static void i9xx_set_backlight(const struct drm_connector_state *conn_state, u32
 
 		lbpc = level * 0xfe / panel->backlight.pwm_level_max + 1;
 		level /= lbpc;
-		pci_write_config_byte(to_pci_dev(dev_priv->drm.dev), LBPC, lbpc);
+		pci_write_config_byte(dev_priv->drm.pdev, LBPC, lbpc);
 	}
 
 	if (DISPLAY_VER(dev_priv) == 4) {
