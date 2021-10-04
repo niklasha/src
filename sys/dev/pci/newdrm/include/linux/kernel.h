@@ -27,6 +27,8 @@
 
 #define offsetofend(s, e) (offsetof(s, e) + sizeof((((s *)0)->e)))
 
+#define typeof_member(s, e)	typeof(((s *)0)->e)
+
 #define S8_MAX		INT8_MAX
 #define S16_MAX		INT16_MAX
 #define S32_MAX		INT32_MAX
