@@ -148,4 +148,9 @@ typedef struct {
 	struct ww_mutex lock;
 } seqcount_ww_mutex_t;
 
+typedef struct {
+	unsigned int seq;
+	struct rwlock lock;
+} seqcount_mutex_t;
+
 #endif
