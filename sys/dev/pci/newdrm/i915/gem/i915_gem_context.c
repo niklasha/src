@@ -285,6 +285,9 @@ static int proto_context_register_locked(struct drm_i915_file_private *fpriv,
 					 struct i915_gem_proto_context *pc,
 					 u32 *id)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	int ret;
 	void *old;
 
@@ -302,6 +305,7 @@ static int proto_context_register_locked(struct drm_i915_file_private *fpriv,
 	WARN_ON(old);
 
 	return 0;
+#endif
 }
 
 static int proto_context_register(struct drm_i915_file_private *fpriv,
@@ -1464,6 +1468,8 @@ static void gem_context_register(struct i915_gem_context *ctx,
 		 curproc->p_p->ps_comm, ctx->pid);
 #endif
 
+	STUB();
+#ifdef notyet
 	/* And finally expose ourselves to userspace via the idr */
 	old = xa_store(&fpriv->context_xa, id, ctx, GFP_KERNEL);
 	WARN_ON(old);
@@ -1471,6 +1477,7 @@ static void gem_context_register(struct i915_gem_context *ctx,
 	spin_lock(&i915->gem.contexts.lock);
 	list_add_tail(&ctx->link, &i915->gem.contexts.list);
 	spin_unlock(&i915->gem.contexts.lock);
+#endif
 }
 
 int i915_gem_context_open(struct drm_i915_private *i915,
