@@ -744,6 +744,9 @@ static int init_stolen_lmem(struct intel_memory_region *mem)
 	if (GEM_WARN_ON(resource_size(&mem->region) == 0))
 		return -ENODEV;
 
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	if (!io_mapping_init_wc(&mem->iomap,
 				mem->io_start,
 				resource_size(&mem->region)))
@@ -763,11 +766,15 @@ static int init_stolen_lmem(struct intel_memory_region *mem)
 err_fini:
 	io_mapping_fini(&mem->iomap);
 	return err;
+#endif
 }
 
 static void release_stolen_lmem(struct intel_memory_region *mem)
 {
+	STUB();
+#ifdef notyet
 	io_mapping_fini(&mem->iomap);
+#endif
 	i915_gem_cleanup_stolen(mem->i915);
 }
 
@@ -781,6 +788,9 @@ struct intel_memory_region *
 i915_gem_stolen_lmem_setup(struct drm_i915_private *i915, u16 type,
 			   u16 instance)
 {
+	STUB();
+	return ERR_PTR(-ENOSYS);
+#ifdef notyet
 	struct intel_uncore *uncore = &i915->uncore;
 	struct pci_dev *pdev = i915->drm.pdev;
 	struct intel_memory_region *mem;
@@ -816,6 +826,7 @@ i915_gem_stolen_lmem_setup(struct drm_i915_private *i915, u16 type,
 	mem->private = true;
 
 	return mem;
+#endif
 }
 
 struct intel_memory_region*
