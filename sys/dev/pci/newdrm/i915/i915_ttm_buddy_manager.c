@@ -17,7 +17,7 @@ struct i915_ttm_buddy_manager {
 	struct ttm_resource_manager manager;
 	struct i915_buddy_mm mm;
 	struct list_head reserved;
-	struct mutex lock;
+	struct rwlock lock;
 	u64 default_page_size;
 };
 
@@ -176,7 +176,7 @@ int i915_ttm_buddy_man_init(struct ttm_device *bdev,
 	if (err)
 		goto err_free_bman;
 
-	mutex_init(&bman->lock);
+	rw_init(&bman->lock, "bmlk");
 	INIT_LIST_HEAD(&bman->reserved);
 	GEM_BUG_ON(default_page_size < chunk_size);
 	bman->default_page_size = default_page_size;
