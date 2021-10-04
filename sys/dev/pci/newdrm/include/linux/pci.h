@@ -404,4 +404,6 @@ pci_get_class(pcireg_t class, struct pci_dev *pdev)
 #define PCI_CLASS_DISPLAY_OTHER \
     ((PCI_CLASS_DISPLAY << 8) | PCI_SUBCLASS_DISPLAY_MISC)
 
+#define pci_unregister_driver(x)
+
 #endif /* _LINUX_PCI_H_ */
