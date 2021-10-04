@@ -82,6 +82,16 @@ hweight64(uint64_t x)
 	return x;
 }
 
+static inline unsigned long
+hweight_long(unsigned long x)
+{
+#ifdef __LP64__
+	return hweight64(x);
+#else
+	return hweight32(x);
+#endif
+}
+
 static inline int64_t
 sign_extend64(uint64_t value, int index)
 {
