@@ -389,6 +389,8 @@ struct drm_device {
 	/* IRQs */
 	bool irq_enabled;
 	int irq;
+#else
+	struct drm_agp_head *agp;
 #endif
 };
 

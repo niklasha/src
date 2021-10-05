@@ -1992,7 +1992,7 @@ static const struct drm_driver driver = {
 
 #ifdef __OpenBSD__
 
-#include <drm/drm_agpsupport.h>
+#include <drm/drm_legacy.h> /* for agp */
 #include <drm/drm_utils.h>
 
 #ifdef __amd64__
@@ -2441,7 +2441,7 @@ inteldrm_attach(struct device *parent, struct device *self, void *aux)
 #if NINTAGP > 0
 	if (GRAPHICS_VER(dev_priv) <= 5) {
 		config_found_sm(self, aux, intagp_print, intagpsubmatch);
-		dev->agp = drm_agp_init();
+		dev->agp = drm_legacy_agp_init(dev);
 		if (dev->agp) {
 			if (drm_mtrr_add(dev->agp->info.ai_aperture_base,
 			    dev->agp->info.ai_aperture_size, DRM_MTRR_WC) == 0)
