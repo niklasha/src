@@ -207,6 +207,9 @@ static int reserve_lowmem_region(struct intel_uncore *uncore,
 
 static struct intel_memory_region *setup_lmem(struct intel_gt *gt)
 {
+	STUB();
+	return ERR_PTR(-ENOSYS);
+#ifdef notyet
 	struct drm_i915_private *i915 = gt->i915;
 	struct intel_uncore *uncore = gt->uncore;
 	struct pci_dev *pdev = i915->drm.pdev;
@@ -251,6 +254,7 @@ static struct intel_memory_region *setup_lmem(struct intel_gt *gt)
 err_region_put:
 	intel_memory_region_put(mem);
 	return ERR_PTR(err);
+#endif
 }
 
 struct intel_memory_region *intel_gt_setup_lmem(struct intel_gt *gt)
