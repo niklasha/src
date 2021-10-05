@@ -286,6 +286,34 @@ gtt_user_read(struct io_mapping *mapping,
 	}
 	return unwritten;
 }
+#else
+static inline bool
+gtt_user_read(struct drm_i915_private *dev_priv,
+	      loff_t base, int offset,
+	      char __user *user_data, int length)
+{
+	bus_space_handle_t bsh;
+	void __iomem *vaddr;
+	unsigned long unwritten;
+
+	/* We can use the cpu mem copy function because this is X86. */
+	agp_map_atomic(dev_priv->agph, base, &bsh);
+	vaddr = bus_space_vaddr(dev_priv->bst, bsh);
+	unwritten = __copy_to_user_inatomic(user_data,
+					    (void __force *)vaddr + offset,
+					    length);
+	agp_unmap_atomic(dev_priv->agph, bsh);
+	if (unwritten) {
+		agp_map_subregion(dev_priv->agph, base, PAGE_SIZE, &bsh);
+		vaddr = bus_space_vaddr(dev_priv->bst, bsh);
+		unwritten = copy_to_user(user_data,
+					 (void __force *)vaddr + offset,
+					 length);
+		agp_unmap_subregion(dev_priv->agph, bsh, PAGE_SIZE);
+	}
+	return unwritten;
+}
+#endif
 
 static struct i915_vma *i915_gem_gtt_prepare(struct drm_i915_gem_object *obj,
 					     struct drm_mm_node *node,
@@ -363,34 +391,6 @@ static void i915_gem_gtt_cleanup(struct drm_i915_gem_object *obj,
 		i915_vma_unpin(vma);
 	}
 }
-#else
-static inline bool
-gtt_user_read(struct drm_i915_private *dev_priv,
-	      loff_t base, int offset,
-	      char __user *user_data, int length)
-{
-	bus_space_handle_t bsh;
-	void __iomem *vaddr;
-	unsigned long unwritten;
-
-	/* We can use the cpu mem copy function because this is X86. */
-	agp_map_atomic(dev_priv->agph, base, &bsh);
-	vaddr = bus_space_vaddr(dev_priv->bst, bsh);
-	unwritten = __copy_to_user_inatomic(user_data,
-					    (void __force *)vaddr + offset,
-					    length);
-	agp_unmap_atomic(dev_priv->agph, bsh);
-	if (unwritten) {
-		agp_map_subregion(dev_priv->agph, base, PAGE_SIZE, &bsh);
-		vaddr = bus_space_vaddr(dev_priv->bst, bsh);
-		unwritten = copy_to_user(user_data,
-					 (void __force *)vaddr + offset,
-					 length);
-		agp_unmap_subregion(dev_priv->agph, bsh, PAGE_SIZE);
-	}
-	return unwritten;
-}
-#endif
 
 static int
 i915_gem_gtt_pread(struct drm_i915_gem_object *obj,
