@@ -198,6 +198,8 @@ static struct ttm_tt *i915_ttm_tt_create(struct ttm_buffer_object *bo,
 
 static void i915_ttm_tt_unpopulate(struct ttm_device *bdev, struct ttm_tt *ttm)
 {
+	STUB();
+#ifdef notyet
 	struct i915_ttm_tt *i915_tt = container_of(ttm, typeof(*i915_tt), ttm);
 
 	if (i915_tt->cached_st) {
@@ -208,6 +210,7 @@ static void i915_ttm_tt_unpopulate(struct ttm_device *bdev, struct ttm_tt *ttm)
 		i915_tt->cached_st = NULL;
 	}
 	ttm_pool_free(&bdev->pool, ttm);
+#endif
 }
 
 static void i915_ttm_tt_destroy(struct ttm_device *bdev, struct ttm_tt *ttm)
@@ -378,6 +381,9 @@ i915_ttm_region(struct ttm_device *bdev, int ttm_mem_type)
 
 static struct sg_table *i915_ttm_tt_get_st(struct ttm_tt *ttm)
 {
+	STUB();
+	return ERR_PTR(-ENOSYS);
+#ifdef notyet
 	struct i915_ttm_tt *i915_tt = container_of(ttm, typeof(*i915_tt), ttm);
 	struct sg_table *st;
 	int ret;
@@ -407,6 +413,7 @@ static struct sg_table *i915_ttm_tt_get_st(struct ttm_tt *ttm)
 
 	i915_tt->cached_st = st;
 	return st;
+#endif
 }
 
 static struct sg_table *
@@ -490,6 +497,9 @@ static int i915_ttm_move(struct ttm_buffer_object *bo, bool evict,
 			 struct ttm_resource *dst_mem,
 			 struct ttm_place *hop)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	struct drm_i915_gem_object *obj = i915_ttm_to_gem(bo);
 	struct ttm_resource_manager *dst_man =
 		ttm_manager_type(bo->bdev, dst_mem->mem_type);
@@ -562,6 +572,7 @@ static int i915_ttm_move(struct ttm_buffer_object *bo, bool evict,
 
 	i915_ttm_adjust_gem_after_move(obj);
 	return 0;
+#endif
 }
 
 static int i915_ttm_io_mem_reserve(struct ttm_device *bdev, struct ttm_resource *mem)
@@ -578,6 +589,9 @@ static int i915_ttm_io_mem_reserve(struct ttm_device *bdev, struct ttm_resource 
 static unsigned long i915_ttm_io_mem_pfn(struct ttm_buffer_object *bo,
 					 unsigned long page_offset)
 {
+	STUB();
+	return 0;
+#ifdef notyet
 	struct drm_i915_gem_object *obj = i915_ttm_to_gem(bo);
 	unsigned long base = obj->mm.region->iomap.base - obj->mm.region->region.start;
 	struct scatterlist *sg;
@@ -588,6 +602,7 @@ static unsigned long i915_ttm_io_mem_pfn(struct ttm_buffer_object *bo,
 	sg = __i915_gem_object_get_sg(obj, &obj->ttm.get_io_page, page_offset, &ofs, true);
 
 	return ((base + sg_dma_address(sg)) >> PAGE_SHIFT) + ofs;
+#endif
 }
 
 static struct ttm_device_funcs i915_ttm_bo_driver = {
@@ -795,6 +810,7 @@ static void i915_ttm_delayed_free(struct drm_i915_gem_object *obj)
 	}
 }
 
+#ifdef notyet
 static vm_fault_t vm_fault_ttm(struct vm_fault *vmf)
 {
 	struct vm_area_struct *area = vmf->vma;
@@ -847,6 +863,8 @@ static const struct vm_operations_struct vm_ops_ttm = {
 	.close = ttm_vm_close,
 };
 
+#endif
+
 static u64 i915_ttm_mmap_offset(struct drm_i915_gem_object *obj)
 {
 	/* The ttm_bo must be allocated with I915_BO_ALLOC_USER */
@@ -865,7 +883,9 @@ static const struct drm_i915_gem_object_ops i915_gem_ttm_obj_ops = {
 	.delayed_free = i915_ttm_delayed_free,
 	.migrate = i915_ttm_migrate,
 	.mmap_offset = i915_ttm_mmap_offset,
+#ifdef notyet
 	.mmap_ops = &vm_ops_ttm,
+#endif
 };
 
 void i915_ttm_bo_destroy(struct ttm_buffer_object *bo)
@@ -911,7 +931,7 @@ int __i915_gem_ttm_object_init(struct intel_memory_region *mem,
 	i915_gem_object_init_memory_region(obj, mem);
 	i915_gem_object_make_unshrinkable(obj);
 	INIT_RADIX_TREE(&obj->ttm.get_io_page.radix, GFP_KERNEL | __GFP_NOWARN);
-	mutex_init(&obj->ttm.get_io_page.lock);
+	rw_init(&obj->ttm.get_io_page.lock, "i915ttm");
 	bo_type = (obj->flags & I915_BO_ALLOC_USER) ? ttm_bo_type_device :
 		ttm_bo_type_kernel;
 
