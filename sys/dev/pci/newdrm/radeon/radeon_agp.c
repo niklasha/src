@@ -129,7 +129,10 @@ static struct radeon_agpmode_quirk radeon_agpmode_quirk_list[] = {
 
 struct radeon_agp_head *radeon_agp_head_init(struct drm_device *dev)
 {
-	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	STUB();
+	return NULL;
+#ifdef notyet
+	struct pci_dev *pdev = dev->pdev;
 	struct radeon_agp_head *head = NULL;
 
 	head = kzalloc(sizeof(*head), GFP_KERNEL);
@@ -157,12 +160,16 @@ struct radeon_agp_head *radeon_agp_head_init(struct drm_device *dev)
 	head->base = head->agp_info.aper_base;
 
 	return head;
+#endif
 }
 
 static int radeon_agp_head_acquire(struct radeon_device *rdev)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	struct drm_device *dev = rdev->ddev;
-	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	struct pci_dev *pdev = dev->pdev;
 
 	if (!rdev->agp)
 		return -ENODEV;
@@ -173,15 +180,20 @@ static int radeon_agp_head_acquire(struct radeon_device *rdev)
 		return -ENODEV;
 	rdev->agp->acquired = 1;
 	return 0;
+#endif
 }
 
 static int radeon_agp_head_release(struct radeon_device *rdev)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	if (!rdev->agp || !rdev->agp->acquired)
 		return -EINVAL;
 	agp_backend_release(rdev->agp->bridge);
 	rdev->agp->acquired = 0;
 	return 0;
+#endif
 }
 
 static int radeon_agp_head_enable(struct radeon_device *rdev, struct radeon_agp_mode mode)
@@ -197,6 +209,9 @@ static int radeon_agp_head_enable(struct radeon_device *rdev, struct radeon_agp_
 
 static int radeon_agp_head_info(struct radeon_device *rdev, struct radeon_agp_info *info)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 	struct agp_kern_info *kern;
 
 	if (!rdev->agp || !rdev->agp->acquired)
@@ -214,11 +229,15 @@ static int radeon_agp_head_info(struct radeon_device *rdev, struct radeon_agp_in
 	info->id_device = kern->device->device;
 
 	return 0;
+#endif
 }
 #endif
 
 int radeon_agp_init(struct radeon_device *rdev)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 #if IS_ENABLED(CONFIG_AGP)
 	struct radeon_agpmode_quirk *p = radeon_agpmode_quirk_list;
 	struct radeon_agp_mode mode;
@@ -357,6 +376,7 @@ int radeon_agp_init(struct radeon_device *rdev)
 	return 0;
 #else
 	return 0;
+#endif
 #endif
 }
 
