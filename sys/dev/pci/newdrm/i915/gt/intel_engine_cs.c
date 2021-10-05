@@ -1254,6 +1254,8 @@ static bool ring_is_idle(struct intel_engine_cs *engine)
 
 void __intel_engine_flush_submission(struct intel_engine_cs *engine, bool sync)
 {
+	STUB();
+#ifdef notyet
 	struct tasklet_struct *t = &engine->sched_engine->tasklet;
 
 	if (!t->callback)
@@ -1271,6 +1273,7 @@ void __intel_engine_flush_submission(struct intel_engine_cs *engine, bool sync)
 	/* Synchronise and wait for the tasklet on another CPU */
 	if (sync)
 		tasklet_unlock_wait(t);
+#endif
 }
 
 /**
