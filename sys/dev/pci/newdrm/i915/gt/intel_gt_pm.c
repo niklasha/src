@@ -39,16 +39,21 @@ static void user_forcewake(struct intel_gt *gt, bool suspend)
 
 static void runtime_begin(struct intel_gt *gt)
 {
+	STUB();
+#ifdef notyet
 	local_irq_disable();
 	write_seqcount_begin(&gt->stats.lock);
 	gt->stats.start = ktime_get();
 	gt->stats.active = true;
 	write_seqcount_end(&gt->stats.lock);
 	local_irq_enable();
+#endif
 }
 
 static void runtime_end(struct intel_gt *gt)
 {
+	STUB();
+#ifdef notyet
 	local_irq_disable();
 	write_seqcount_begin(&gt->stats.lock);
 	gt->stats.active = false;
@@ -57,6 +62,7 @@ static void runtime_end(struct intel_gt *gt)
 			  ktime_sub(ktime_get(), gt->stats.start));
 	write_seqcount_end(&gt->stats.lock);
 	local_irq_enable();
+#endif
 }
 
 static int __gt_unpark(struct intel_wakeref *wf)
@@ -124,7 +130,10 @@ static const struct intel_wakeref_ops wf_ops = {
 void intel_gt_pm_init_early(struct intel_gt *gt)
 {
 	intel_wakeref_init(&gt->wakeref, gt->uncore->rpm, &wf_ops);
+	STUB();
+#ifdef notyet
 	seqcount_mutex_init(&gt->stats.lock, &gt->wakeref.mutex);
+#endif
 }
 
 void intel_gt_pm_init(struct intel_gt *gt)
@@ -377,6 +386,9 @@ static ktime_t __intel_gt_get_awake_time(const struct intel_gt *gt)
 
 ktime_t intel_gt_get_awake_time(const struct intel_gt *gt)
 {
+	STUB();
+	return 0;
+#ifdef notyet
 	unsigned int seq;
 	ktime_t total;
 
@@ -386,6 +398,7 @@ ktime_t intel_gt_get_awake_time(const struct intel_gt *gt)
 	} while (read_seqcount_retry(&gt->stats.lock, seq));
 
 	return total;
+#endif
 }
 
 #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
