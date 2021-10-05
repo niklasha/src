@@ -18,6 +18,9 @@
 
 static int i915_gem_object_get_pages_phys(struct drm_i915_gem_object *obj)
 {
+	STUB();
+	return -ENOSYS;
+#ifdef notyet
 #ifdef __linux__
 	struct address_space *mapping = obj->base.filp->f_mapping;
 #else
@@ -124,12 +127,15 @@ err_pci:
 	drm_pci_free(obj->base.dev, phys);
 #endif
 	return -ENOMEM;
+#endif
 }
 
 void
 i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
 			       struct sg_table *pages)
 {
+	STUB();
+#ifdef notyet
 	dma_addr_t dma = sg_dma_address(pages->sgl);
 #ifdef __linux__
 	void *vaddr = sg_page(pages->sgl);
@@ -193,6 +199,7 @@ i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
 			  vaddr, dma);
 #else
 	drm_pci_free(obj->base.dev, phys);
+#endif
 #endif
 }
 
