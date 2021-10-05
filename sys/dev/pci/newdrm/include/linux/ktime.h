@@ -23,6 +23,7 @@
 #include <linux/jiffies.h>
 
 typedef int64_t ktime_t;
+#define KTIME_MAX INT64_MAX
 
 static inline ktime_t
 ktime_get(void)
