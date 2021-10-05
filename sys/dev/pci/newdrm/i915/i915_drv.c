@@ -968,7 +968,7 @@ int i915_driver_probe(struct drm_i915_private *i915, const struct pci_device_id 
 #endif
 
 	/* Disable nuclear pageflip by default on pre-ILK */
-	if (!i915_modparams.nuclear_pageflip && match_info->gen < 5)
+	if (!i915_modparams.nuclear_pageflip && match_info->graphics_ver < 5)
 		i915->drm.driver_features &= ~DRIVER_ATOMIC;
 
 	/*
@@ -977,7 +977,7 @@ int i915_driver_probe(struct drm_i915_private *i915, const struct pci_device_id 
 	 */
 #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
 	if (IS_ENABLED(CONFIG_DRM_I915_UNSTABLE_FAKE_LMEM)) {
-		if (INTEL_GEN(i915) >= 9 && i915_selftest.live < 0 &&
+		if (GRAPHICS_VER(i915) >= 9 && i915_selftest.live < 0 &&
 		    i915_modparams.fake_lmem_start) {
 			mkwrite_device_info(i915)->memory_regions =
 				REGION_SMEM | REGION_LMEM | REGION_STOLEN;
@@ -2407,7 +2407,7 @@ inteldrm_attach(struct device *parent, struct device *self, void *aux)
 	memcpy(device_info, info, sizeof(*device_info));
 	RUNTIME_INFO(dev_priv)->device_id = dev->pdev->device;
 
-	mmio_bar = IS_GEN(dev_priv, 2) ? 0x14 : 0x10;
+	mmio_bar = (GRAPHICS_VER(dev_priv) == 2) ? 0x14 : 0x10;
 	/* Before gen4, the registers and the GTT are behind different BARs.
 	 * However, from gen4 onwards, the registers and the GTT are shared
 	 * in the same BAR, so we want to restrict this ioremap from
@@ -2415,10 +2415,12 @@ inteldrm_attach(struct device *parent, struct device *self, void *aux)
 	 * the register BAR remains the same size for all the earlier
 	 * generations up to Ironlake.
 	 */
-	if (info->gen < 5)
-		mmio_size = 512*1024;
+	if (GRAPHICS_VER(dev_priv) < 5)
+		mmio_size = 512 * 1024;
+	else if (IS_DGFX(dev_priv))
+		mmio_size = 4 * 1024 * 1024;
 	else
-		mmio_size = 2*1024*1024;
+		mmio_size = 2 * 1024 * 1024;
 
 	mmio_type = pci_mapreg_type(pa->pa_pc, pa->pa_tag, mmio_bar);
 	if (pci_mapreg_map(pa, mmio_bar, mmio_type, BUS_SPACE_MAP_LINEAR,
@@ -2437,7 +2439,7 @@ inteldrm_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 #if NINTAGP > 0
-	if (info->gen <= 5) {
+	if (GRAPHICS_VER(dev_priv) <= 5) {
 		config_found_sm(self, aux, intagp_print, intagpsubmatch);
 		dev->agp = drm_agp_init();
 		if (dev->agp) {
@@ -2448,7 +2450,7 @@ inteldrm_attach(struct device *parent, struct device *self, void *aux)
 	}
 #endif
 
-	if (info->gen < 5)
+	if (GRAPHICS_VER(dev_priv) < 5)
 		pa->pa_flags &= ~PCI_FLAGS_MSI_ENABLED;
 
 	if (pci_intr_map_msi(pa, &dev_priv->ih) != 0 &&
@@ -2461,7 +2463,7 @@ inteldrm_attach(struct device *parent, struct device *self, void *aux)
 	printf("%s: %s, %s, gen %d\n", dev_priv->sc_dev.dv_xname,
 	    pci_intr_string(dev_priv->pc, dev_priv->ih),
 	    intel_platform_name(INTEL_INFO(dev_priv)->platform),
-	    INTEL_GEN(dev_priv));
+	    GRAPHICS_VER(dev_priv));
 
 	dev_priv->irqh = pci_intr_establish(dev_priv->pc, dev_priv->ih,
 	    IPL_TTY, inteldrm_intr, dev_priv, dev_priv->sc_dev.dv_xname);
@@ -2507,8 +2509,6 @@ inteldrm_attachhook(struct device *self)
 
 	if (inteldrm_refcnt == 0) {
 		/* from i915_init() in i915_pci.c */
-		if (i915_globals_init() != 0)
-			goto fail;
 	}
 	inteldrm_refcnt++;
 
