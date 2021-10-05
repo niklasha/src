@@ -23,6 +23,12 @@ __seqcount_init(seqcount_t *s, const char *name,
 	s->sequence = 0;
 }
 
+static inline void
+seqcount_init(seqcount_t *s)
+{
+	__seqcount_init(s, NULL, NULL);
+}
+
 static inline unsigned int
 __read_seqcount_begin(const seqcount_t *s)
 {
