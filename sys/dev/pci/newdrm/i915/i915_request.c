@@ -344,13 +344,10 @@ static void __rq_arm_watchdog(struct i915_request *rq)
 
 static void __rq_cancel_watchdog(struct i915_request *rq)
 {
-	STUB();
-#ifdef notyet
 	struct i915_request_watchdog *wdg = &rq->watchdog;
 
 	if (wdg->timer.to_func && hrtimer_try_to_cancel(&wdg->timer) > 0)
 		i915_request_put(rq);
-#endif
 }
 
 bool i915_request_retire(struct i915_request *rq)
