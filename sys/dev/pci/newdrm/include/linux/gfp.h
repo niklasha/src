@@ -38,6 +38,24 @@ gfpflags_allow_blocking(const unsigned int flags)
 struct vm_page *alloc_pages(unsigned int, unsigned int);
 void	__free_pages(struct vm_page *, unsigned int);
 
+/*
+ * XXX Kludge alert!
+ * The TAILQ element links of pages allocated by the above API are free to
+ * reuse.  As an ugly hack we map Linux' page's "private" field to vm_page's
+ * TAILQ_ENTRY space.
+ */
+static inline void
+page_set_private(struct vm_page *pg, unsigned long private)
+{
+	*((unsigned long *)&pg->pageq) = private;
+}
+
+static inline unsigned long
+page_get_private(struct vm_page *pg)
+{
+	return *((unsigned long *)&pg->pageq);
+}
+
 static inline struct vm_page *
 alloc_page(unsigned int gfp_mask)
 {

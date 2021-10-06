@@ -99,10 +99,8 @@ static struct vm_page *ttm_pool_alloc_page(struct ttm_pool *pool, gfp_t gfp_flag
 
 	if (!pool->use_dma_alloc) {
 		p = alloc_pages(gfp_flags, order);
-#ifdef notyet
 		if (p)
-			p->private = order;
-#endif
+			page_set_private(p, order);
 		return p;
 	}
 
@@ -138,9 +136,7 @@ static struct vm_page *ttm_pool_alloc_page(struct ttm_pool *pool, gfp_t gfp_flag
 		p = virt_to_page(vaddr);
 
 	dma->vaddr = (unsigned long)vaddr | order;
-#ifdef notyet
-	p->private = (unsigned long)dma;
-#endif
+	page_set_private(p, (unsigned long)dma);
 	return p;
 
 error_free:
@@ -175,7 +171,7 @@ static void ttm_pool_free_page(struct ttm_pool *pool, enum ttm_caching caching,
 	if (order)
 		attr |= DMA_ATTR_NO_WARN;
 
-	dma = (void *)p->private;
+	dma = (void *)page_get_private(p);
 	vaddr = (void *)(dma->vaddr & LINUX_PAGE_MASK);
 	dma_free_attrs(pool->dev, (1UL << order) * PAGE_SIZE, vaddr, dma->addr,
 		       attr);
@@ -215,14 +211,9 @@ static int ttm_pool_map(struct ttm_pool *pool, unsigned int order,
 	unsigned int i;
 
 	if (pool->use_dma_alloc) {
-#ifdef notyet
-		struct ttm_pool_dma *dma = (void *)p->private;
+		struct ttm_pool_dma *dma = (void *)page_get_private(p);
 
 		addr = dma->addr;
-#else
-		STUB();
-		return -ENOSYS;
-#endif
 	} else {
 		size_t size = (1ULL << order) * PAGE_SIZE;
 
@@ -243,15 +234,12 @@ static int ttm_pool_map(struct ttm_pool *pool, unsigned int order,
 static void ttm_pool_unmap(struct ttm_pool *pool, dma_addr_t dma_addr,
 			   unsigned int num_pages)
 {
-	STUB();
-#ifdef notyet
 	/* Unmapped while freeing the page */
 	if (pool->use_dma_alloc)
 		return;
 
 	dma_unmap_page(pool->dev, dma_addr, (long)num_pages << PAGE_SHIFT,
 		       DMA_BIDIRECTIONAL);
-#endif
 }
 
 /* Give pages into a specific pool_type */
@@ -378,17 +366,13 @@ static unsigned int ttm_pool_shrink(void)
 /* Return the allocation order based for a page */
 static unsigned int ttm_pool_page_order(struct ttm_pool *pool, struct vm_page *p)
 {
-	STUB();
-	return 0;
-#ifdef notyet
 	if (pool->use_dma_alloc) {
-		struct ttm_pool_dma *dma = (void *)p->private;
+		struct ttm_pool_dma *dma = (void *)page_get_private(p);
 
 		return dma->vaddr & ~LINUX_PAGE_MASK;
 	}
 
-	return p->private;
-#endif
+	return page_get_private(p);
 }
 
 /**
