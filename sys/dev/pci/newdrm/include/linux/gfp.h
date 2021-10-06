@@ -40,20 +40,33 @@ void	__free_pages(struct vm_page *, unsigned int);
 
 /*
  * XXX Kludge alert!
- * The TAILQ element links of pages allocated by the above API are free to
- * reuse.  As an ugly hack we map Linux' page's "private" field to vm_page's
- * TAILQ_ENTRY space.
+ * Some fields of vm_page structs allocated by the above API are
+ * free to reuse.  As an ugly hack we map Linux' page's "lru" field to
+ * vm_page's pageq space.  We do a similar hack for the the "private"
+ * field where we abuse the objt space.
  */
+static inline struct list_head *
+page_lru(struct vm_page *pg)
+{
+	return (struct list_head *)&pg->pageq;
+}
+
+static inline struct vm_page *
+page_lru_first_entry_or_null(struct list_head *head)
+{
+	return list_empty(head) ? NULL : container_of((void *)&head->next, struct vm_page, pageq);
+}
+
 static inline void
 page_set_private(struct vm_page *pg, unsigned long private)
 {
-	*((unsigned long *)&pg->pageq) = private;
+	*((unsigned long *)&pg->objt) = private;
 }
 
 static inline unsigned long
 page_get_private(struct vm_page *pg)
 {
-	return *((unsigned long *)&pg->pageq);
+	return *((unsigned long *)&pg->objt);
 }
 
 static inline struct vm_page *

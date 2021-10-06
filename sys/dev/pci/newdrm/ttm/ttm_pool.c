@@ -245,42 +245,45 @@ static void ttm_pool_unmap(struct ttm_pool *pool, dma_addr_t dma_addr,
 /* Give pages into a specific pool_type */
 static void ttm_pool_type_give(struct ttm_pool_type *pt, struct vm_page *p)
 {
-	STUB();
-#ifdef notyet
 	unsigned int i, num_pages = 1 << pt->order;
 
 	for (i = 0; i < num_pages; ++i) {
+#ifdef notyet
 		if (PageHighMem(p))
 			clear_highpage(p + i);
 		else
+#endif
+#ifdef __linux__
 			clear_page(page_address(p + i));
+#else
+			pmap_zero_page(p + i);
+#endif
 	}
 
 	spin_lock(&pt->lock);
-	list_add(&p->lru, &pt->pages);
+	list_add(page_lru(p), &pt->pages);
 	spin_unlock(&pt->lock);
 	atomic_long_add(1 << pt->order, &allocated_pages);
-#endif
 }
 
 /* Take pages from a specific pool_type, return NULL when nothing available */
 static struct vm_page *ttm_pool_type_take(struct ttm_pool_type *pt)
 {
-	STUB();
-	return NULL;
-#ifdef notyet
 	struct vm_page *p;
 
 	spin_lock(&pt->lock);
+#ifdef __linux__
 	p = list_first_entry_or_null(&pt->pages, typeof(*p), lru);
+#else
+	p = page_lru_first_entry_or_null(&pt->pages); 
+#endif
 	if (p) {
 		atomic_long_sub(1 << pt->order, &allocated_pages);
-		list_del(&p->lru);
+		list_del(page_lru(p));
 	}
 	spin_unlock(&pt->lock);
 
 	return p;
-#endif
 }
 
 /* Initialize and add a pool type to the global shrinker list */
