@@ -150,13 +150,15 @@ read_seqretry(seqlock_t *sl, unsigned int pos)
 }
 
 typedef struct {
-	unsigned int seq;
+	seqcount_t seq;
 	struct ww_mutex lock;
 } seqcount_ww_mutex_t;
 
 typedef struct {
-	unsigned int seq;
+	seqcount_t seq;
 	struct rwlock lock;
 } seqcount_mutex_t;
+
+#define seqcount_mutex_init(s, l)	seqcount_init(&(s)->seq)
 
 #endif
