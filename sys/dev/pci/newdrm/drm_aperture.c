@@ -340,7 +340,7 @@ int drm_aperture_remove_conflicting_pci_framebuffers(struct pci_dev *pdev,
 						     const struct drm_driver *req_driver)
 {
 	STUB();
-	return -ENOSYS;
+	return 0;
 #ifdef notyet
 	resource_size_t base, size;
 	int bar, ret = 0;
