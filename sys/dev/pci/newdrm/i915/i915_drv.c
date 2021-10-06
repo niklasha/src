@@ -2497,6 +2497,8 @@ inteldrm_forcedetach(struct inteldrm_softc *dev_priv)
 #endif
 }
 
+extern int __init i915_init(void);
+
 void
 inteldrm_attachhook(struct device *self)
 {
@@ -2508,7 +2510,7 @@ inteldrm_attachhook(struct device *self)
 	int orientation_quirk;
 
 	if (inteldrm_refcnt == 0) {
-		/* from i915_init() in i915_pci.c */
+		i915_init();
 	}
 	inteldrm_refcnt++;
 

@@ -1239,9 +1239,20 @@ int i915_register_pci_driver(void)
 {
 	return pci_register_driver(&i915_pci_driver);
 }
-#endif
 
 void i915_unregister_pci_driver(void)
 {
 	pci_unregister_driver(&i915_pci_driver);
 }
+
+#else
+
+int i915_register_pci_driver(void)
+{
+	return 0;
+}
+
+void i915_unregister_pci_driver(void)
+{
+}
+#endif
