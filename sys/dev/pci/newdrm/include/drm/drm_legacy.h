@@ -282,7 +282,8 @@ struct drm_agp_head {
 };
 #endif
 
-#if IS_ENABLED(CONFIG_DRM_LEGACY) && IS_ENABLED(CONFIG_AGP)
+/* #if IS_ENABLED(CONFIG_DRM_LEGACY) && IS_ENABLED(CONFIG_AGP) */
+#if IS_ENABLED(CONFIG_AGP)
 struct drm_agp_head *drm_legacy_agp_init(struct drm_device *dev);
 int drm_legacy_agp_acquire(struct drm_device *dev);
 int drm_legacy_agp_release(struct drm_device *dev);
