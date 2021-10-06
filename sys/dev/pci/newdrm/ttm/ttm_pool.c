@@ -211,16 +211,18 @@ static int ttm_pool_apply_caching(struct vm_page **first, struct vm_page **last,
 static int ttm_pool_map(struct ttm_pool *pool, unsigned int order,
 			struct vm_page *p, dma_addr_t **dma_addr)
 {
-	STUB();
-	return -ENOSYS;
-#ifdef notyet
 	dma_addr_t addr;
 	unsigned int i;
 
 	if (pool->use_dma_alloc) {
+#ifdef notyet
 		struct ttm_pool_dma *dma = (void *)p->private;
 
 		addr = dma->addr;
+#else
+		STUB();
+		return -ENOSYS;
+#endif
 	} else {
 		size_t size = (1ULL << order) * PAGE_SIZE;
 
@@ -235,7 +237,6 @@ static int ttm_pool_map(struct ttm_pool *pool, unsigned int order,
 	}
 
 	return 0;
-#endif
 }
 
 /* Unmap pages of 1 << order size */
