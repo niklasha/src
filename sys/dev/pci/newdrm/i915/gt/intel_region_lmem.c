@@ -128,11 +128,8 @@ static const struct intel_memory_region_ops intel_region_lmem_ops = {
 struct intel_memory_region *
 intel_gt_setup_fake_lmem(struct intel_gt *gt)
 {
-	STUB();
-	return NULL;
-#ifdef notyet
 	struct drm_i915_private *i915 = gt->i915;
-	struct pci_dev *pdev = to_pci_dev(i915->drm.dev);
+	struct pci_dev *pdev = i915->drm.pdev;
 	struct intel_memory_region *mem;
 	resource_size_t mappable_end;
 	resource_size_t io_start;
@@ -147,8 +144,25 @@ intel_gt_setup_fake_lmem(struct intel_gt *gt)
 	GEM_BUG_ON(i915_ggtt_has_aperture(&i915->ggtt));
 
 	/* Your mappable aperture belongs to me now! */
+#ifdef __linux__
 	mappable_end = pci_resource_len(pdev, 2);
 	io_start = pci_resource_start(pdev, 2);
+#else
+	{
+		bus_addr_t base;
+		bus_size_t sz;
+		pcireg_t type;
+		int err;
+
+		type = pci_mapreg_type(i915->pc, i915->tag, 0x18);
+		err = -pci_mapreg_info(i915->pc, i915->tag, 0x18, type,
+		    &base, &sz, NULL);
+		if (err)
+			return ERR_PTR(-ENODEV);
+		mappable_end = sz;
+		io_start = base;
+	}
+#endif
 	start = i915->params.fake_lmem_start;
 
 	mem = intel_memory_region_create(i915,
@@ -170,7 +184,6 @@ intel_gt_setup_fake_lmem(struct intel_gt *gt)
 	}
 
 	return mem;
-#endif
 }
 
 static bool get_legacy_lowmem_region(struct intel_uncore *uncore,
