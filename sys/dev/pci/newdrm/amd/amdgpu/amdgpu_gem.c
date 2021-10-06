@@ -276,6 +276,31 @@ static int amdgpu_gem_object_mmap(struct drm_gem_object *obj, struct vm_area_str
 
 	return drm_gem_ttm_mmap(obj, vma);
 }
+#else
+static int amdgpu_gem_object_mmap(struct drm_gem_object *obj,
+    vm_prot_t accessprot, voff_t off, vsize_t size)
+{
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+
+	if (amdgpu_ttm_tt_get_usermm(bo->tbo.ttm))
+		return -EPERM;
+	if (bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
+		return -EPERM;
+
+	/* Workaround for Thunk bug creating PROT_NONE,MAP_PRIVATE mappings
+	 * for debugger access to invisible VRAM. Should have used MAP_SHARED
+	 * instead. Clearing VM_MAYWRITE prevents the mapping from ever
+	 * becoming writable and makes is_cow_mapping(vm_flags) false.
+	 */
+#ifdef notyet
+	if (is_cow_mapping(vma->vm_flags) &&
+	    !(vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC)))
+		vma->vm_flags &= ~VM_MAYWRITE;
+#endif
+
+	return drm_gem_ttm_mmap(obj, accessprot, off, size);
+}
+#endif
 
 static const struct drm_gem_object_funcs amdgpu_gem_object_funcs = {
 	.free = amdgpu_gem_object_free,
@@ -285,9 +310,10 @@ static const struct drm_gem_object_funcs amdgpu_gem_object_funcs = {
 	.vmap = drm_gem_ttm_vmap,
 	.vunmap = drm_gem_ttm_vunmap,
 	.mmap = amdgpu_gem_object_mmap,
+#ifdef notyet
 	.vm_ops = &amdgpu_gem_vm_ops,
+#endif
 };
-#endif /* __linux__ */
 
 /*
  * GEM ioctls.

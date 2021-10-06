@@ -279,6 +279,20 @@ static int radeon_gem_object_mmap(struct drm_gem_object *obj, struct vm_area_str
 
 	return drm_gem_ttm_mmap(obj, vma);
 }
+#else
+static int
+radeon_gem_object_mmap(struct drm_gem_object *obj,
+    vm_prot_t accessprot, voff_t off, vsize_t size)
+{
+	struct radeon_bo *bo = gem_to_radeon_bo(obj);
+	struct radeon_device *rdev = radeon_get_rdev(bo->tbo.bdev);
+
+	if (radeon_ttm_tt_has_userptr(rdev, bo->tbo.ttm))
+		return -EPERM;
+
+	return drm_gem_ttm_mmap(obj, accessprot, off, size);
+}
+#endif
 
 const struct drm_gem_object_funcs radeon_gem_object_funcs = {
 	.free = radeon_gem_object_free,
@@ -291,9 +305,10 @@ const struct drm_gem_object_funcs radeon_gem_object_funcs = {
 	.vmap = drm_gem_ttm_vmap,
 	.vunmap = drm_gem_ttm_vunmap,
 	.mmap = radeon_gem_object_mmap,
+#ifdef notyet
 	.vm_ops = &radeon_gem_vm_ops,
-};
 #endif
+};
 
 /*
  * GEM ioctls.

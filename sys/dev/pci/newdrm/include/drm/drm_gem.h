@@ -164,6 +164,8 @@ struct drm_gem_object_funcs {
 	 */
 #ifdef __linux__
 	int (*mmap)(struct drm_gem_object *obj, struct vm_area_struct *vma);
+#else
+	int (*mmap)(struct drm_gem_object *, vm_prot_t, voff_t, vsize_t);
 #endif
 
 	/**
