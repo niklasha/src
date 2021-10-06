@@ -207,9 +207,6 @@ static int reserve_lowmem_region(struct intel_uncore *uncore,
 
 static struct intel_memory_region *setup_lmem(struct intel_gt *gt)
 {
-	STUB();
-	return ERR_PTR(-ENOSYS);
-#ifdef notyet
 	struct drm_i915_private *i915 = gt->i915;
 	struct intel_uncore *uncore = gt->uncore;
 	struct pci_dev *pdev = i915->drm.pdev;
@@ -224,9 +221,27 @@ static struct intel_memory_region *setup_lmem(struct intel_gt *gt)
 	/* Stolen starts from GSMBASE on DG1 */
 	lmem_size = intel_uncore_read64(uncore, GEN12_GSMBASE);
 
+#ifdef __linux__
 	io_start = pci_resource_start(pdev, 2);
 	if (GEM_WARN_ON(lmem_size > pci_resource_len(pdev, 2)))
 		return ERR_PTR(-ENODEV);
+#else
+	{
+		bus_addr_t base;
+		bus_size_t sz;
+		pcireg_t type;
+		int err;
+
+		type = pci_mapreg_type(i915->pc, i915->tag, 0x18);
+		err = -pci_mapreg_info(i915->pc, i915->tag, 0x18, type,
+		    &base, &sz, NULL);
+		if (err)
+			return ERR_PTR(-ENODEV);
+		io_start = base;
+		if (GEM_WARN_ON(lmem_size > sz))
+			return ERR_PTR(-ENODEV);
+	}
+#endif
 
 	mem = intel_memory_region_create(i915,
 					 0,
@@ -254,7 +269,6 @@ static struct intel_memory_region *setup_lmem(struct intel_gt *gt)
 err_region_put:
 	intel_memory_region_put(mem);
 	return ERR_PTR(err);
-#endif
 }
 
 struct intel_memory_region *intel_gt_setup_lmem(struct intel_gt *gt)
