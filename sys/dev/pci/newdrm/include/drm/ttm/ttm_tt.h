@@ -49,6 +49,7 @@ struct ttm_operation_ctx;
  * struct ttm_tt
  *
  * @pages: Array of pages backing the data.
+ * @orders: Array of order values.
  * @page_flags: see TTM_PAGE_FLAG_*
  * @num_pages: Number of pages in the page array.
  * @sg: for SG objects via dma-buf
@@ -63,6 +64,7 @@ struct ttm_operation_ctx;
  */
 struct ttm_tt {
 	struct vm_page **pages;
+	unsigned long *orders;
 	uint32_t page_flags;
 	uint32_t num_pages;
 	struct sg_table *sg;

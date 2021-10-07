@@ -99,10 +99,7 @@ static struct vm_page *ttm_pool_alloc_page(struct ttm_pool *pool, gfp_t gfp_flag
 
 	if (!pool->use_dma_alloc) {
 		p = alloc_pages(gfp_flags, order);
-#ifdef notyet
-		if (p)
-			p->private = order;
-#endif
+
 		return p;
 	}
 
@@ -254,42 +251,42 @@ static void ttm_pool_unmap(struct ttm_pool *pool, dma_addr_t dma_addr,
 /* Give pages into a specific pool_type */
 static void ttm_pool_type_give(struct ttm_pool_type *pt, struct vm_page *p)
 {
-	STUB();
-#ifdef notyet
 	unsigned int i, num_pages = 1 << pt->order;
+	struct ttm_pool_type_lru *entry;
 
 	for (i = 0; i < num_pages; ++i) {
+#ifdef notyet
 		if (PageHighMem(p))
 			clear_highpage(p + i);
 		else
-			clear_page(page_address(p + i));
+#endif
+			pmap_zero_page(p + i);
 	}
 
+	entry = malloc(sizeof(struct ttm_pool_type_lru), M_DRM, M_WAITOK);
+	entry->pg = p;
 	spin_lock(&pt->lock);
-	list_add(&p->lru, &pt->pages);
+	LIST_INSERT_HEAD(&pt->lru, entry, entries);
 	spin_unlock(&pt->lock);
 	atomic_long_add(1 << pt->order, &allocated_pages);
-#endif
 }
 
 /* Take pages from a specific pool_type, return NULL when nothing available */
 static struct vm_page *ttm_pool_type_take(struct ttm_pool_type *pt)
 {
-	STUB();
-	return NULL;
-#ifdef notyet
-	struct vm_page *p;
+	struct vm_page *p = NULL;
+	struct ttm_pool_type_lru *entry;
 
 	spin_lock(&pt->lock);
-	p = list_first_entry_or_null(&pt->pages, typeof(*p), lru);
-	if (p) {
+	if (!LIST_EMPTY(&pt->lru)) {
+		entry = LIST_FIRST(&pt->lru);
+		p = entry->pg;
 		atomic_long_sub(1 << pt->order, &allocated_pages);
-		list_del(&p->lru);
+		LIST_REMOVE(entry, entries);
 	}
 	spin_unlock(&pt->lock);
 
 	return p;
-#endif
 }
 
 /* Initialize and add a pool type to the global shrinker list */
@@ -301,6 +298,7 @@ static void ttm_pool_type_init(struct ttm_pool_type *pt, struct ttm_pool *pool,
 	pt->order = order;
 	mtx_init(&pt->lock, IPL_NONE);
 	INIT_LIST_HEAD(&pt->pages);
+	LIST_INIT(&pt->lru);
 
 	mutex_lock(&shrinker_lock);
 	list_add_tail(&pt->shrinker_list, &shrinker_list);
@@ -311,6 +309,7 @@ static void ttm_pool_type_init(struct ttm_pool_type *pt, struct ttm_pool *pool,
 static void ttm_pool_type_fini(struct ttm_pool_type *pt)
 {
 	struct vm_page *p;
+	struct ttm_pool_type_lru *entry;
 
 	mutex_lock(&shrinker_lock);
 	list_del(&pt->shrinker_list);
@@ -318,6 +317,12 @@ static void ttm_pool_type_fini(struct ttm_pool_type *pt)
 
 	while ((p = ttm_pool_type_take(pt)))
 		ttm_pool_free_page(pt->pool, pt->caching, pt->order, p);
+
+	while (!LIST_EMPTY(&pt->lru)) {
+		entry = LIST_FIRST(&pt->lru);
+		LIST_REMOVE(entry, entries);
+		free(entry, M_DRM, sizeof(struct ttm_pool_type_lru));
+	}
 }
 
 /* Return the pool_type to use for the given caching and order */
@@ -407,6 +412,7 @@ int ttm_pool_alloc(struct ttm_pool *pool, struct ttm_tt *tt,
 	dma_addr_t *dma_addr = tt->dma_address;
 	struct vm_page **caching = tt->pages;
 	struct vm_page **pages = tt->pages;
+	unsigned long *orders = tt->orders;
 	gfp_t gfp_flags = GFP_USER;
 	unsigned int i, order;
 	struct vm_page *p;
@@ -468,8 +474,10 @@ int ttm_pool_alloc(struct ttm_pool *pool, struct ttm_tt *tt,
 		}
 
 		num_pages -= 1 << order;
-		for (i = 1 << order; i; --i)
+		for (i = 1 << order; i; --i) {
 			*(pages++) = p++;
+			*(orders++) = order;
+		}
 	}
 
 	r = ttm_pool_apply_caching(caching, pages, tt->caching);
@@ -484,7 +492,7 @@ error_free_page:
 error_free_all:
 	num_pages = tt->num_pages - num_pages;
 	for (i = 0; i < num_pages; ) {
-		order = ttm_pool_page_order(pool, tt->pages[i]);
+		order = tt->orders[i];
 		ttm_pool_free_page(pool, tt->caching, order, tt->pages[i]);
 		i += 1 << order;
 	}
@@ -510,7 +518,7 @@ void ttm_pool_free(struct ttm_pool *pool, struct ttm_tt *tt)
 		unsigned int order, num_pages;
 		struct ttm_pool_type *pt;
 
-		order = ttm_pool_page_order(pool, p);
+		order = tt->orders[i];
 		num_pages = 1ULL << order;
 		if (tt->dma_address)
 			ttm_pool_unmap(pool, tt->dma_address[i], num_pages);
@@ -612,11 +620,11 @@ static unsigned long ttm_pool_shrinker_count(struct shrinker *shrink,
 static unsigned int ttm_pool_type_count(struct ttm_pool_type *pt)
 {
 	unsigned int count = 0;
-	struct vm_page *p;
+	struct ttm_pool_type_lru *entry;
 
 	spin_lock(&pt->lock);
 	/* Only used for debugfs, the overhead doesn't matter */
-	list_for_each_entry(p, &pt->pages, lru)
+	LIST_FOREACH(entry, &pt->lru, entries)
 		++count;
 	spin_unlock(&pt->lock);
 

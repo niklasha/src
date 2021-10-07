@@ -96,6 +96,11 @@ static int ttm_tt_alloc_page_directory(struct ttm_tt *ttm)
 			GFP_KERNEL | __GFP_ZERO);
 	if (!ttm->pages)
 		return -ENOMEM;
+	ttm->orders = kvmalloc_array(ttm->num_pages,
+				      sizeof(unsigned long),
+				      GFP_KERNEL | __GFP_ZERO);
+	if (!ttm->orders)
+		return -ENOMEM;
 	return 0;
 }
 
@@ -109,6 +114,12 @@ static int ttm_dma_tt_alloc_page_directory(struct ttm_tt *ttm)
 		return -ENOMEM;
 
 	ttm->dma_address = (void *)(ttm->pages + ttm->num_pages);
+
+	ttm->orders = kvmalloc_array(ttm->num_pages,
+				      sizeof(unsigned long),
+				      GFP_KERNEL | __GFP_ZERO);
+	if (!ttm->orders)
+		return -ENOMEM;
 	return 0;
 }
 
@@ -167,11 +178,13 @@ EXPORT_SYMBOL(ttm_tt_init);
 
 void ttm_tt_fini(struct ttm_tt *ttm)
 {
-	if (ttm->pages)
+	if (ttm->pages) {
 		kvfree(ttm->pages);
-	else
+		kvfree(ttm->orders);
+	} else
 		kvfree(ttm->dma_address);
 	ttm->pages = NULL;
+	ttm->orders = NULL;
 	ttm->dma_address = NULL;
 
 	bus_dmamap_destroy(ttm->dmat, ttm->map);
@@ -209,11 +222,13 @@ int ttm_sg_tt_init(struct ttm_tt *ttm, struct ttm_buffer_object *bo,
 	    &ttm->map)) {
 		km_free(ttm->segs, round_page(ttm->num_pages *
 		    sizeof(bus_dma_segment_t)), &kv_any, &kp_zero);
-		if (ttm->pages)
+		if (ttm->pages) {
 			kvfree(ttm->pages);
-		else
+			kvfree(ttm->orders);
+		} else
 			kvfree(ttm->dma_address);
 		ttm->pages = NULL;
+		ttm->orders = NULL;
 		ttm->dma_address = NULL;
 		pr_err("Failed allocating page table\n");
 		return -ENOMEM;
