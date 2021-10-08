@@ -998,10 +998,14 @@ __xa_store(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
 	void *prev;
 	int flags = (gfp & GFP_NOWAIT) ? PR_NOWAIT : PR_WAITOK;
 
+	if (entry == NULL)
+		return __xa_erase(xa, index);
+
 	find.id = index;
 	res = SPLAY_FIND(xarray_tree, &xa->xa_tree, &find);
 	if (res != NULL) {
 		/* index exists */
+		/* XXX Multislot entries updates not implemented yet */
 		prev = res->ptr;
 		res->ptr = entry;
 		return prev;
