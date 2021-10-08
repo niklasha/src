@@ -3873,15 +3873,28 @@ static void amdgpu_device_unmap_mmio(struct amdgpu_device *adev)
 #ifdef notyet
 	/* Clear all CPU mappings pointing to this device */
 	unmap_mapping_range(adev->ddev.anon_inode->i_mapping, 0, 0, 1);
+#endif
 
 	/* Unmap all mapped bars - Doorbell, registers and VRAM */
 	amdgpu_device_doorbell_fini(adev);
 
+#ifdef __linux__
 	iounmap(adev->rmmio);
 	adev->rmmio = NULL;
 	if (adev->mman.aper_base_kaddr)
 		iounmap(adev->mman.aper_base_kaddr);
 	adev->mman.aper_base_kaddr = NULL;
+#else
+	if (adev->rmmio_size > 0)
+		bus_space_unmap(adev->rmmio_bst, adev->rmmio_bsh,
+		    adev->rmmio_size);
+	adev->rmmio_size = 0;
+	adev->rmmio = NULL;
+	if (adev->mman.aper_base_kaddr)
+		bus_space_unmap(adev->memt, adev->mman.aper_bsh,
+		    adev->gmc.visible_vram_size);
+	adev->mman.aper_base_kaddr = NULL;
+#endif
 
 	/* Memory manager related */
 	if (!adev->gmc.xgmi.connected_to_cpu) {
@@ -3892,7 +3905,6 @@ static void amdgpu_device_unmap_mmio(struct amdgpu_device *adev)
 		drm_mtrr_del(0, adev->gmc.aper_base, adev->gmc.aper_size, DRM_MTRR_WC);
 #endif
 	}
-#endif
 }
 
 /**
