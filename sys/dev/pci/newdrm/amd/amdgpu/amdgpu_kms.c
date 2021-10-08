@@ -1910,7 +1910,7 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 		    adev->self.dv_xname);
 		return;
 	}
-	adev->pdev->irq = -1;
+	adev->pdev->irq = 0;
 
 	fb_aper = bus_space_mmap(adev->memt, adev->fb_aper_offset, 0, 0, 0);
 	if (fb_aper != -1)
