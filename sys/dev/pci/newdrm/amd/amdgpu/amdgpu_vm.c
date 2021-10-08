@@ -3281,8 +3281,6 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
  */
 void amdgpu_vm_manager_init(struct amdgpu_device *adev)
 {
-	STUB();
-#ifdef notyet
 	unsigned i;
 
 	/* Concurrent flushes are only possible starting with Vega10 and
@@ -3318,7 +3316,6 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
 #endif
 
 	xa_init_flags(&adev->vm_manager.pasids, XA_FLAGS_LOCK_IRQ);
-#endif
 }
 
 /**
