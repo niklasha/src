@@ -1864,6 +1864,7 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 		}
 
 		amdgpu_register_atpx_handler();
+		amdgpu_acpi_detect();
 	}
 	amdgpu_refcnt++;
 
