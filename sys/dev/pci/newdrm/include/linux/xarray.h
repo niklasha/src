@@ -11,6 +11,12 @@
 #define XA_FLAGS_ALLOC1		2
 #define XA_FLAGS_LOCK_IRQ	4
 
+/*
+ * lower bits of pointer are tagged:
+ * 00: pointer
+ * 01: value
+ * 10: internal
+ */
 struct xarray_entry {
 	SPLAY_ENTRY(xarray_entry) entry;
 	int id;
@@ -53,6 +59,19 @@ xa_to_value(const void *e)
 {
 	unsigned long v = (unsigned long)e;
 	return v >> 1;
+}
+
+static inline int
+xa_err(const void *e)
+{
+	long v = (long)e;
+	/* not tagged internal, not an errno */
+	if ((v & 3) != 2)
+		return 0;
+	v >>= 2;
+	if (v >= -ELAST)
+		return v;
+	return 0;
 }
 
 #endif
