@@ -9,6 +9,7 @@
 
 #define XA_FLAGS_ALLOC		1
 #define XA_FLAGS_ALLOC1		2
+#define XA_FLAGS_LOCK_IRQ	4
 
 struct xarray_entry {
 	SPLAY_ENTRY(xarray_entry) entry;
