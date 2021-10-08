@@ -1731,6 +1731,7 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 	paddr_t			 fb_aper;
 	pcireg_t		 addr, mask;
 	int			 s;
+	bool			 supports_atomic = false;
 
 	id_entry = drm_find_description(PCI_VENDOR(pa->pa_id),
 	    PCI_PRODUCT(pa->pa_id), amdgpu_pciidlist);
@@ -1867,9 +1868,6 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 	amdgpu_refcnt++;
 
 	/* from amdgpu_pci_probe() */
-{
-	int ret;
-	bool supports_atomic = false;
 
 	if (!amdgpu_virtual_display &&
 	     amdgpu_device_asic_has_dc_support(adev->family))
@@ -1877,6 +1875,7 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 
 	if ((adev->flags & AMD_EXP_HW_SUPPORT) && !amdgpu_exp_hw_support) {
 		DRM_INFO("This hardware requires experimental hardware support.\n");
+		return;
 	}
 
 	/*
@@ -1884,17 +1883,12 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 	 */
 	amdgpu_amdkfd_init();
 
-	/* warn the user if they mix atomic and non-atomic capable GPUs */
-	if ((amdgpu_kms_driver.driver_features & DRIVER_ATOMIC) && !supports_atomic)
-		DRM_ERROR("Mixing atomic and non-atomic capable GPUs!\n");
-	/* support atomic early so the atomic debugfs stuff gets created */
-	if (supports_atomic)
-		amdgpu_kms_driver.driver_features |= DRIVER_ATOMIC;
-}
-
 	dev = drm_attach_pci(&amdgpu_kms_driver, pa, 0, adev->primary,
 	    self, &adev->ddev);
 	adev->pdev = dev->pdev;
+
+	if (!supports_atomic)
+		dev->driver_features &= ~DRIVER_ATOMIC;
 
 	if (!amdgpu_msi_ok(adev))
 		pa->pa_flags &= ~PCI_FLAGS_MSI_ENABLED;
