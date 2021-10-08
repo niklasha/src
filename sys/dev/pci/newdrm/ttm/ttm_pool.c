@@ -283,6 +283,7 @@ static struct vm_page *ttm_pool_type_take(struct ttm_pool_type *pt)
 		p = entry->pg;
 		atomic_long_sub(1 << pt->order, &allocated_pages);
 		LIST_REMOVE(entry, entries);
+		free(entry, M_DRM, sizeof(struct ttm_pool_type_lru));
 	}
 	spin_unlock(&pt->lock);
 
