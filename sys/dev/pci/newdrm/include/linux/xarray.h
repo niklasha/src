@@ -114,4 +114,10 @@ xa_erase_irq(struct xarray *xa, unsigned long index)
 	return r;
 }
 
+static inline bool
+xa_empty(const struct xarray *xa)
+{
+	return SPLAY_EMPTY(&xa->xa_tree);
+}
+
 #endif
