@@ -25,6 +25,7 @@ struct xarray_entry {
 
 struct xarray {
 	gfp_t		xa_flags;
+	struct mutex	xa_lock;
 	SPLAY_HEAD(xarray_tree, xarray_entry) xa_tree;
 };
 
@@ -32,6 +33,7 @@ void xa_init_flags(struct xarray *, gfp_t);
 void xa_destroy(struct xarray *);
 int xa_alloc(struct xarray *, u32 *, void *, int, gfp_t);
 void *xa_load(struct xarray *, unsigned long);
+void *xa_store(struct xarray *, unsigned long, void *, gfp_t);
 void *xa_erase(struct xarray *, unsigned long);
 void *xa_get_next(struct xarray *, unsigned long *);
 
@@ -61,6 +63,8 @@ xa_to_value(const void *e)
 	return v >> 1;
 }
 
+#define XA_ERROR(x)	((struct xa_node *)(((unsigned long)x << 2) | 2))
+
 static inline int
 xa_err(const void *e)
 {
@@ -72,6 +76,32 @@ xa_err(const void *e)
 	if (v >= -ELAST)
 		return v;
 	return 0;
+}
+
+static inline bool
+xa_is_err(const void *e)
+{
+	return xa_err(e) != 0;
+}
+
+static inline void *
+xa_store_irq(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
+{
+	void *r;
+	mtx_enter(&xa->xa_lock);
+	r = xa_store(xa, index, entry, gfp);
+	mtx_leave(&xa->xa_lock);
+	return r;
+}
+
+static inline void *
+xa_erase_irq(struct xarray *xa, unsigned long index)
+{
+	void *r;
+	mtx_enter(&xa->xa_lock);
+	r = xa_erase(xa, index);
+	mtx_leave(&xa->xa_lock);
+	return r;
 }
 
 #endif

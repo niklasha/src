@@ -893,6 +893,10 @@ xa_init_flags(struct xarray *xa, gfp_t flags)
 		initialized = 1;
 	}
 	SPLAY_INIT(&xa->xa_tree);
+	if (flags & XA_FLAGS_LOCK_IRQ)
+		mtx_init(&xa->xa_lock, IPL_TTY);
+	else
+		mtx_init(&xa->xa_lock, IPL_NONE);
 }
 
 void
@@ -964,6 +968,33 @@ xa_load(struct xarray *xa, unsigned long index)
 	if (res == NULL)
 		return NULL;
 	return res->ptr;
+}
+
+void *
+xa_store(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
+{
+	struct xarray_entry find, *res;
+	void *prev;
+	int flags = (gfp & GFP_NOWAIT) ? PR_NOWAIT : PR_WAITOK;
+
+	find.id = index;
+	res = SPLAY_FIND(xarray_tree, &xa->xa_tree, &find);
+	if (res != NULL) {
+		/* index exists */
+		prev = res->ptr;
+		res->ptr = entry;
+		return prev;
+	}
+
+	/* index not found, add new */
+	res = pool_get(&xa_pool, flags);
+	if (res == NULL)
+		return XA_ERROR(-ENOMEM);
+	res->id = index;
+	res->ptr = entry;
+	if (SPLAY_INSERT(xarray_tree, &xa->xa_tree, res) != NULL)
+		return XA_ERROR(-EINVAL);
+	return NULL; /* no prev entry at index */
 }
 
 void *
