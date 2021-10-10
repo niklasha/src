@@ -31,10 +31,10 @@ struct xarray {
 
 void xa_init_flags(struct xarray *, gfp_t);
 void xa_destroy(struct xarray *);
-int xa_alloc(struct xarray *, u32 *, void *, int, gfp_t);
-void *xa_load(struct xarray *, unsigned long);
-void *xa_store(struct xarray *, unsigned long, void *, gfp_t);
-void *xa_erase(struct xarray *, unsigned long);
+int __xa_alloc(struct xarray *, u32 *, void *, int, gfp_t);
+void *__xa_load(struct xarray *, unsigned long);
+void *__xa_store(struct xarray *, unsigned long, void *, gfp_t);
+void *__xa_erase(struct xarray *, unsigned long);
 void *xa_get_next(struct xarray *, unsigned long *);
 
 #define xa_for_each(xa, index, entry) \
@@ -94,16 +94,45 @@ xa_is_err(const void *e)
 	return xa_err(e) != 0;
 }
 
-static inline void *
-__xa_store(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
+static inline int
+xa_alloc(struct xarray *xa, u32 *id, void *entry, int limit, gfp_t gfp)
 {
-	return xa_store(xa, index, entry, gfp);
+	int r;
+	mtx_enter(&xa->xa_lock);
+	r = __xa_alloc(xa, id, entry, limit, gfp);
+	mtx_leave(&xa->xa_lock);
+	return r;
 }
 
 static inline void *
-__xa_erase(struct xarray *xa, unsigned long index)
+xa_load(struct xarray *xa, unsigned long index)
 {
-	return xa_erase(xa, index);
+	void *r;
+	mtx_enter(&xa->xa_lock);
+	r = __xa_load(xa, index);
+	mtx_leave(&xa->xa_lock);
+	return r;
+}
+
+
+static inline void *
+xa_store(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
+{
+	void *r;
+	mtx_enter(&xa->xa_lock);
+	r = __xa_store(xa, index, entry, gfp);
+	mtx_leave(&xa->xa_lock);
+	return r;
+}
+
+static inline void *
+xa_erase(struct xarray *xa, unsigned long index)
+{
+	void *r;
+	mtx_enter(&xa->xa_lock);
+	r = __xa_erase(xa, index);
+	mtx_leave(&xa->xa_lock);
+	return r;
 }
 
 static inline void *
@@ -111,7 +140,7 @@ xa_store_irq(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
 {
 	void *r;
 	mtx_enter(&xa->xa_lock);
-	r = xa_store(xa, index, entry, gfp);
+	r = __xa_store(xa, index, entry, gfp);
 	mtx_leave(&xa->xa_lock);
 	return r;
 }
@@ -121,7 +150,7 @@ xa_erase_irq(struct xarray *xa, unsigned long index)
 {
 	void *r;
 	mtx_enter(&xa->xa_lock);
-	r = xa_erase(xa, index);
+	r = __xa_erase(xa, index);
 	mtx_leave(&xa->xa_lock);
 	return r;
 }

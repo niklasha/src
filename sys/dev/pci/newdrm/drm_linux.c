@@ -911,7 +911,7 @@ xa_destroy(struct xarray *xa)
 }
 
 int
-xa_alloc(struct xarray *xa, u32 *id, void *entry, int limit, gfp_t gfp)
+__xa_alloc(struct xarray *xa, u32 *id, void *entry, int limit, gfp_t gfp)
 {
 	struct xarray_entry *xid;
 	int flags = (gfp & GFP_NOWAIT) ? PR_NOWAIT : PR_WAITOK;
@@ -943,7 +943,7 @@ xa_alloc(struct xarray *xa, u32 *id, void *entry, int limit, gfp_t gfp)
 }
 
 void *
-xa_erase(struct xarray *xa, unsigned long index)
+__xa_erase(struct xarray *xa, unsigned long index)
 {
 	struct xarray_entry find, *res;
 	void *ptr = NULL;
@@ -959,7 +959,7 @@ xa_erase(struct xarray *xa, unsigned long index)
 }
 
 void *
-xa_load(struct xarray *xa, unsigned long index)
+__xa_load(struct xarray *xa, unsigned long index)
 {
 	struct xarray_entry find, *res;
 
@@ -971,7 +971,7 @@ xa_load(struct xarray *xa, unsigned long index)
 }
 
 void *
-xa_store(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
+__xa_store(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
 {
 	struct xarray_entry find, *res;
 	void *prev;
