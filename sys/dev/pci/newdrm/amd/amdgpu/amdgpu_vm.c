@@ -40,9 +40,7 @@
 #include "amdgpu_xgmi.h"
 #include "amdgpu_dma_buf.h"
 #include "amdgpu_res_cursor.h"
-#ifdef notyet
-#include "kfd_svm.h"
-#endif
+#include "../amdkfd/kfd_svm.h"
 
 /**
  * DOC: GPUVM
@@ -3323,13 +3321,10 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
  */
 void amdgpu_vm_manager_fini(struct amdgpu_device *adev)
 {
-	STUB();
-#ifdef notyet
 	WARN_ON(!xa_empty(&adev->vm_manager.pasids));
 	xa_destroy(&adev->vm_manager.pasids);
 
 	amdgpu_vmid_mgr_fini(adev);
-#endif
 }
 
 /**
@@ -3393,8 +3388,6 @@ int amdgpu_vm_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 void amdgpu_vm_get_task_info(struct amdgpu_device *adev, u32 pasid,
 			 struct amdgpu_task_info *task_info)
 {
-	STUB();
-#ifdef notyet
 	struct amdgpu_vm *vm;
 	unsigned long flags;
 
@@ -3405,7 +3398,6 @@ void amdgpu_vm_get_task_info(struct amdgpu_device *adev, u32 pasid,
 		*task_info = vm->task_info;
 
 	xa_unlock_irqrestore(&adev->vm_manager.pasids, flags);
-#endif
 }
 
 /**
@@ -3447,9 +3439,6 @@ void amdgpu_vm_set_task_info(struct amdgpu_vm *vm)
 bool amdgpu_vm_handle_fault(struct amdgpu_device *adev, u32 pasid,
 			    uint64_t addr, bool write_fault)
 {
-	STUB();
-	return true;
-#ifdef notyet
 	bool is_compute_context = false;
 	struct amdgpu_bo *root;
 	unsigned long irqflags;
@@ -3535,7 +3524,6 @@ error_unref:
 	amdgpu_bo_unref(&root);
 
 	return false;
-#endif
 }
 
 #if defined(CONFIG_DEBUG_FS)
