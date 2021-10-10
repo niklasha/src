@@ -209,26 +209,6 @@ int ttm_sg_tt_init(struct ttm_tt *ttm, struct ttm_buffer_object *bo,
 	    &ttm->map)) {
 		km_free(ttm->segs, round_page(ttm->num_pages *
 		    sizeof(bus_dma_segment_t)), &kv_any, &kp_zero);
-		kvfree(ttm->pages);
-		ttm->pages = NULL;
-		ttm->dma_address = NULL;
-		pr_err("Failed allocating page table\n");
-		return -ENOMEM;
-	}
-
-
-	ttm->segs = km_alloc(round_page(ttm->num_pages *
-	    sizeof(bus_dma_segment_t)), &kv_any, &kp_zero, &kd_waitok);
-
-	ttm->dmat = bo->bdev->dmat;
-
-	if (bo->bdev->pool.use_dma32 == false)
-		flags |= BUS_DMA_64BIT;
-	if (bus_dmamap_create(ttm->dmat, ttm->num_pages << PAGE_SHIFT,
-	    ttm->num_pages, ttm->num_pages << PAGE_SHIFT, 0, flags,
-	    &ttm->map)) {
-		km_free(ttm->segs, round_page(ttm->num_pages *
-		    sizeof(bus_dma_segment_t)), &kv_any, &kp_zero);
 		if (ttm->pages)
 			kvfree(ttm->pages);
 		else
