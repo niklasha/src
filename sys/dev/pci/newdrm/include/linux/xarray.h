@@ -42,6 +42,16 @@ void *xa_get_next(struct xarray *, unsigned long *);
 
 #define xa_limit_32b	0
 
+#define xa_lock_irqsave(_xa, _flags) do {		\
+		_flags = 0;				\
+		mtx_enter(&(_xa)->xa_lock);		\
+	} while (0)
+
+#define xa_unlock_irqrestore(_xa, _flags) do {		\
+		(void)(_flags);				\
+		mtx_leave(&(_xa)->xa_lock);		\
+	} while (0)
+
 static inline void *
 xa_mk_value(unsigned long v)
 {
