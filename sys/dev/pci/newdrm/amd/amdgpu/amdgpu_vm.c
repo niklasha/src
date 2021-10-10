@@ -165,9 +165,6 @@ struct amdgpu_prt_cb {
 int amdgpu_vm_set_pasid(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 			u32 pasid)
 {
-	STUB();
-	return -ENOSYS;
-#ifdef notyet
 	int r;
 
 	if (vm->pasid == pasid)
@@ -192,7 +189,6 @@ int amdgpu_vm_set_pasid(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 
 
 	return 0;
-#endif
 }
 
 /*
