@@ -95,6 +95,18 @@ xa_is_err(const void *e)
 }
 
 static inline void *
+__xa_store(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
+{
+	return xa_store(xa, index, entry, gfp);
+}
+
+static inline void *
+__xa_erase(struct xarray *xa, unsigned long index)
+{
+	return xa_erase(xa, index);
+}
+
+static inline void *
 xa_store_irq(struct xarray *xa, unsigned long index, void *entry, gfp_t gfp)
 {
 	void *r;
