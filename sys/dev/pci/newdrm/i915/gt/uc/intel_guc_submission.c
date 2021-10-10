@@ -317,8 +317,6 @@ static inline bool guc_submission_initialized(struct intel_guc *guc)
 
 static inline void reset_lrc_desc(struct intel_guc *guc, u32 id)
 {
-	STUB();
-#ifdef notyet
 	if (likely(guc_submission_initialized(guc))) {
 		struct guc_lrc_desc *desc = __get_lrc_desc(guc, id);
 		unsigned long flags;
@@ -333,7 +331,6 @@ static inline void reset_lrc_desc(struct intel_guc *guc, u32 id)
 		__xa_erase(&guc->context_lookup, id);
 		xa_unlock_irqrestore(&guc->context_lookup, flags);
 	}
-#endif
 }
 
 static inline bool lrc_desc_registered(struct intel_guc *guc, u32 id)
@@ -344,8 +341,6 @@ static inline bool lrc_desc_registered(struct intel_guc *guc, u32 id)
 static inline void set_lrc_desc_registered(struct intel_guc *guc, u32 id,
 					   struct intel_context *ce)
 {
-	STUB();
-#ifdef notyet
 	unsigned long flags;
 
 	/*
@@ -355,7 +350,6 @@ static inline void set_lrc_desc_registered(struct intel_guc *guc, u32 id,
 	xa_lock_irqsave(&guc->context_lookup, flags);
 	__xa_store(&guc->context_lookup, id, ce, GFP_ATOMIC);
 	xa_unlock_irqrestore(&guc->context_lookup, flags);
-#endif
 }
 
 static int guc_submission_send_busy_loop(struct intel_guc *guc,
