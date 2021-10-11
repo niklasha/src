@@ -20,7 +20,11 @@
 typedef irqreturn_t (*irq_handler_t)(int, void *);
 
 struct tasklet_struct {
-	void (*func)(unsigned long);
+	union {
+		void (*func)(unsigned long);
+		void (*callback)(struct tasklet_struct *);
+	};
+	bool use_callback;
 	unsigned long data;
 	unsigned long state;
 	atomic_t count;
@@ -41,6 +45,19 @@ tasklet_init(struct tasklet_struct *ts, void (*func)(unsigned long),
 	ts->data = data;
 	ts->state = 0;
 	atomic_set(&ts->count, 0);
+	ts->use_callback = false;
+	task_set(&ts->task, tasklet_run, ts);
+}
+
+static inline void
+tasklet_setup(struct tasklet_struct *ts,
+    void (*callback)(struct tasklet_struct *))
+{
+	ts->callback = callback;
+	ts->data = 0;
+	ts->state = 0;
+	atomic_set(&ts->count, 0);
+	ts->use_callback = true;
 	task_set(&ts->task, tasklet_run, ts);
 }
 

@@ -64,8 +64,12 @@ tasklet_run(void *arg)
 
 	clear_bit(TASKLET_STATE_SCHED, &ts->state);
 	if (tasklet_trylock(ts)) {
-		if (!atomic_read(&ts->count))
-			ts->func(ts->data);
+		if (!atomic_read(&ts->count)) {
+			if (ts->use_callback)
+				ts->callback(ts);
+			else
+				ts->func(ts->data);
+		}
 		tasklet_unlock(ts);
 	}
 }
