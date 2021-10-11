@@ -2492,13 +2492,15 @@ static void __execlists_kick(struct intel_engine_execlists *execlists)
 #define execlists_kick(t, member) \
 	__execlists_kick(container_of(t, struct intel_engine_execlists, member))
 
-static void execlists_timeslice(struct timeout *timer)
+static void execlists_timeslice(void *arg)
 {
+	struct timeout *timer = (struct timeout *)arg;
 	execlists_kick(timer, timer);
 }
 
-static void execlists_preempt(struct timeout *timer)
+static void execlists_preempt(void *arg)
 {
+	struct timeout *timer = (struct timeout *)arg;
 	execlists_kick(timer, preempt);
 }
 
@@ -3409,17 +3411,21 @@ static void rcs_submission_override(struct intel_engine_cs *engine)
 
 int intel_execlists_submission_setup(struct intel_engine_cs *engine)
 {
-	STUB();
-	return -ENOSYS;
-#ifdef notyet
 	struct intel_engine_execlists * const execlists = &engine->execlists;
 	struct drm_i915_private *i915 = engine->i915;
 	struct intel_uncore *uncore = engine->uncore;
 	u32 base = engine->mmio_base;
 
 	tasklet_setup(&engine->sched_engine->tasklet, execlists_submission_tasklet);
+#ifdef __linux__
 	timer_setup(&engine->execlists.timer, execlists_timeslice, 0);
 	timer_setup(&engine->execlists.preempt, execlists_preempt, 0);
+#else
+	timeout_set(&engine->execlists.timer, execlists_timeslice,
+	    &engine->execlists.timer);
+	timeout_set(&engine->execlists.preempt, execlists_preempt,
+	    &engine->execlists.preempt);
+#endif
 
 	logical_ring_default_vfuncs(engine);
 	logical_ring_default_irqs(engine);
@@ -3466,7 +3472,6 @@ int intel_execlists_submission_setup(struct intel_engine_cs *engine)
 	engine->release = execlists_release;
 
 	return 0;
-#endif
 }
 
 static struct list_head *virtual_queue(struct virtual_engine *ve)
@@ -3810,9 +3815,6 @@ unlock:
 static struct intel_context *
 execlists_create_virtual(struct intel_engine_cs **siblings, unsigned int count)
 {
-	STUB();
-	return ERR_PTR(-ENOSYS);
-#ifdef notyet
 	struct virtual_engine *ve;
 	unsigned int n;
 	int err;
@@ -3948,7 +3950,6 @@ execlists_create_virtual(struct intel_engine_cs **siblings, unsigned int count)
 err_put:
 	intel_context_put(&ve->context);
 	return ERR_PTR(err);
-#endif
 }
 
 void intel_execlists_show_requests(struct intel_engine_cs *engine,
