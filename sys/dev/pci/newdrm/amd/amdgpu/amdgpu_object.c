@@ -69,11 +69,7 @@ static void amdgpu_bo_destroy(struct ttm_buffer_object *tbo)
 		drm_prime_gem_destroy(&bo->tbo.base, bo->tbo.sg);
 	drm_gem_object_release(&bo->tbo.base);
 	amdgpu_bo_unref(&bo->parent);
-#ifdef __linux__
 	kvfree(bo);
-#else
-	pool_put(&adev->ddev.objpl, bo);
-#endif
 }
 
 static void amdgpu_bo_user_destroy(struct ttm_buffer_object *tbo)
@@ -568,11 +564,7 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 	BUG_ON(bp->bo_ptr_size < sizeof(struct amdgpu_bo));
 
 	*bo_ptr = NULL;
-#ifdef __linux__
 	bo = kvzalloc(bp->bo_ptr_size, GFP_KERNEL);
-#else
-	bo = pool_get(&adev->ddev.objpl, PR_WAITOK | PR_ZERO);
-#endif
 	if (bo == NULL)
 		return -ENOMEM;
 	drm_gem_private_object_init(adev_to_drm(adev), &bo->tbo.base, size);

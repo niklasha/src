@@ -1820,9 +1820,6 @@ const struct drm_driver amdgpu_kms_driver = {
 	.lastclose = amdgpu_driver_lastclose_kms,
 	.ioctls = amdgpu_ioctls_kms,
 	.num_ioctls = ARRAY_SIZE(amdgpu_ioctls_kms),
-#ifdef __OpenBSD__
-	.gem_size = sizeof(struct amdgpu_bo),
-#endif
 	.dumb_create = amdgpu_mode_dumb_create,
 	.dumb_map_offset = amdgpu_mode_dumb_mmap,
 #ifdef __linux__
