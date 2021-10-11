@@ -40,14 +40,16 @@ static void user_forcewake(struct intel_gt *gt, bool suspend)
 static void runtime_begin(struct intel_gt *gt)
 {
 	STUB();
-#ifdef notyet
 	local_irq_disable();
+#ifdef notyet
 	write_seqcount_begin(&gt->stats.lock);
+#endif
 	gt->stats.start = ktime_get();
 	gt->stats.active = true;
+#ifdef notyet
 	write_seqcount_end(&gt->stats.lock);
-	local_irq_enable();
 #endif
+	local_irq_enable();
 }
 
 static void runtime_end(struct intel_gt *gt)
