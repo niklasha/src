@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.40 2021/05/02 14:39:05 martijn Exp $ */
+/*	$OpenBSD: parse.y,v 1.42 2021/10/07 11:35:30 claudio Exp $ */
 
 /*
  * Copyright (c) 2009, 2010 Martin Hedenfalk <martinh@openbsd.org>
@@ -207,7 +207,7 @@ conf_main	: LISTEN ON STRING port ssl certname	{
 			if (! interface($3, cert, &conf->listeners,
 			    $4, $5)) {
 				if (host($3, cert, &conf->listeners,
-				    $4, $5) <= 0) {
+				    $4, $5) != 1) {
 					yyerror("invalid virtual ip or interface: %s", $3);
 					free($6);
 					free($3);
@@ -1206,15 +1206,16 @@ namespace_new(const char *suffix)
 
 	if ((ns = calloc(1, sizeof(*ns))) == NULL)
 		return NULL;
-	ns->suffix = strdup(suffix);
 	ns->sync = 1;
 	ns->cache_size = 1024;
 	ns->index_cache_size = 512;
+	ns->suffix = strdup(suffix);
 	if (ns->suffix == NULL) {
 		free(ns->suffix);
 		free(ns);
 		return NULL;
 	}
+	normalize_dn(ns->suffix);
 	TAILQ_INIT(&ns->indices);
 	TAILQ_INIT(&ns->request_queue);
 	SIMPLEQ_INIT(&ns->acl);

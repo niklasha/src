@@ -1,4 +1,4 @@
-/* $OpenBSD: job.c,v 1.62 2021/08/13 19:55:11 nicm Exp $ */
+/* $OpenBSD: job.c,v 1.64 2021/10/05 12:49:37 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>

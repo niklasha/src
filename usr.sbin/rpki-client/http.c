@@ -1,4 +1,4 @@
-/*	$OpenBSD: http.c,v 1.40 2021/09/23 13:26:51 tb Exp $  */
+/*	$OpenBSD: http.c,v 1.42 2021/10/05 07:22:21 claudio Exp $  */
 /*
  * Copyright (c) 2020 Nils Fisher <nils_fisher@hotmail.com>
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -1311,6 +1311,9 @@ http_read(struct http_connection *conn)
 	char *buf;
 	int done;
 
+	if (conn->bufpos > 0)
+		goto again;
+
 read_more:
 	s = tls_read(conn->tls, conn->buf + conn->bufpos,
 	    conn->bufsz - conn->bufpos);
@@ -1390,7 +1393,7 @@ again:
 
 			if (rv == -1)
 				return http_failed(conn);
-			if (rv ==  0)
+			if (rv == 0)
 				done = 1;
 		}
 
@@ -1422,10 +1425,10 @@ again:
 			 * After redirects all data needs to be discarded.
 			 */
 			if (conn->iosz < (off_t)conn->bufpos) {
-				conn->bufpos  -= conn->iosz;
+				conn->bufpos -= conn->iosz;
 				conn->iosz = 0;
 			} else {
-				conn->iosz  -= conn->bufpos;
+				conn->iosz -= conn->bufpos;
 				conn->bufpos = 0;
 			}
 			if (conn->chunked)
