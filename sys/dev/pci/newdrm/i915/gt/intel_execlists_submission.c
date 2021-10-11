@@ -3287,10 +3287,7 @@ static void execlists_set_default_submission(struct intel_engine_cs *engine)
 	engine->submit_request = execlists_submit_request;
 	engine->sched_engine->schedule = i915_schedule;
 	engine->sched_engine->kick_backend = kick_execlists;
-	STUB();
-#ifdef notyet
 	engine->sched_engine->tasklet.callback = execlists_submission_tasklet;
-#endif
 }
 
 static void execlists_shutdown(struct intel_engine_cs *engine)
