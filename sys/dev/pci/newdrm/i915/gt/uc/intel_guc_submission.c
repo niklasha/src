@@ -2506,9 +2506,6 @@ static void guc_sched_engine_destroy(struct kref *kref)
 
 int intel_guc_submission_setup(struct intel_engine_cs *engine)
 {
-	STUB();
-	return -ENOSYS;
-#ifdef notyet
 	struct drm_i915_private *i915 = engine->i915;
 	struct intel_guc *guc = &engine->gt->uc.guc;
 
@@ -2551,7 +2548,6 @@ int intel_guc_submission_setup(struct intel_engine_cs *engine)
 	engine->release = guc_release;
 
 	return 0;
-#endif
 }
 
 void intel_guc_submission_enable(struct intel_guc *guc)
