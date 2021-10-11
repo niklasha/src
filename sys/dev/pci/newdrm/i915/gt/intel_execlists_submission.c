@@ -3056,8 +3056,6 @@ static void nop_submission_tasklet(struct tasklet_struct *t)
 
 static void execlists_reset_cancel(struct intel_engine_cs *engine)
 {
-	STUB();
-#ifdef notyet
 	struct intel_engine_execlists * const execlists = &engine->execlists;
 	struct i915_sched_engine * const sched_engine = engine->sched_engine;
 	struct i915_request *rq, *rn;
@@ -3142,7 +3140,6 @@ static void execlists_reset_cancel(struct intel_engine_cs *engine)
 
 	spin_unlock_irqrestore(&engine->sched_engine->lock, flags);
 	rcu_read_unlock();
-#endif
 }
 
 static void execlists_reset_finish(struct intel_engine_cs *engine)
