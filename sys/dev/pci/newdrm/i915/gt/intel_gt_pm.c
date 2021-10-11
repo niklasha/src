@@ -55,16 +55,18 @@ static void runtime_begin(struct intel_gt *gt)
 static void runtime_end(struct intel_gt *gt)
 {
 	STUB();
-#ifdef notyet
 	local_irq_disable();
+#ifdef notyet
 	write_seqcount_begin(&gt->stats.lock);
+#endif
 	gt->stats.active = false;
 	gt->stats.total =
 		ktime_add(gt->stats.total,
 			  ktime_sub(ktime_get(), gt->stats.start));
+#ifdef notyet
 	write_seqcount_end(&gt->stats.lock);
-	local_irq_enable();
 #endif
+	local_irq_enable();
 }
 
 static int __gt_unpark(struct intel_wakeref *wf)
