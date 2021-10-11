@@ -968,7 +968,7 @@ int i915_driver_probe(struct drm_i915_private *i915, const struct pci_device_id 
 #endif
 
 	/* Disable nuclear pageflip by default on pre-ILK */
-	if (!i915_modparams.nuclear_pageflip && match_info->graphics_ver < 5)
+	if (!i915->params.nuclear_pageflip && match_info->graphics_ver < 5)
 		i915->drm.driver_features &= ~DRIVER_ATOMIC;
 
 	/*
@@ -978,12 +978,10 @@ int i915_driver_probe(struct drm_i915_private *i915, const struct pci_device_id 
 #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
 	if (IS_ENABLED(CONFIG_DRM_I915_UNSTABLE_FAKE_LMEM)) {
 		if (GRAPHICS_VER(i915) >= 9 && i915_selftest.live < 0 &&
-		    i915_modparams.fake_lmem_start) {
+		    i915->params.fake_lmem_start) {
 			mkwrite_device_info(i915)->memory_regions =
-				REGION_SMEM | REGION_LMEM | REGION_STOLEN;
-			mkwrite_device_info(i915)->is_dgfx = true;
+				REGION_SMEM | REGION_LMEM | REGION_STOLEN_SMEM;
 			GEM_BUG_ON(!HAS_LMEM(i915));
-			GEM_BUG_ON(!IS_DGFX(i915));
 		}
 	}
 #endif
@@ -1060,6 +1058,8 @@ out_cleanup_hw:
 	i915_driver_hw_remove(i915);
 	intel_memory_regions_driver_release(i915);
 	i915_ggtt_driver_release(i915);
+	i915_gem_drain_freed_objects(i915);
+	i915_ggtt_driver_late_release(i915);
 out_cleanup_mmio:
 	i915_driver_mmio_release(i915);
 out_runtime_pm_put:
