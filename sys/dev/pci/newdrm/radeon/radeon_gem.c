@@ -80,7 +80,64 @@ static const struct vm_operations_struct radeon_gem_vm_ops = {
 	.close = ttm_bo_vm_close,
 	.access = ttm_bo_vm_access
 };
-#endif /* __linux__ */
+#else /* !__linux__ */
+int
+radeon_gem_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
+    int npages, int centeridx, vm_fault_t fault_type,
+    vm_prot_t access_type, int flags)
+{
+	struct uvm_object *uobj = ufi->entry->object.uvm_obj;
+	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
+	struct radeon_device *rdev = radeon_get_rdev(bo->bdev);
+	vm_fault_t ret;
+
+	down_read(&rdev->pm.mclk_lock);
+
+	ret = ttm_bo_vm_reserve(bo);
+	if (ret)
+		goto unlock_mclk;
+
+	ret = radeon_bo_fault_reserve_notify(bo);
+	if (ret)
+		goto unlock_resv;
+
+	ret = ttm_bo_vm_fault_reserved(ufi, vaddr,
+				       TTM_BO_VM_NUM_PREFAULT, 1);
+#ifdef notyet
+	if (ret == VM_FAULT_RETRY && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
+		goto unlock_mclk;
+#endif
+
+unlock_resv:
+	dma_resv_unlock(bo->base.resv);
+
+unlock_mclk:
+	up_read(&rdev->pm.mclk_lock);
+	return ret;
+}
+
+void
+radeon_gem_vm_reference(struct uvm_object *uobj)
+{
+	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
+
+	ttm_bo_get(bo);
+}
+
+void
+radeon_gem_vm_detach(struct uvm_object *uobj)
+{
+	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
+
+	ttm_bo_put(bo);
+}
+
+static const struct uvm_pagerops radeon_gem_vm_ops = {
+	.pgo_fault = radeon_gem_fault,
+	.pgo_reference = radeon_gem_vm_reference,
+	.pgo_detach = radeon_gem_vm_detach
+};
+#endif /* !__linux__ */
 
 static void radeon_gem_object_free(struct drm_gem_object *gobj)
 {
@@ -305,9 +362,7 @@ const struct drm_gem_object_funcs radeon_gem_object_funcs = {
 	.vmap = drm_gem_ttm_vmap,
 	.vunmap = drm_gem_ttm_vunmap,
 	.mmap = radeon_gem_object_mmap,
-#ifdef notyet
 	.vm_ops = &radeon_gem_vm_ops,
-#endif
 };
 
 /*

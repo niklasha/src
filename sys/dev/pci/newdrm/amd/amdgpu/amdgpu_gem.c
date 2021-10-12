@@ -82,7 +82,71 @@ static const struct vm_operations_struct amdgpu_gem_vm_ops = {
 	.close = ttm_bo_vm_close,
 	.access = ttm_bo_vm_access
 };
-#endif /* __linux__ */
+#else /* !__linux__ */
+int
+amdgpu_gem_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
+    int npages, int centeridx, vm_fault_t fault_type,
+    vm_prot_t access_type, int flags)
+{
+	struct uvm_object *uobj = ufi->entry->object.uvm_obj;
+	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
+	struct drm_device *ddev = bo->base.dev;
+	vm_fault_t ret;
+	int idx;
+
+	ret = ttm_bo_vm_reserve(bo);
+	if (ret)
+		return ret;
+
+	if (drm_dev_enter(ddev, &idx)) {
+		ret = amdgpu_bo_fault_reserve_notify(bo);
+		if (ret) {
+			drm_dev_exit(idx);
+			goto unlock;
+		}
+
+		 ret = ttm_bo_vm_fault_reserved(ufi, vaddr,
+						TTM_BO_VM_NUM_PREFAULT, 1);
+
+		 drm_dev_exit(idx);
+	} else {
+		STUB();
+#ifdef notyet
+		ret = ttm_bo_vm_dummy_page(vmf, vmf->vma->vm_page_prot);
+#endif
+	}
+#ifdef __linux__
+	if (ret == VM_FAULT_RETRY && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
+		return ret;
+#endif
+
+unlock:
+	dma_resv_unlock(bo->base.resv);
+	return ret;
+}
+
+void
+amdgpu_gem_vm_reference(struct uvm_object *uobj)
+{
+	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
+
+	ttm_bo_get(bo);
+}
+
+void
+amdgpu_gem_vm_detach(struct uvm_object *uobj)
+{
+	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
+
+	ttm_bo_put(bo);
+}
+
+static const struct uvm_pagerops amdgpu_gem_vm_ops = {
+	.pgo_fault = amdgpu_gem_fault,
+	.pgo_reference = amdgpu_gem_vm_reference,
+	.pgo_detach = amdgpu_gem_vm_detach
+};
+#endif /* !__linux__ */
 
 static void amdgpu_gem_object_free(struct drm_gem_object *gobj)
 {
@@ -310,9 +374,7 @@ static const struct drm_gem_object_funcs amdgpu_gem_object_funcs = {
 	.vmap = drm_gem_ttm_vmap,
 	.vunmap = drm_gem_ttm_vunmap,
 	.mmap = amdgpu_gem_object_mmap,
-#ifdef notyet
 	.vm_ops = &amdgpu_gem_vm_ops,
-#endif
 };
 
 /*

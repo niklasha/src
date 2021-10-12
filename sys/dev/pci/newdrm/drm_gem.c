@@ -1355,9 +1355,11 @@ int drm_gem_mmap_obj(struct drm_gem_object *obj, unsigned long obj_size,
 	 */
 	drm_gem_object_get(obj);
 
-#ifdef notyet
+#ifdef __linux__
 	vma->vm_private_data = obj;
 	vma->vm_ops = obj->funcs->vm_ops;
+#else
+	uvm_obj_init(&obj->uobj, obj->funcs->vm_ops, 1);
 #endif
 
 	if (obj->funcs->mmap) {

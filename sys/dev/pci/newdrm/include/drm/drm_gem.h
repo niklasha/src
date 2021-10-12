@@ -175,7 +175,11 @@ struct drm_gem_object_funcs {
 	 *
 	 * This is optional but necessary for mmap support.
 	 */
+#ifdef __linux__
 	const struct vm_operations_struct *vm_ops;
+#else
+	const struct uvm_pagerops *vm_ops;
+#endif
 };
 
 /**
