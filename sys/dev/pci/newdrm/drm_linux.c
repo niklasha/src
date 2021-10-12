@@ -517,6 +517,111 @@ dmi_check_system(const struct dmi_system_id *sysid)
 	return (num);
 }
 
+struct vmalloc_entry {
+	const void	*addr;
+	size_t		size;
+	RBT_ENTRY(vmalloc_entry) vmalloc_node;
+};
+
+struct pool vmalloc_pool;
+RBT_HEAD(vmalloc_tree, vmalloc_entry) vmalloc_tree;
+
+RBT_PROTOTYPE(vmalloc_tree, vmalloc_entry, vmalloc_node, vmalloc_compare);
+
+static inline int
+vmalloc_compare(const struct vmalloc_entry *a, const struct vmalloc_entry *b)
+{
+	vaddr_t va = (vaddr_t)a->addr;
+	vaddr_t vb = (vaddr_t)b->addr;
+
+	return va < vb ? -1 : va > vb;
+}
+
+RBT_GENERATE(vmalloc_tree, vmalloc_entry, vmalloc_node, vmalloc_compare);
+
+bool
+is_vmalloc_addr(const void *addr)
+{
+	struct vmalloc_entry key;
+	struct vmalloc_entry *entry;
+
+	key.addr = addr;
+	entry = RBT_FIND(vmalloc_tree, &vmalloc_tree, &key);
+	return (entry != NULL);
+}
+
+void *
+vmalloc(unsigned long size)
+{
+	struct vmalloc_entry *entry;
+	void *addr;
+
+	size = round_page(size);
+	addr = km_alloc(size, &kv_any, &kp_dirty, &kd_waitok);
+	if (addr) {
+		entry = pool_get(&vmalloc_pool, PR_WAITOK);
+		entry->addr = addr;
+		entry->size = size;
+		RBT_INSERT(vmalloc_tree, &vmalloc_tree, entry);
+	}
+
+	return addr;
+}
+
+void *
+vzalloc(unsigned long size)
+{
+	struct vmalloc_entry *entry;
+	void *addr;
+
+	size = round_page(size);
+	addr = km_alloc(size, &kv_any, &kp_zero, &kd_waitok);
+	if (addr) {
+		entry = pool_get(&vmalloc_pool, PR_WAITOK);
+		entry->addr = addr;
+		entry->size = size;
+		RBT_INSERT(vmalloc_tree, &vmalloc_tree, entry);
+	}
+
+	return addr;
+}
+
+void
+vfree(const void *addr)
+{
+	struct vmalloc_entry key;
+	struct vmalloc_entry *entry;
+
+	key.addr = addr;
+	entry = RBT_FIND(vmalloc_tree, &vmalloc_tree, &key);
+	if (entry == NULL)
+		panic("%s: non vmalloced addr %p", __func__, addr);
+
+	RBT_REMOVE(vmalloc_tree, &vmalloc_tree, entry);
+	km_free((void *)addr, entry->size, &kv_any, &kp_dirty);
+	pool_put(&vmalloc_pool, entry);
+}
+
+void *
+kvmalloc(size_t size, gfp_t flags)
+{
+	if ((flags & M_NOWAIT) || size < PAGE_SIZE)
+		return malloc(size, M_DRM, flags);
+	if (flags & M_ZERO)
+		return vzalloc(size);
+	else
+		return vmalloc(size);
+}
+
+void
+kvfree(const void *addr)
+{
+	if (is_vmalloc_addr(addr))
+		vfree(addr);
+	else
+		free((void *)addr, M_DRM, 0);
+}
+
 struct vm_page *
 alloc_pages(unsigned int gfp_mask, unsigned int order)
 {
@@ -645,21 +750,6 @@ vunmap(void *addr, size_t size)
 	pmap_remove(pmap_kernel(), va, va + size);
 	pmap_update(pmap_kernel());
 	uvm_km_free(kernel_map, va, size);
-}
-
-bool
-is_vmalloc_addr(const void *p)
-{
-	vaddr_t min, max, addr;
-
-	min = vm_map_min(kernel_map);
-	max = vm_map_max(kernel_map);
-	addr = (vaddr_t)p;
-
-	if (addr >= min && addr <= max)
-		return true;
-	else
-		return false;
 }
 
 void
@@ -918,6 +1008,10 @@ xa_init_flags(struct xarray *xa, gfp_t flags)
 		mtx_init(&xa->xa_lock, IPL_TTY);
 	else
 		mtx_init(&xa->xa_lock, IPL_NONE);
+
+	pool_init(&vmalloc_pool, sizeof(struct vmalloc_entry), 0, IPL_NONE, 0,
+	    "vmallocpl", NULL);
+	RBT_INIT(vmalloc_tree, &vmalloc_tree);
 }
 
 void

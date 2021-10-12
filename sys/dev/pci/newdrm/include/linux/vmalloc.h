@@ -25,25 +25,10 @@
 #include <linux/overflow.h>
 
 void	*vmap(struct vm_page **, unsigned int, unsigned long, pgprot_t);
-void	 vunmap(void *, size_t);
+void	vunmap(void *, size_t);
 
-static inline void *
-vmalloc(unsigned long size)
-{
-	return malloc(size, M_DRM, M_WAITOK | M_CANFAIL);
-}
-
-static inline void *
-vzalloc(unsigned long size)
-{
-	return malloc(size, M_DRM, M_WAITOK | M_CANFAIL | M_ZERO);
-}
-
-static inline void
-vfree(void *objp)
-{
-	free(objp, M_DRM, 0);
-}
-
+void	*vmalloc(unsigned long);
+void	*vzalloc(unsigned long);
+void	vfree(const void *);
 
 #endif
