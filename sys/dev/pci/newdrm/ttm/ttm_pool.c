@@ -243,15 +243,12 @@ static int ttm_pool_map(struct ttm_pool *pool, unsigned int order,
 static void ttm_pool_unmap(struct ttm_pool *pool, dma_addr_t dma_addr,
 			   unsigned int num_pages)
 {
-	STUB();
-#ifdef notyet
 	/* Unmapped while freeing the page */
 	if (pool->use_dma_alloc)
 		return;
 
 	dma_unmap_page(pool->dev, dma_addr, (long)num_pages << PAGE_SHIFT,
 		       DMA_BIDIRECTIONAL);
-#endif
 }
 
 /* Give pages into a specific pool_type */
