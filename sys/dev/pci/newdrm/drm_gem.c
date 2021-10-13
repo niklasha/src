@@ -337,6 +337,7 @@ void drm_gem_private_object_init(struct drm_device *dev,
 	obj->filp = NULL;
 #else
 	obj->uao = NULL;
+	obj->uobj.pgops = NULL;
 #endif
 
 	kref_init(&obj->refcount);
@@ -1146,6 +1147,8 @@ drm_gem_object_release(struct drm_gem_object *obj)
 #else
 	if (obj->uao)
 		uao_detach(obj->uao);
+	if (obj->uobj.pgops)
+		uvm_obj_destroy(&obj->uobj);
 #endif
 
 	dma_resv_fini(&obj->_resv);
@@ -1359,7 +1362,8 @@ int drm_gem_mmap_obj(struct drm_gem_object *obj, unsigned long obj_size,
 	vma->vm_private_data = obj;
 	vma->vm_ops = obj->funcs->vm_ops;
 #else
-	uvm_obj_init(&obj->uobj, obj->funcs->vm_ops, 1);
+	if (obj->uobj.pgops == NULL)
+		uvm_obj_init(&obj->uobj, obj->funcs->vm_ops, 1);
 #endif
 
 	if (obj->funcs->mmap) {

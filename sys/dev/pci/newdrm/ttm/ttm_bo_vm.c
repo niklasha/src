@@ -848,7 +848,6 @@ ttm_bo_vm_reference(struct uvm_object *uobj)
 	    (struct ttm_buffer_object *)uobj;
 
 	ttm_bo_get(bo);
-	uobj->uo_refs++;
 }
 
 void
@@ -856,7 +855,6 @@ ttm_bo_vm_detach(struct uvm_object *uobj)
 {
 	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
 
-	uobj->uo_refs--;
 	ttm_bo_put(bo);
 }
 
