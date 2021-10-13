@@ -113,6 +113,7 @@ unlock_resv:
 
 unlock_mclk:
 	up_read(&rdev->pm.mclk_lock);
+	uvmfault_unlockall(ufi, NULL, uobj);
 	return ret;
 }
 

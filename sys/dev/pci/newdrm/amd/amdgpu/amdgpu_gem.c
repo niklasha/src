@@ -95,8 +95,10 @@ amdgpu_gem_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 	int idx;
 
 	ret = ttm_bo_vm_reserve(bo);
-	if (ret)
+	if (ret) {
+		uvmfault_unlockall(ufi, NULL, uobj);
 		return ret;
+	}
 
 	if (drm_dev_enter(ddev, &idx)) {
 		ret = amdgpu_bo_fault_reserve_notify(bo);
@@ -122,6 +124,7 @@ amdgpu_gem_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 
 unlock:
 	dma_resv_unlock(bo->base.resv);
+	uvmfault_unlockall(ufi, NULL, uobj);
 	return ret;
 }
 
