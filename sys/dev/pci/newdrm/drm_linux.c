@@ -2032,8 +2032,22 @@ dma_fence_chain_enable_signaling(struct dma_fence *fence)
 static bool
 dma_fence_chain_signaled(struct dma_fence *fence)
 {
-	STUB();
-	return false;
+	struct dma_fence_chain *chain;
+	struct dma_fence *f;
+
+	dma_fence_chain_for_each(fence, fence) {
+		chain = to_dma_fence_chain(fence);
+		if (chain == NULL)
+			f = fence;
+		else
+			f = chain->fence;
+
+		if (dma_fence_is_signaled(f) == false) {
+			dma_fence_put(fence);
+			return false;
+		}
+	}
+	return true;
 }
 
 static void
@@ -2046,15 +2060,16 @@ struct dma_fence *
 dma_fence_chain_next(struct dma_fence *fence)
 {
 	struct dma_fence_chain *chain = to_dma_fence_chain(fence);
+	struct dma_fence *next;
 
 	if (chain == NULL) {
 		dma_fence_put(fence);
 		return NULL;
 	}
 
-	STUB();
+	next = dma_fence_get(chain->prev);
 	dma_fence_put(fence);
-	return NULL;
+	return next;
 }
 
 const struct dma_fence_ops dma_fence_chain_ops = {
