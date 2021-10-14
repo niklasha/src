@@ -2039,10 +2039,47 @@ dma_fence_chain_get_timeline_name(struct dma_fence *fence)
 	return "unbound";
 }
 
+static void dma_fence_chain_irq_work(struct irq_work *work)
+{
+	struct dma_fence_chain *chain;
+
+	chain = container_of(work, typeof(*chain), work);
+
+	/* Try to rearm the callback */
+	if (!dma_fence_chain_enable_signaling(&chain->base))
+		/* Ok, we are done. No more unsignaled fences left */
+		dma_fence_signal(&chain->base);
+	dma_fence_put(&chain->base);
+}
+
+static void dma_fence_chain_cb(struct dma_fence *f, struct dma_fence_cb *cb)
+{
+	struct dma_fence_chain *chain;
+
+	chain = container_of(cb, typeof(*chain), cb);
+	init_irq_work(&chain->work, dma_fence_chain_irq_work);
+	irq_work_queue(&chain->work);
+	dma_fence_put(f);
+}
+
 static bool
 dma_fence_chain_enable_signaling(struct dma_fence *fence)
 {
-	STUB();
+	struct dma_fence_chain *head = to_dma_fence_chain(fence);
+
+	dma_fence_get(&head->base);
+	dma_fence_chain_for_each(fence, &head->base) {
+		struct dma_fence_chain *chain = to_dma_fence_chain(fence);
+		struct dma_fence *f = chain ? chain->fence : fence;
+
+		dma_fence_get(f);
+		if (!dma_fence_add_callback(f, &head->cb, dma_fence_chain_cb)) {
+			dma_fence_put(fence);
+			return true;
+		}
+		dma_fence_put(f);
+	}
+	dma_fence_put(&head->base);
 	return false;
 }
 
@@ -2070,7 +2107,33 @@ dma_fence_chain_signaled(struct dma_fence *fence)
 static void
 dma_fence_chain_release(struct dma_fence *fence)
 {
-	STUB();
+	struct dma_fence_chain *chain = to_dma_fence_chain(fence);
+	struct dma_fence *prev;
+
+	/* Manually unlink the chain as much as possible to avoid recursion
+	 * and potential stack overflow.
+	 */
+	while ((prev = rcu_dereference_protected(chain->prev, true))) {
+		struct dma_fence_chain *prev_chain;
+
+		if (kref_read(&prev->refcount) > 1)
+		       break;
+
+		prev_chain = to_dma_fence_chain(prev);
+		if (!prev_chain)
+			break;
+
+		/* No need for atomic operations since we hold the last
+		 * reference to prev_chain.
+		 */
+		chain->prev = prev_chain->prev;
+		RCU_INIT_POINTER(prev_chain->prev, NULL);
+		dma_fence_put(prev);
+	}
+	dma_fence_put(prev);
+
+	dma_fence_put(chain->fence);
+	dma_fence_free(fence);
 }
 
 struct dma_fence *
