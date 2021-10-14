@@ -112,6 +112,17 @@ unlock_resv:
 	dma_resv_unlock(bo->base.resv);
 
 unlock_mclk:
+	switch (ret) {
+	case VM_FAULT_NOPAGE:
+		ret = VM_PAGER_OK;
+		break;
+	case VM_FAULT_RETRY:
+		ret = VM_PAGER_REFAULT;
+		break;
+	default:
+		ret = VM_PAGER_BAD;
+		break;
+	}
 	up_read(&rdev->pm.mclk_lock);
 	uvmfault_unlockall(ufi, NULL, uobj);
 	return ret;

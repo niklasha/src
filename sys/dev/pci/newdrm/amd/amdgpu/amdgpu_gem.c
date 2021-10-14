@@ -96,6 +96,17 @@ amdgpu_gem_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 
 	ret = ttm_bo_vm_reserve(bo);
 	if (ret) {
+		switch (ret) {
+		case VM_FAULT_NOPAGE:
+			ret = VM_PAGER_OK;
+			break;
+		case VM_FAULT_RETRY:
+			ret = VM_PAGER_REFAULT;
+			break;
+		default:
+			ret = VM_PAGER_BAD;
+			break;
+		}
 		uvmfault_unlockall(ufi, NULL, uobj);
 		return ret;
 	}
@@ -123,6 +134,17 @@ amdgpu_gem_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 #endif
 
 unlock:
+	switch (ret) {
+	case VM_FAULT_NOPAGE:
+		ret = VM_PAGER_OK;
+		break;
+	case VM_FAULT_RETRY:
+		ret = VM_PAGER_REFAULT;
+		break;
+	default:
+		ret = VM_PAGER_BAD;
+		break;
+	}
 	dma_resv_unlock(bo->base.resv);
 	uvmfault_unlockall(ufi, NULL, uobj);
 	return ret;
