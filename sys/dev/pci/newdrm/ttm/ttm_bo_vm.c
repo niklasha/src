@@ -861,7 +861,7 @@ const struct uvm_pagerops ttm_bo_vm_ops = {
 	.pgo_detach = ttm_bo_vm_detach
 };
 
-#ifdef notyet
+#ifdef __linux__
 int ttm_bo_mmap_obj(struct vm_area_struct *vma, struct ttm_buffer_object *bo)
 {
 	/* Enforce no COW since would have really strange behavior with it. */
@@ -889,4 +889,35 @@ int ttm_bo_mmap_obj(struct vm_area_struct *vma, struct ttm_buffer_object *bo)
 	return 0;
 }
 EXPORT_SYMBOL(ttm_bo_mmap_obj);
+#else /* !__linux__ */
+int ttm_bo_mmap_obj(struct ttm_buffer_object *bo)
+{
+	/* Enforce no COW since would have really strange behavior with it. */
+#ifdef notyet
+	if (UVM_ET_ISCOPYONWRITE(entry))
+		return -EINVAL;
 #endif
+
+	ttm_bo_get(bo);
+
+	/*
+	 * Drivers may want to override the vm_ops field. Otherwise we
+	 * use TTM's default callbacks.
+	 */
+	if (bo->base.uobj.pgops == NULL)
+		uvm_obj_init(&bo->base.uobj, &ttm_bo_vm_ops, 1);
+
+	/*
+	 * Note: We're transferring the bo reference to
+	 * vma->vm_private_data here.
+	 */
+
+#ifdef notyet
+	vma->vm_private_data = bo;
+
+	vma->vm_flags |= VM_PFNMAP;
+	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+#endif
+	return 0;
+}
+#endif /* !__linux__ */

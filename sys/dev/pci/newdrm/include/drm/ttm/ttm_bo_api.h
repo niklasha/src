@@ -516,7 +516,6 @@ int ttm_bo_vmap(struct ttm_buffer_object *bo, struct dma_buf_map *map);
  */
 void ttm_bo_vunmap(struct ttm_buffer_object *bo, struct dma_buf_map *map);
 
-#ifdef notyet
 /**
  * ttm_bo_mmap_obj - mmap memory backed by a ttm buffer object.
  *
@@ -525,7 +524,10 @@ void ttm_bo_vunmap(struct ttm_buffer_object *bo, struct dma_buf_map *map);
  *
  * Maps a buffer object.
  */
+#ifdef __linux__
 int ttm_bo_mmap_obj(struct vm_area_struct *vma, struct ttm_buffer_object *bo);
+#else
+int ttm_bo_mmap_obj(struct ttm_buffer_object *bo);
 #endif
 
 /**
