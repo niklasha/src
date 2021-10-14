@@ -565,6 +565,15 @@ vm_fault_t ttm_bo_vm_reserve(struct ttm_buffer_object *bo)
 			return VM_FAULT_NOPAGE;
 	}
 
+	/*
+	 * Refuse to fault imported pages. This should be handled
+	 * (if at all) by redirecting mmap to the exporter.
+	 */
+	if (bo->ttm && (bo->ttm->page_flags & TTM_PAGE_FLAG_SG)) {
+		dma_resv_unlock(bo->base.resv);
+		return VM_FAULT_SIGBUS;
+	}
+
 	return 0;
 }
 
@@ -589,13 +598,6 @@ vm_fault_t ttm_bo_vm_fault_reserved(struct uvm_faultinfo *ufi,
 	pgoff_t i;
 	vm_fault_t ret = VM_FAULT_NOPAGE;
 	unsigned long address = (unsigned long)vaddr;
-
-	/*
-	 * Refuse to fault imported pages. This should be handled
-	 * (if at all) by redirecting mmap to the exporter.
-	 */
-	if (bo->ttm && (bo->ttm->page_flags & TTM_PAGE_FLAG_SG))
-		return VM_FAULT_SIGBUS;
 
 	/*
 	 * Wait for buffer data in transit, due to a pipelined
