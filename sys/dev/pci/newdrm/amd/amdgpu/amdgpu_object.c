@@ -39,12 +39,6 @@
 #include "amdgpu_trace.h"
 #include "amdgpu_amdkfd.h"
 
-/* matches ttm_bo_vm.c */
-#define VM_FAULT_NOPAGE		1
-#define VM_FAULT_SIGBUS		2
-#define VM_FAULT_RETRY		3
-#define VM_FAULT_OOM		4
-
 /**
  * DOC: amdgpu_object
  *
