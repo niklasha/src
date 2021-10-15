@@ -39,25 +39,29 @@ static void user_forcewake(struct intel_gt *gt, bool suspend)
 
 static void runtime_begin(struct intel_gt *gt)
 {
-	STUB();
 	local_irq_disable();
 #ifdef notyet
 	write_seqcount_begin(&gt->stats.lock);
+#else
+	write_seqcount_begin((seqcount_t *)&gt->stats.lock);
 #endif
 	gt->stats.start = ktime_get();
 	gt->stats.active = true;
 #ifdef notyet
 	write_seqcount_end(&gt->stats.lock);
+#else
+	write_seqcount_end((seqcount_t *)&gt->stats.lock);
 #endif
 	local_irq_enable();
 }
 
 static void runtime_end(struct intel_gt *gt)
 {
-	STUB();
 	local_irq_disable();
 #ifdef notyet
 	write_seqcount_begin(&gt->stats.lock);
+#else
+	write_seqcount_begin((seqcount_t *)&gt->stats.lock);
 #endif
 	gt->stats.active = false;
 	gt->stats.total =
@@ -65,6 +69,8 @@ static void runtime_end(struct intel_gt *gt)
 			  ktime_sub(ktime_get(), gt->stats.start));
 #ifdef notyet
 	write_seqcount_end(&gt->stats.lock);
+#else
+	write_seqcount_end((seqcount_t *)&gt->stats.lock);
 #endif
 	local_irq_enable();
 }
