@@ -80,7 +80,6 @@ struct drm_driver rkdrm_driver = {
 	.dumb_create = drm_gem_cma_dumb_create,
 	.dumb_map_offset = drm_gem_dumb_map_offset,
 
-	.gem_free_object_unlocked = drm_gem_cma_free_object,
 	.gem_fault = drm_gem_cma_fault,
 
 	.name = DRIVER_NAME,
@@ -89,6 +88,10 @@ struct drm_driver rkdrm_driver = {
 	.major = DRIVER_MAJOR,
 	.minor = DRIVER_MINOR,
 	.patchlevel = DRIVER_PATCHLEVEL,
+};
+
+const struct drm_gem_object_funcs rkdrm_gem_object_funcs = {
+	.free = drm_gem_cma_free_object,
 };
 
 struct cfattach	rkdrm_ca = {
