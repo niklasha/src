@@ -474,7 +474,7 @@ again:
 		printf("%s: cr fail\n", sc->sc_dev.dv_xname);
 		return;
 	}
-	drm_dp_link_train_clock_recovery_delay(sc->sc_dpcd);
+	drm_dp_link_train_clock_recovery_delay(&sc->sc_dpaux, sc->sc_dpcd);
 	if (DP_LINK_STATUS_SIZE !=
 	    drm_dp_dpcd_read_link_status(&sc->sc_dpaux, link_status)) {
 		return;
@@ -519,7 +519,7 @@ again:
 		printf("%s: eq fail\n", sc->sc_dev.dv_xname);
 		return;
 	}
-	drm_dp_link_train_channel_eq_delay(sc->sc_dpcd);
+	drm_dp_link_train_channel_eq_delay(&sc->sc_dpaux, sc->sc_dpcd);
 	if (DP_LINK_STATUS_SIZE !=
 	    drm_dp_dpcd_read_link_status(&sc->sc_dpaux, link_status)) {
 		return;
