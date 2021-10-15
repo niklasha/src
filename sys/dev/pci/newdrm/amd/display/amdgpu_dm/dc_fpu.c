@@ -61,7 +61,7 @@ static int fpu_recursion_depth;
  * function for checking if the caller invoked it after DC_FP_START(). For
  * example, take a look at dcn2x.c file.
  */
-inline void dc_assert_fp_enabled(void)
+void dc_assert_fp_enabled(void)
 {
 	int *pcpu, depth = 0;
 
