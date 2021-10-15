@@ -258,9 +258,11 @@ rkvop_attach(struct device *parent, struct device *self, void *aux)
 }
 
 int
-rkvop_plane_check(struct drm_plane *plane, struct drm_plane_state *state)
+rkvop_plane_check(struct drm_plane *plane, struct drm_atomic_state *das)
 {
 	struct drm_crtc_state *crtc_state;
+	struct drm_plane_state *state = drm_atomic_get_new_plane_state(das,
+	    plane);
 
 	if (state->crtc == NULL)
 		return 0;
@@ -275,8 +277,10 @@ rkvop_plane_check(struct drm_plane *plane, struct drm_plane_state *state)
 }
 
 void
-rkvop_plane_update(struct drm_plane *plane, struct drm_plane_state *old_state)
+rkvop_plane_update(struct drm_plane *plane, struct drm_atomic_state *das)
 {
+	struct drm_plane_state *old_state = drm_atomic_get_new_plane_state(das,
+	    plane);
 	struct drm_plane_state *state = plane->state;
 	struct drm_crtc *crtc = state->crtc;
 	struct rkvop_crtc *rkcrtc = to_rkvop_crtc(crtc);
@@ -382,8 +386,10 @@ rkvop_mode_fixup(struct drm_crtc *crtc,
 }
 
 int
-rkvop_crtc_check(struct drm_crtc *crtc, struct drm_crtc_state *state)
+rkvop_crtc_check(struct drm_crtc *crtc, struct drm_atomic_state *das)
 {
+	struct drm_crtc_state *state = drm_atomic_get_new_crtc_state(das,
+	    crtc);
 	bool enabled = state->plane_mask & drm_plane_mask(crtc->primary);
 
 	if (enabled != state->enable)
@@ -393,8 +399,10 @@ rkvop_crtc_check(struct drm_crtc *crtc, struct drm_crtc_state *state)
 }
 
 void
-rkvop_crtc_enable(struct drm_crtc *crtc, struct drm_crtc_state *old_state)
+rkvop_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_state *das)
 {
+	struct drm_crtc_state *old_state = drm_atomic_get_old_crtc_state(das,
+	    crtc);
 	struct rkvop_crtc *rkcrtc = to_rkvop_crtc(crtc);
 	struct rkvop_softc *sc = rkcrtc->sc;
 	struct drm_display_mode *adjusted_mode = &crtc->state->adjusted_mode;
@@ -486,8 +494,10 @@ rkvop_crtc_enable(struct drm_crtc *crtc, struct drm_crtc_state *old_state)
 }
 
 void
-rkvop_crtc_flush(struct drm_crtc *crtc, struct drm_crtc_state *old_state)
+rkvop_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_state *das)
 {
+	struct drm_crtc_state *old_state = drm_atomic_get_old_crtc_state(das,
+	    crtc);
 	struct rkvop_crtc *rkcrtc = to_rkvop_crtc(crtc);
 	struct rkvop_softc *sc = rkcrtc->sc;
 
