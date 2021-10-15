@@ -9,6 +9,7 @@
 #include <linux/swap.h>
 
 #include <drm/drm_cache.h>
+#include <drm/drm_legacy.h>	/* for drm_dmamem_alloc() */
 
 #include "gt/intel_gt.h"
 #include "i915_drv.h"
@@ -18,13 +19,12 @@
 
 static int i915_gem_object_get_pages_phys(struct drm_i915_gem_object *obj)
 {
-	STUB();
-	return -ENOSYS;
-#ifdef notyet
 #ifdef __linux__
 	struct address_space *mapping = obj->base.filp->f_mapping;
 #else
-	struct drm_dma_handle *phys;
+	struct drm_i915_private *i915 = to_i915(obj->base.dev);
+	struct drm_dmamem *dmah;
+	int flags = 0;
 #endif
 	struct scatterlist *sg;
 	struct sg_table *st;
@@ -48,13 +48,14 @@ static int i915_gem_object_get_pages_phys(struct drm_i915_gem_object *obj)
 	if (!vaddr)
 		return -ENOMEM;
 #else
-	phys = drm_pci_alloc(obj->base.dev,
-			     roundup_pow_of_two(obj->base.size),
-			     roundup_pow_of_two(obj->base.size));
-	if (!phys)
+	dmah = drm_dmamem_alloc(i915->dmat,
+	    roundup_pow_of_two(obj->base.size),
+	    PAGE_SIZE, 1,
+	    roundup_pow_of_two(obj->base.size), flags, 0);
+	if (dmah == NULL)
 		return -ENOMEM;
-	vaddr = phys->vaddr;
-	dma = phys->busaddr;
+	dma = dmah->map->dm_segs[0].ds_addr;
+	vaddr = dmah->kva;
 #endif
 
 	st = kmalloc(sizeof(*st), GFP_KERNEL);
@@ -71,7 +72,7 @@ static int i915_gem_object_get_pages_phys(struct drm_i915_gem_object *obj)
 #ifdef __linux__
 	sg_assign_page(sg, (struct page *)vaddr);
 #else
-	sg_assign_page(sg, (struct vm_page *)phys);
+	sg_assign_page(sg, (struct vm_page *)dmah);
 #endif
 	sg_dma_address(sg) = dma;
 	sg_dma_len(sg) = obj->base.size;
@@ -124,24 +125,22 @@ err_pci:
 			  roundup_pow_of_two(obj->base.size),
 			  vaddr, dma);
 #else
-	drm_pci_free(obj->base.dev, phys);
+	drm_dmamem_free(i915->dmat, dmah);
 #endif
 	return -ENOMEM;
-#endif
 }
 
 void
 i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
 			       struct sg_table *pages)
 {
-	STUB();
-#ifdef notyet
 	dma_addr_t dma = sg_dma_address(pages->sgl);
 #ifdef __linux__
 	void *vaddr = sg_page(pages->sgl);
 #else
-	struct drm_dma_handle *phys = (void *)sg_page(pages->sgl);
-	void *vaddr = phys->vaddr;
+	struct drm_dmamem *dmah = (void *)sg_page(pages->sgl);
+	void *vaddr = dmah->kva;
+	struct drm_i915_private *i915 = to_i915(obj->base.dev);
 #endif
 
 	__i915_gem_object_release_shmem(obj, pages, false);
@@ -198,8 +197,7 @@ i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
 			  roundup_pow_of_two(obj->base.size),
 			  vaddr, dma);
 #else
-	drm_pci_free(obj->base.dev, phys);
-#endif
+	drm_dmamem_free(i915->dmat, dmah);
 #endif
 }
 
