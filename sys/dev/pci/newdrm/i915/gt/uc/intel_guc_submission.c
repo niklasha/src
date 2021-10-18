@@ -566,8 +566,6 @@ deadlk:
 
 static void guc_submission_tasklet(struct tasklet_struct *t)
 {
-	STUB();
-#ifdef notyet
 	struct i915_sched_engine *sched_engine =
 		from_tasklet(sched_engine, t, tasklet);
 	unsigned long flags;
@@ -582,7 +580,6 @@ static void guc_submission_tasklet(struct tasklet_struct *t)
 	i915_sched_engine_reset_on_empty(sched_engine);
 
 	spin_unlock_irqrestore(&sched_engine->lock, flags);
-#endif
 }
 
 static void cs_irq_handler(struct intel_engine_cs *engine, u16 iir)

@@ -2397,8 +2397,6 @@ static bool preempt_timeout(const struct intel_engine_cs *const engine)
  */
 static void execlists_submission_tasklet(struct tasklet_struct *t)
 {
-	STUB();
-#ifdef notyet
 	struct i915_sched_engine *sched_engine =
 		from_tasklet(sched_engine, t, tasklet);
 	struct intel_engine_cs * const engine = sched_engine->private_data;
@@ -2438,7 +2436,6 @@ static void execlists_submission_tasklet(struct tasklet_struct *t)
 
 	post_process_csb(post, inactive);
 	rcu_read_unlock();
-#endif
 }
 
 static void execlists_irq_handler(struct intel_engine_cs *engine, u16 iir)
@@ -3043,15 +3040,12 @@ static void execlists_reset_rewind(struct intel_engine_cs *engine, bool stalled)
 
 static void nop_submission_tasklet(struct tasklet_struct *t)
 {
-	STUB();
-#ifdef notyet
 	struct i915_sched_engine *sched_engine =
 		from_tasklet(sched_engine, t, tasklet);
 	struct intel_engine_cs * const engine = sched_engine->private_data;
 
 	/* The driver is wedged; don't process any more events. */
 	WRITE_ONCE(engine->sched_engine->queue_priority_hint, INT_MIN);
-#endif
 }
 
 static void execlists_reset_cancel(struct intel_engine_cs *engine)
@@ -3683,8 +3677,6 @@ static intel_engine_mask_t virtual_submission_mask(struct virtual_engine *ve)
 
 static void virtual_submission_tasklet(struct tasklet_struct *t)
 {
-	STUB();
-#ifdef notyet
 	struct i915_sched_engine *sched_engine =
 		from_tasklet(sched_engine, t, tasklet);
 	struct virtual_engine * const ve =
@@ -3766,7 +3758,6 @@ unlock_engine:
 		if (intel_context_inflight(&ve->context))
 			break;
 	}
-#endif
 }
 
 static void virtual_submit_request(struct i915_request *rq)

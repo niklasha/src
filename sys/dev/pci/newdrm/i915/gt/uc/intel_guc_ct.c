@@ -1176,12 +1176,9 @@ static void ct_try_receive_message(struct intel_guc_ct *ct)
 
 static void ct_receive_tasklet_func(struct tasklet_struct *t)
 {
-	STUB();
-#ifdef notyet
 	struct intel_guc_ct *ct = from_tasklet(ct, t, receive_tasklet);
 
 	ct_try_receive_message(ct);
-#endif
 }
 
 /*
