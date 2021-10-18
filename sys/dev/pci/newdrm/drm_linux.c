@@ -49,6 +49,7 @@
 #include <linux/xarray.h>
 #include <linux/interval_tree.h>
 #include <linux/kthread.h>
+#include <linux/processor.h>
 
 #include <drm/drm_device.h>
 #include <drm/drm_print.h>
@@ -56,6 +57,14 @@
 #if defined(__amd64__) || defined(__i386__)
 #include "bios.h"
 #endif
+
+/* allowed to sleep */
+void
+tasklet_unlock_wait(struct tasklet_struct *ts)
+{
+	while (test_bit(TASKLET_STATE_RUN, &ts->state))
+		cpu_relax();
+}
 
 void
 tasklet_run(void *arg)
