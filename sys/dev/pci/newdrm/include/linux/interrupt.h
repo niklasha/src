@@ -34,6 +34,9 @@ struct tasklet_struct {
 #define TASKLET_STATE_SCHED	1
 #define TASKLET_STATE_RUN	0
 
+#define from_tasklet(x, t, f) \
+	container_of(t, typeof(*x), f)
+
 extern struct taskq *taskletq;
 void tasklet_run(void *);
 void tasklet_unlock_wait(struct tasklet_struct *);
