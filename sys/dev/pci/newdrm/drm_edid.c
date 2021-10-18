@@ -1836,9 +1836,6 @@ static void connector_bad_edid(struct drm_connector *connector,
 	int i;
 	u8 num_of_ext = edid[0x7e];
 
-	if (num_of_ext > num_blocks)
-		num_of_ext = num_blocks;
-
 	/* Calculate real checksum for the last edid extension block data */
 	connector->real_edid_checksum =
 		drm_edid_block_checksum(edid + num_of_ext * EDID_LENGTH);
