@@ -66,6 +66,14 @@ tasklet_unlock_wait(struct tasklet_struct *ts)
 		cpu_relax();
 }
 
+/* must not sleep */
+void
+tasklet_unlock_spin_wait(struct tasklet_struct *ts)
+{
+	while (test_bit(TASKLET_STATE_RUN, &ts->state))
+		cpu_relax();
+}
+
 void
 tasklet_run(void *arg)
 {

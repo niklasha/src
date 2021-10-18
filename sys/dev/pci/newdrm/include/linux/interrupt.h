@@ -37,6 +37,7 @@ struct tasklet_struct {
 extern struct taskq *taskletq;
 void tasklet_run(void *);
 void tasklet_unlock_wait(struct tasklet_struct *);
+void tasklet_unlock_spin_wait(struct tasklet_struct *);
 
 static inline void
 tasklet_init(struct tasklet_struct *ts, void (*func)(unsigned long),
