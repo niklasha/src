@@ -339,6 +339,7 @@ static bool radeon_atrm_get_bios(struct radeon_device *rdev)
 	if (rdev->flags & RADEON_IS_IGP)
 		return false;
 
+#ifdef notyet
 	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_VGA << 8, pdev)) != NULL) {
 		dhandle = ACPI_HANDLE(&pdev->dev);
 		if (!dhandle)
@@ -364,6 +365,19 @@ static bool radeon_atrm_get_bios(struct radeon_device *rdev)
 			}
 		}
 	}
+#else
+	{
+		pdev = rdev->pdev;
+		dhandle = ACPI_HANDLE(&pdev->dev);
+
+		if (dhandle) {
+			status = acpi_get_handle(dhandle, "ATRM", &atrm_handle);
+			if (ACPI_SUCCESS(status)) {
+				found = true;
+			}
+		}
+	}
+#endif
 
 	if (!found)
 		return false;
