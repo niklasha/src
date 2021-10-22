@@ -417,6 +417,7 @@ static bool amdgpu_atrm_get_bios(struct amdgpu_device *adev)
 	if (adev->flags & AMD_IS_APU)
 		return false;
 
+#ifdef notyet
 	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_VGA << 8, pdev)) != NULL) {
 		dhandle = ACPI_HANDLE(&pdev->dev);
 		if (!dhandle)
@@ -442,6 +443,19 @@ static bool amdgpu_atrm_get_bios(struct amdgpu_device *adev)
 			}
 		}
 	}
+#else
+	{
+		pdev = adev->pdev;
+		dhandle = ACPI_HANDLE(&pdev->dev);
+
+		if (dhandle) {
+			status = acpi_get_handle(dhandle, "ATRM", &atrm_handle);
+			if (ACPI_SUCCESS(status)) {
+				found = true;
+			}
+		}
+	}
+#endif
 
 	if (!found)
 		return false;
