@@ -1848,26 +1848,6 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 
 	printf("\n");
 
-	/* from amdgpu_init() */
-	if (amdgpu_refcnt == 0) {
-		drm_sched_fence_slab_init();
-
-		if (amdgpu_sync_init()) {
-			printf(": amdgpu_sync_init failed\n");
-			return;
-		}
-
-		if (amdgpu_fence_slab_init()) {
-			amdgpu_sync_fini();
-			printf(": amdgpu_fence_slab_init failed\n");
-			return;
-		}
-
-		amdgpu_register_atpx_handler();
-		amdgpu_acpi_detect();
-	}
-	amdgpu_refcnt++;
-
 	/* from amdgpu_pci_probe() */
 
 	if (!amdgpu_virtual_display &&
@@ -1893,6 +1873,26 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 
 	if (!amdgpu_msi_ok(adev))
 		pa->pa_flags &= ~PCI_FLAGS_MSI_ENABLED;
+
+	/* from amdgpu_init() */
+	if (amdgpu_refcnt == 0) {
+		drm_sched_fence_slab_init();
+
+		if (amdgpu_sync_init()) {
+			printf(": amdgpu_sync_init failed\n");
+			return;
+		}
+
+		if (amdgpu_fence_slab_init()) {
+			amdgpu_sync_fini();
+			printf(": amdgpu_fence_slab_init failed\n");
+			return;
+		}
+
+		amdgpu_register_atpx_handler();
+		amdgpu_acpi_detect();
+	}
+	amdgpu_refcnt++;
 
 	adev->irq.msi_enabled = false;
 	if (pci_intr_map_msi(pa, &adev->intrh) == 0)
