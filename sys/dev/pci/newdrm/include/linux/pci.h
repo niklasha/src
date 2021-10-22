@@ -393,12 +393,6 @@ pci_set_power_state(struct pci_dev *dev, int state)
 	return 0;
 }
 
-static inline struct pci_dev *
-pci_get_class(pcireg_t class, struct pci_dev *pdev)
-{
-	return NULL;
-}
-
 #define PCI_CLASS_DISPLAY_VGA \
     ((PCI_CLASS_DISPLAY << 8) | PCI_SUBCLASS_DISPLAY_VGA)
 #define PCI_CLASS_DISPLAY_OTHER \
