@@ -15,7 +15,11 @@
 #define IRQF_SHARED	0
 
 #define request_irq(irq, hdlr, flags, name, dev)	(0)
-#define free_irq(irq, dev)
+
+static inline void
+free_irq(unsigned int irq, void *dev)
+{
+}
 
 typedef irqreturn_t (*irq_handler_t)(int, void *);
 
