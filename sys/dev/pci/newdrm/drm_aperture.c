@@ -143,6 +143,8 @@ static bool overlap(resource_size_t base1, resource_size_t end1,
 	return (base1 < end2) && (end1 > base2);
 }
 
+#ifdef notyet
+
 static void devm_aperture_acquire_release(void *data)
 {
 	struct drm_aperture *ap = data;
@@ -160,9 +162,6 @@ static int devm_aperture_acquire(struct drm_device *dev,
 				 resource_size_t base, resource_size_t size,
 				 void (*detach)(struct drm_device *))
 {
-	STUB();
-	return -ENOSYS;
-#ifdef notyet
 	size_t end = base + size;
 	struct list_head *pos;
 	struct drm_aperture *ap;
@@ -194,13 +193,10 @@ static int devm_aperture_acquire(struct drm_device *dev,
 	mutex_unlock(&drm_apertures_lock);
 
 	return devm_add_action_or_reset(dev->dev, devm_aperture_acquire_release, ap);
-#endif
 }
 
 static void drm_aperture_detach_firmware(struct drm_device *dev)
 {
-	STUB();
-#ifdef notyet
 	struct platform_device *pdev = to_platform_device(dev->dev);
 
 	/*
@@ -216,8 +212,9 @@ static void drm_aperture_detach_firmware(struct drm_device *dev)
 	 * stays around after detachment.
 	 */
 	platform_device_unregister(pdev);
-#endif
 }
+
+#endif /* notyet */
 
 /**
  * devm_aperture_acquire_from_firmware - Acquires ownership of a firmware framebuffer
