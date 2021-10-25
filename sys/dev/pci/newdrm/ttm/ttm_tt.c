@@ -250,14 +250,19 @@ int ttm_tt_swapin(struct ttm_tt *ttm)
 	BUG_ON(swap_storage == NULL);
 
 	TAILQ_INIT(&plist);
-	if (uvm_obj_wire(swap_storage, 0, ttm->num_pages << PAGE_SHIFT, &plist))
+	if (uvm_obj_wire(swap_storage, 0, ttm->num_pages << PAGE_SHIFT,
+	    &plist)) {
+		ret = -ENOMEM;
 		goto out_err;
+	}
 
 	from_page = TAILQ_FIRST(&plist);
 	for (i = 0; i < ttm->num_pages; ++i) {
 		to_page = ttm->pages[i];
-		if (unlikely(to_page == NULL))
+		if (unlikely(to_page == NULL)) {
+			ret = -ENOMEM;
 			goto out_err;
+		}
 
 		uvm_pagecopy(from_page, to_page);
 		from_page = TAILQ_NEXT(from_page, pageq);
