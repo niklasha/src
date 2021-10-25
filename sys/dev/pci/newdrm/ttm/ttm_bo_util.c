@@ -277,8 +277,6 @@ static int ttm_bo_ioremap(struct ttm_buffer_object *bo,
 		map->bo_kmap_type = ttm_bo_map_premapped;
 		map->virtual = ((u8 *)bo->resource->bus.addr) + offset;
 	} else {
-		resource_size_t res = bo->resource->bus.offset + offset;
-
 		map->bo_kmap_type = ttm_bo_map_iomap;
 		if (mem->bus.caching == ttm_write_combined)
 			flags = BUS_SPACE_MAP_PREFETCHABLE;
