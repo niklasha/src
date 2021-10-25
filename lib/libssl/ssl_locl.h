@@ -1,4 +1,4 @@
-/* $OpenBSD: ssl_locl.h,v 1.358 2021/08/30 19:25:43 jsing Exp $ */
+/* $OpenBSD: ssl_locl.h,v 1.366 2021/10/23 20:42:50 beck Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -361,6 +361,11 @@ __BEGIN_HIDDEN_DECLS
 #define EXPLICIT_CHAR2_CURVE_TYPE  2
 #define NAMED_CURVE_TYPE           3
 
+struct ssl_comp_st {
+	int id;
+	const char *name;
+};
+
 struct ssl_cipher_st {
 	int valid;
 	const char *name;		/* text name */
@@ -491,9 +496,9 @@ struct ssl_session_st {
 	char *tlsext_hostname;
 
 	/* RFC4507 info */
-	unsigned char *tlsext_tick;	/* Session ticket */
-	size_t tlsext_ticklen;		/* Session ticket length */
-	long tlsext_tick_lifetime_hint;	/* Session lifetime hint in seconds */
+	unsigned char *tlsext_tick;		/* Session ticket */
+	size_t tlsext_ticklen;			/* Session ticket length */
+	uint32_t tlsext_tick_lifetime_hint;	/* Session lifetime hint in seconds */
 
 	struct ssl_session_internal_st *internal;
 };
@@ -578,6 +583,13 @@ typedef struct ssl_handshake_st {
 	uint16_t negotiated_tls_version;
 
 	/*
+	 * Legacy version advertised by our peer. For a server this is the
+	 * version specified by the client in the ClientHello message. For a
+	 * client, this is the version provided in the ServerHello message.
+	 */
+	uint16_t peer_legacy_version;
+
+	/*
 	 * Current handshake state - contains one of the SSL3_ST_* values and
 	 * is used by the TLSv1.2 state machine, as well as being updated by
 	 * the TLSv1.3 stack due to it being exposed externally.
@@ -610,6 +622,14 @@ typedef struct ssl_handshake_st {
 	SSL_HANDSHAKE_TLS12 tls12;
 	SSL_HANDSHAKE_TLS13 tls13;
 } SSL_HANDSHAKE;
+
+typedef struct tls_session_ticket_ext_st TLS_SESSION_TICKET_EXT;
+
+/* TLS Session Ticket extension struct. */
+struct tls_session_ticket_ext_st {
+	unsigned short length;
+	void *data;
+};
 
 struct tls12_key_block;
 
@@ -650,8 +670,6 @@ void tls12_record_layer_write_epoch_done(struct tls12_record_layer *rl,
 void tls12_record_layer_clear_read_state(struct tls12_record_layer *rl);
 void tls12_record_layer_clear_write_state(struct tls12_record_layer *rl);
 void tls12_record_layer_reflect_seq_num(struct tls12_record_layer *rl);
-void tls12_record_layer_read_cipher_hash(struct tls12_record_layer *rl,
-    EVP_CIPHER_CTX **cipher, EVP_MD_CTX **hash);
 int tls12_record_layer_change_read_cipher_state(struct tls12_record_layer *rl,
     CBS *mac_key, CBS *key, CBS *iv);
 int tls12_record_layer_change_write_cipher_state(struct tls12_record_layer *rl,
@@ -830,7 +848,47 @@ typedef struct ssl_ctx_internal_st {
 	uint8_t *tlsext_ecpointformatlist; /* our list */
 	size_t tlsext_supportedgroups_length;
 	uint16_t *tlsext_supportedgroups; /* our list */
+	SSL_CTX_keylog_cb_func keylog_callback; /* Unused. For OpenSSL compatibility. */
+	size_t num_tickets; /* Unused, for OpenSSL compatibility */
 } SSL_CTX_INTERNAL;
+
+struct ssl_ctx_st {
+	const SSL_METHOD *method;
+
+	STACK_OF(SSL_CIPHER) *cipher_list;
+
+	struct x509_store_st /* X509_STORE */ *cert_store;
+
+	/* If timeout is not 0, it is the default timeout value set
+	 * when SSL_new() is called.  This has been put in to make
+	 * life easier to set things up */
+	long session_timeout;
+
+	int references;
+
+	/* Default values to use in SSL structures follow (these are copied by SSL_new) */
+
+	STACK_OF(X509) *extra_certs;
+
+	int verify_mode;
+	unsigned int sid_ctx_length;
+	unsigned char sid_ctx[SSL_MAX_SID_CTX_LENGTH];
+
+	X509_VERIFY_PARAM *param;
+
+	/*
+	 * XXX
+	 * default_passwd_cb used by python and openvpn, need to keep it until we
+	 * add an accessor
+	 */
+	/* Default password callback. */
+	pem_password_cb *default_passwd_callback;
+
+	/* Default password callback user data. */
+	void *default_passwd_callback_userdata;
+
+	struct ssl_ctx_internal_st *internal;
+};
 
 typedef struct ssl_internal_st {
 	struct tls13_ctx *tls13;
@@ -971,7 +1029,76 @@ typedef struct ssl_internal_st {
 	int mac_packet;
 
 	int empty_record_count;
+
+	size_t num_tickets; /* Unused, for OpenSSL compatibility */
+	STACK_OF(X509) *verified_chain;
 } SSL_INTERNAL;
+
+struct ssl_st {
+	/* protocol version
+	 * (one of SSL2_VERSION, SSL3_VERSION, TLS1_VERSION, DTLS1_VERSION)
+	 */
+	int version;
+
+	const SSL_METHOD *method; /* SSLv3 */
+
+	/* There are 2 BIO's even though they are normally both the
+	 * same.  This is so data can be read and written to different
+	 * handlers */
+
+	BIO *rbio; /* used by SSL_read */
+	BIO *wbio; /* used by SSL_write */
+	BIO *bbio; /* used during session-id reuse to concatenate
+		    * messages */
+	int server;	/* are we the server side? - mostly used by SSL_clear*/
+
+	struct ssl3_state_st *s3; /* SSLv3 variables */
+	struct dtls1_state_st *d1; /* DTLSv1 variables */
+
+	X509_VERIFY_PARAM *param;
+
+	/* crypto */
+	STACK_OF(SSL_CIPHER) *cipher_list;
+
+	/* This is used to hold the server certificate used */
+	struct cert_st /* CERT */ *cert;
+
+	/* the session_id_context is used to ensure sessions are only reused
+	 * in the appropriate context */
+	unsigned int sid_ctx_length;
+	unsigned char sid_ctx[SSL_MAX_SID_CTX_LENGTH];
+
+	/* This can also be in the session once a session is established */
+	SSL_SESSION *session;
+
+	/* Used in SSL2 and SSL3 */
+	int verify_mode;	/* 0 don't care about verify failure.
+				 * 1 fail if verify fails */
+	int error;		/* error bytes to be written */
+	int error_code;		/* actual code */
+
+	SSL_CTX *ctx;
+
+	long verify_result;
+
+	int references;
+
+	int client_version;	/* what was passed, used for
+				 * SSLv3/TLS rollback check */
+
+	unsigned int max_send_fragment;
+
+	char *tlsext_hostname;
+
+	/* certificate status request info */
+	/* Status type or -1 if no status type */
+	int tlsext_status_type;
+
+	SSL_CTX * initial_ctx; /* initial ctx, used to store sessions */
+#define session_ctx initial_ctx
+
+	struct ssl_internal_st *internal;
+};
 
 typedef struct ssl3_record_internal_st {
 	int type;               /* type of record */
@@ -1165,6 +1292,7 @@ int ssl_supported_tls_version_range(SSL *s, uint16_t *min_ver, uint16_t *max_ver
 uint16_t ssl_tls_version(uint16_t version);
 uint16_t ssl_effective_tls_version(SSL *s);
 int ssl_max_supported_version(SSL *s, uint16_t *max_ver);
+int ssl_max_legacy_version(SSL *s, uint16_t *max_ver);
 int ssl_max_shared_version(SSL *s, uint16_t peer_ver, uint16_t *max_ver);
 int ssl_check_version_from_server(SSL *s, uint16_t server_version);
 int ssl_legacy_stack_version(SSL *s, uint16_t version);
@@ -1176,8 +1304,6 @@ const SSL_METHOD *tls_legacy_method(void);
 const SSL_METHOD *ssl_get_method(uint16_t version);
 
 void ssl_clear_cipher_state(SSL *s);
-void ssl_clear_cipher_read_state(SSL *s);
-void ssl_clear_cipher_write_state(SSL *s);
 int ssl_clear_bad_session(SSL *s);
 
 void ssl_info_callback(const SSL *s, int type, int value);
@@ -1240,7 +1366,7 @@ int ssl3_send_change_cipher_spec(SSL *s, int state_a, int state_b);
 int ssl3_do_write(SSL *s, int type);
 int ssl3_send_alert(SSL *s, int level, int desc);
 int ssl3_get_req_cert_types(SSL *s, CBB *cbb);
-long ssl3_get_message(SSL *s, int st1, int stn, int mt, long max, int *ok);
+int ssl3_get_message(SSL *s, int st1, int stn, int mt, long max);
 int ssl3_send_finished(SSL *s, int state_a, int state_b);
 int ssl3_num_ciphers(void);
 const SSL_CIPHER *ssl3_get_cipher(unsigned int u);

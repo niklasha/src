@@ -542,8 +542,6 @@
 ./usr/include/dev/pci/gcu_var.h
 ./usr/include/dev/pci/glxreg.h
 ./usr/include/dev/pci/glxvar.h
-./usr/include/dev/pci/hifn7751reg.h
-./usr/include/dev/pci/hifn7751var.h
 ./usr/include/dev/pci/i82365_pcivar.h
 ./usr/include/dev/pci/ichreg.h
 ./usr/include/dev/pci/if_agereg.h
@@ -645,13 +643,9 @@
 ./usr/include/dev/pci/ppbreg.h
 ./usr/include/dev/pci/pucvar.h
 ./usr/include/dev/pci/qlereg.h
-./usr/include/dev/pci/safereg.h
-./usr/include/dev/pci/safevar.h
 ./usr/include/dev/pci/siop_pci_common.h
 ./usr/include/dev/pci/tgareg.h
 ./usr/include/dev/pci/tgavar.h
-./usr/include/dev/pci/ubsecreg.h
-./usr/include/dev/pci/ubsecvar.h
 ./usr/include/dev/pci/vga_pcivar.h
 ./usr/include/dev/pci/virtio_pcireg.h
 ./usr/include/dev/pci/ydsreg.h
@@ -1755,6 +1749,7 @@
 ./usr/share/man/man3/ASN1_get_object.3
 ./usr/share/man/man3/ASN1_item_d2i.3
 ./usr/share/man/man3/ASN1_item_new.3
+./usr/share/man/man3/ASN1_mbstring_copy.3
 ./usr/share/man/man3/ASN1_parse_dump.3
 ./usr/share/man/man3/ASN1_put_object.3
 ./usr/share/man/man3/ASN1_time_parse.3
@@ -1901,6 +1896,7 @@
 ./usr/share/man/man3/EVP_OpenInit.3
 ./usr/share/man/man3/EVP_PKEY_CTX_ctrl.3
 ./usr/share/man/man3/EVP_PKEY_CTX_new.3
+./usr/share/man/man3/EVP_PKEY_add1_attr.3
 ./usr/share/man/man3/EVP_PKEY_asn1_get_count.3
 ./usr/share/man/man3/EVP_PKEY_asn1_new.3
 ./usr/share/man/man3/EVP_PKEY_cmp.3
@@ -2040,6 +2036,7 @@
 ./usr/share/man/man3/SSL_CTX_set_default_passwd_cb.3
 ./usr/share/man/man3/SSL_CTX_set_generate_session_id.3
 ./usr/share/man/man3/SSL_CTX_set_info_callback.3
+./usr/share/man/man3/SSL_CTX_set_keylog_callback.3
 ./usr/share/man/man3/SSL_CTX_set_max_cert_list.3
 ./usr/share/man/man3/SSL_CTX_set_min_proto_version.3
 ./usr/share/man/man3/SSL_CTX_set_mode.3
@@ -2141,7 +2138,9 @@
 ./usr/share/man/man3/X509V3_extensions_print.3
 ./usr/share/man/man3/X509V3_get_d2i.3
 ./usr/share/man/man3/X509_ALGOR_dup.3
+./usr/share/man/man3/X509_ATTRIBUTE_get0_object.3
 ./usr/share/man/man3/X509_ATTRIBUTE_new.3
+./usr/share/man/man3/X509_ATTRIBUTE_set1_object.3
 ./usr/share/man/man3/X509_CINF_new.3
 ./usr/share/man/man3/X509_CRL_get0_by_serial.3
 ./usr/share/man/man3/X509_CRL_new.3
@@ -2157,6 +2156,7 @@
 ./usr/share/man/man3/X509_NAME_new.3
 ./usr/share/man/man3/X509_NAME_print_ex.3
 ./usr/share/man/man3/X509_OBJECT_get0_X509.3
+./usr/share/man/man3/X509_PKEY_new.3
 ./usr/share/man/man3/X509_PUBKEY_new.3
 ./usr/share/man/man3/X509_PURPOSE_set.3
 ./usr/share/man/man3/X509_REQ_new.3
@@ -2173,6 +2173,7 @@
 ./usr/share/man/man3/X509_STORE_set1_param.3
 ./usr/share/man/man3/X509_STORE_set_verify_cb_func.3
 ./usr/share/man/man3/X509_TRUST_set.3
+./usr/share/man/man3/X509_VERIFY_PARAM_new.3
 ./usr/share/man/man3/X509_VERIFY_PARAM_set_flags.3
 ./usr/share/man/man3/X509_add1_trust_object.3
 ./usr/share/man/man3/X509_check_ca.3
@@ -2189,6 +2190,7 @@
 ./usr/share/man/man3/X509_get0_signature.3
 ./usr/share/man/man3/X509_get1_email.3
 ./usr/share/man/man3/X509_get_pubkey.3
+./usr/share/man/man3/X509_get_pubkey_parameters.3
 ./usr/share/man/man3/X509_get_serialNumber.3
 ./usr/share/man/man3/X509_get_subject_name.3
 ./usr/share/man/man3/X509_get_version.3
@@ -2201,6 +2203,8 @@
 ./usr/share/man/man3/X509_sign.3
 ./usr/share/man/man3/X509_signature_dump.3
 ./usr/share/man/man3/X509_verify_cert.3
+./usr/share/man/man3/X509at_add1_attr.3
+./usr/share/man/man3/X509at_get_attr.3
 ./usr/share/man/man3/X509v3_get_ext_by_NID.3
 ./usr/share/man/man3/__tfork_thread.3
 ./usr/share/man/man3/a64l.3

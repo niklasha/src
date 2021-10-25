@@ -1,4 +1,4 @@
-/* $OpenBSD: x509v3.h,v 1.5 2021/09/02 13:48:39 job Exp $ */
+/* $OpenBSD: x509v3.h,v 1.9 2021/10/23 17:43:06 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 1999.
  */
@@ -206,8 +206,6 @@ union {
 } d;
 } GENERAL_NAME;
 
-typedef STACK_OF(GENERAL_NAME) GENERAL_NAMES;
-
 typedef struct ACCESS_DESCRIPTION_st {
 	ASN1_OBJECT *method;
 	GENERAL_NAME *location;
@@ -218,6 +216,9 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
 typedef STACK_OF(ASN1_OBJECT) EXTENDED_KEY_USAGE;
 
 DECLARE_STACK_OF(GENERAL_NAME)
+
+typedef STACK_OF(GENERAL_NAME) GENERAL_NAMES;
+DECLARE_STACK_OF(GENERAL_NAMES)
 
 DECLARE_STACK_OF(ACCESS_DESCRIPTION)
 
@@ -446,7 +447,7 @@ struct ISSUING_DIST_POINT_st
 #define NS_OBJSIGN_CA		0x01
 #define NS_ANY_CA		(NS_SSL_CA|NS_SMIME_CA|NS_OBJSIGN_CA)
 
-#define XKU_SSL_SERVER		0x1	
+#define XKU_SSL_SERVER		0x1
 #define XKU_SSL_CLIENT		0x2
 #define XKU_SMIME		0x4
 #define XKU_CODE_SIGN		0x8
@@ -454,6 +455,7 @@ struct ISSUING_DIST_POINT_st
 #define XKU_OCSP_SIGN		0x20
 #define XKU_TIMESTAMP		0x40
 #define XKU_DVCS		0x80
+#define XKU_ANYEKU		0x100
 
 #define X509_PURPOSE_DYNAMIC	0x1
 #define X509_PURPOSE_DYNAMIC_NAME	0x2
@@ -798,6 +800,11 @@ char *X509_PURPOSE_get0_sname(const X509_PURPOSE *xp);
 int X509_PURPOSE_get_trust(const X509_PURPOSE *xp);
 void X509_PURPOSE_cleanup(void);
 int X509_PURPOSE_get_id(const X509_PURPOSE *);
+#if defined(LIBRESSL_NEW_API)
+uint32_t X509_get_extension_flags(X509 *x);
+uint32_t X509_get_key_usage(X509 *x);
+uint32_t X509_get_extended_key_usage(X509 *x);
+#endif
 
 STACK_OF(OPENSSL_STRING) *X509_get1_email(X509 *x);
 STACK_OF(OPENSSL_STRING) *X509_REQ_get1_email(X509_REQ *x);

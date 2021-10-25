@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_ipip.c,v 1.94 2021/10/05 11:45:26 bluhm Exp $ */
+/*	$OpenBSD: ip_ipip.c,v 1.97 2021/10/23 22:19:37 bluhm Exp $ */
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr) and
@@ -331,9 +331,9 @@ ipip_input_if(struct mbuf **mp, int *offp, int proto, int oaf,
 }
 
 int
-ipip_output(struct mbuf *m, struct tdb *tdb, struct mbuf **mp, int dummy,
-    int dummy2)
+ipip_output(struct mbuf **mp, struct tdb *tdb)
 {
+	struct mbuf *m = *mp;
 	u_int8_t tp, otos, itos;
 	u_int64_t obytes;
 	struct ip *ipo;
@@ -366,13 +366,14 @@ ipip_output(struct mbuf *m, struct tdb *tdb, struct mbuf **mp, int dummy,
 			goto drop;
 		}
 
-		M_PREPEND(m, sizeof(struct ip), M_DONTWAIT);
-		if (m == NULL) {
+		M_PREPEND(*mp, sizeof(struct ip), M_DONTWAIT);
+		if (*mp == NULL) {
 			DPRINTF("M_PREPEND failed");
 			ipipstat_inc(ipips_hdrops);
 			error = ENOBUFS;
 			goto drop;
 		}
+		m = *mp;
 
 		ipo = mtod(m, struct ip *);
 
@@ -464,13 +465,14 @@ ipip_output(struct mbuf *m, struct tdb *tdb, struct mbuf **mp, int dummy,
 				ip6->ip6_dst.s6_addr16[1] = 0;
 		}
 
-		M_PREPEND(m, sizeof(struct ip6_hdr), M_DONTWAIT);
-		if (m == NULL) {
+		M_PREPEND(*mp, sizeof(struct ip6_hdr), M_DONTWAIT);
+		if (*mp == NULL) {
 			DPRINTF("M_PREPEND failed");
 			ipipstat_inc(ipips_hdrops);
 			error = ENOBUFS;
 			goto drop;
 		}
+		m = *mp;
 
 		/* Initialize IPv6 header */
 		ip6o = mtod(m, struct ip6_hdr *);
@@ -522,17 +524,15 @@ ipip_output(struct mbuf *m, struct tdb *tdb, struct mbuf **mp, int dummy,
 		DPRINTF("unsupported protocol family %d",
 		    tdb->tdb_dst.sa.sa_family);
 		ipipstat_inc(ipips_family);
-		error = EAFNOSUPPORT;
+		error = EPFNOSUPPORT;
 		goto drop;
 	}
 
-	*mp = m;
 	ipipstat_pkt(ipips_opackets, ipips_obytes, obytes);
 	return 0;
 
  drop:
-	m_freem(m);
-	*mp = NULL;
+	m_freemp(mp);
 	return error;
 }
 
@@ -557,11 +557,11 @@ ipe4_zeroize(struct tdb *tdbp)
 }
 
 int
-ipe4_input(struct mbuf *m, struct tdb *tdb, int hlen, int proto)
+ipe4_input(struct mbuf **mp, struct tdb *tdb, int hlen, int proto)
 {
 	/* This is a rather serious mistake, so no conditional printing. */
 	printf("%s: should never be called\n", __func__);
-	m_freem(m);
+	m_freemp(mp);
 	return EINVAL;
 }
 #endif	/* IPSEC */

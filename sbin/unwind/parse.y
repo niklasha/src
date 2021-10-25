@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.27 2021/08/31 20:18:03 kn Exp $	*/
+/*	$OpenBSD: parse.y,v 1.29 2021/10/22 15:03:28 florian Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -557,10 +557,10 @@ findeol(void)
 int
 yylex(void)
 {
-	unsigned char	 buf[8096];
-	unsigned char	*p, *val;
-	int		 quotec, next, c;
-	int		 token;
+	char	 buf[8096];
+	char	*p, *val;
+	int	 quotec, next, c;
+	int	 token;
 
 top:
 	p = buf;
@@ -596,7 +596,7 @@ top:
 		p = val + strlen(val) - 1;
 		lungetc(DONE_EXPAND);
 		while (p >= val) {
-			lungetc(*p);
+			lungetc((unsigned char)*p);
 			p--;
 		}
 		lungetc(START_EXPAND);
@@ -672,8 +672,8 @@ top:
 		} else {
 nodigits:
 			while (p > buf + 1)
-				lungetc(*--p);
-			c = *--p;
+				lungetc((unsigned char)*--p);
+			c = (unsigned char)*--p;
 			if (c == '-')
 				return (c);
 		}
@@ -788,9 +788,24 @@ popfile(void)
 struct uw_conf *
 parse_config(char *filename)
 {
-	struct sym	*sym, *next;
+	static enum uw_resolver_type	 default_res_pref[] = {
+	    UW_RES_DOT,
+	    UW_RES_ODOT_FORWARDER,
+	    UW_RES_FORWARDER,
+	    UW_RES_RECURSOR,
+	    UW_RES_ODOT_AUTOCONF,
+	    UW_RES_AUTOCONF,
+	    UW_RES_ASR};
+	struct sym			*sym, *next;
+	int				 i;
 
 	conf = config_new_empty();
+
+	memcpy(&conf->res_pref.types, &default_res_pref,
+	    sizeof(default_res_pref));
+	conf->res_pref.len = nitems(default_res_pref);
+	for (i = 0; i < conf->res_pref.len; i++)
+		conf->enabled_resolvers[conf->res_pref.types[i]] = 1;
 
 	file = pushfile(filename != NULL ? filename : _PATH_CONF_FILE, 0);
 	if (file == NULL) {

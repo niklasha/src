@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_purp.c,v 1.7 2021/09/13 15:26:53 claudio Exp $ */
+/* $OpenBSD: x509_purp.c,v 1.10 2021/10/23 11:53:24 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 2001.
  */
@@ -549,6 +549,10 @@ x509v3_cache_extensions(X509 *x)
 			case NID_dvcs:
 				x->ex_xkusage |= XKU_DVCS;
 				break;
+
+			case NID_anyExtendedKeyUsage:
+				x->ex_xkusage |= XKU_ANYEKU;
+				break;
 			}
 		}
 		sk_ASN1_OBJECT_pop_free(extusage, ASN1_OBJECT_free);
@@ -937,4 +941,40 @@ X509_check_akid(X509 *issuer, AUTHORITY_KEYID *akid)
 			return X509_V_ERR_AKID_ISSUER_SERIAL_MISMATCH;
 	}
 	return X509_V_OK;
+}
+
+uint32_t
+X509_get_extension_flags(X509 *x)
+{
+	/* Call for side-effect of computing hash and caching extensions */
+	if (X509_check_purpose(x, -1, -1) != 1)
+		return 0;
+
+	return x->ex_flags;
+}
+
+uint32_t
+X509_get_key_usage(X509 *x)
+{
+	/* Call for side-effect of computing hash and caching extensions */
+	if (X509_check_purpose(x, -1, -1) != 1)
+		return 0;
+
+	if (x->ex_flags & EXFLAG_KUSAGE)
+		return x->ex_kusage;
+
+	return UINT32_MAX;
+}
+
+uint32_t
+X509_get_extended_key_usage(X509 *x)
+{
+	/* Call for side-effect of computing hash and caching extensions */
+	if (X509_check_purpose(x, -1, -1) != 1)
+		return 0;
+
+	if (x->ex_flags & EXFLAG_XKUSAGE)
+		return x->ex_xkusage;
+
+	return UINT32_MAX;
 }

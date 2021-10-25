@@ -1,4 +1,4 @@
-/*	$OpenBSD: ipsec_output.c,v 1.87 2021/10/05 11:45:26 bluhm Exp $ */
+/*	$OpenBSD: ipsec_output.c,v 1.91 2021/10/23 15:42:35 tobhe Exp $ */
 /*
  * The author of this code is Angelos D. Keromytis (angelos@cis.upenn.edu)
  *
@@ -73,7 +73,6 @@ int
 ipsp_process_packet(struct mbuf *m, struct tdb *tdb, int af, int tunalready)
 {
 	int hlen, off, error;
-	struct mbuf *mp;
 #ifdef INET6
 	struct ip6_ext ip6e;
 	int nxt;
@@ -131,7 +130,7 @@ ipsp_process_packet(struct mbuf *m, struct tdb *tdb, int af, int tunalready)
 		    ipsp_address(&tdb->tdb_dst, buf, sizeof(buf)),
 		    ntohl(tdb->tdb_spi), tdb->tdb_sproto,
 		    tdb->tdb_dst.sa.sa_family);
-		error = ENXIO;
+		error = EPFNOSUPPORT;
 		goto drop;
 	}
 
@@ -242,12 +241,10 @@ ipsp_process_packet(struct mbuf *m, struct tdb *tdb, int af, int tunalready)
 			}
 #endif /* INET6 */
 
-			/* Encapsulate -- the last two arguments are unused. */
-			error = ipip_output(m, tdb, &mp, 0, 0);
-			if ((mp == NULL) && (!error))
+			/* Encapsulate -- m may be changed or set to NULL. */
+			error = ipip_output(&m, tdb);
+			if ((m == NULL) && (!error))
 				error = EFAULT;
-			m = mp;
-			mp = NULL;
 			if (error)
 				goto drop;
 
@@ -266,18 +263,14 @@ ipsp_process_packet(struct mbuf *m, struct tdb *tdb, int af, int tunalready)
 			/* Remember that we appended a tunnel header. */
 			tdb->tdb_flags |= TDBF_USEDTUNNEL;
 		}
-
-		/* We may be done with this TDB */
-		if (tdb->tdb_xform->xf_type == XF_IP4)
-			return ipsp_process_done(m, tdb);
-	} else {
-		/*
-		 * If this is just an IP-IP TDB and we're told there's
-		 * already an encapsulation header, move on.
-		 */
-		if (tdb->tdb_xform->xf_type == XF_IP4)
-			return ipsp_process_done(m, tdb);
 	}
+
+	/*
+	 * If this is just an IP-IP TDB and we're told there's already an
+	 * encapsulation header or ipip_output() has encapsulted it, move on.
+	 */
+	if (tdb->tdb_xform->xf_type == XF_IP4)
+		return ipsp_process_done(m, tdb);
 
 	/* Extract some information off the headers. */
 	switch (tdb->tdb_dst.sa.sa_family) {
@@ -355,7 +348,7 @@ ipsp_process_packet(struct mbuf *m, struct tdb *tdb, int af, int tunalready)
 		break;
 #endif /* INET6 */
 	default:
-		error = EINVAL;
+		error = EPFNOSUPPORT;
 		goto drop;
 	}
 
@@ -377,91 +370,11 @@ ipsp_process_packet(struct mbuf *m, struct tdb *tdb, int af, int tunalready)
 	}
 
 	/* Invoke the IPsec transform. */
-	return (*(tdb->tdb_xform->xf_output))(m, tdb, NULL, hlen, off);
+	return (*(tdb->tdb_xform->xf_output))(m, tdb, hlen, off);
 
  drop:
 	m_freem(m);
 	return error;
-}
-
-/*
- * IPsec output callback, called directly by the crypto driver.
- */
-void
-ipsec_output_cb(struct cryptop *crp)
-{
-	struct tdb_crypto *tc = (struct tdb_crypto *) crp->crp_opaque;
-	struct mbuf *m = (struct mbuf *) crp->crp_buf;
-	struct tdb *tdb = NULL;
-	int error, ilen, olen;
-
-	NET_ASSERT_LOCKED();
-
-	if (m == NULL) {
-		DPRINTF("bogus returned buffer from crypto");
-		ipsecstat_inc(ipsec_crypto);
-		goto drop;
-	}
-
-	tdb = gettdb(tc->tc_rdomain, tc->tc_spi, &tc->tc_dst, tc->tc_proto);
-	if (tdb == NULL) {
-		DPRINTF("TDB is expired while in crypto");
-		ipsecstat_inc(ipsec_notdb);
-		goto drop;
-	}
-
-	/* Check for crypto errors. */
-	if (crp->crp_etype) {
-		if (crp->crp_etype == EAGAIN) {
-			/* Reset the session ID */
-			if (tdb->tdb_cryptoid != 0)
-				tdb->tdb_cryptoid = crp->crp_sid;
-			error = crypto_dispatch(crp);
-			if (error) {
-				DPRINTF("crypto dispatch error %d", error);
-				goto drop;
-			}
-			return;
-		}
-		DPRINTF("crypto error %d", crp->crp_etype);
-		ipsecstat_inc(ipsec_noxform);
-		goto drop;
-	}
-
-	olen = crp->crp_olen;
-	ilen = crp->crp_ilen;
-
-	/* Release crypto descriptors. */
-	crypto_freereq(crp);
-
-	switch (tdb->tdb_sproto) {
-	case IPPROTO_ESP:
-		error = esp_output_cb(tdb, tc, m, ilen, olen);
-		break;
-	case IPPROTO_AH:
-		error = ah_output_cb(tdb, tc, m, ilen, olen);
-		break;
-	case IPPROTO_IPCOMP:
-		error = ipcomp_output_cb(tdb, tc, m, ilen, olen);
-		break;
-	default:
-		panic("%s: unknown/unsupported security protocol %d",
-		    __func__, tdb->tdb_sproto);
-	}
-
-	if (error) {
-		ipsecstat_inc(ipsec_odrops);
-		tdb->tdb_odrops++;
-	}
-	return;
-
- drop:
-	if (tdb != NULL)
-		tdb->tdb_odrops++;
-	m_freem(m);
-	free(tc, M_XDATA, 0);
-	crypto_freereq(crp);
-	ipsecstat_inc(ipsec_odrops);
 }
 
 /*
@@ -505,7 +418,7 @@ ipsp_process_done(struct mbuf *m, struct tdb *tdb)
 		default:
 			DPRINTF("unknown protocol family (%d)",
 			    tdb->tdb_dst.sa.sa_family);
-			error = ENXIO;
+			error = EPFNOSUPPORT;
 			goto drop;
 		}
 
@@ -559,7 +472,7 @@ ipsp_process_done(struct mbuf *m, struct tdb *tdb)
 	default:
 		DPRINTF("unknown protocol family (%d)",
 		    tdb->tdb_dst.sa.sa_family);
-		error = ENXIO;
+		error = EPFNOSUPPORT;
 		goto drop;
 	}
 
@@ -607,18 +520,22 @@ ipsp_process_done(struct mbuf *m, struct tdb *tdb)
 	 */
 	switch (tdb->tdb_dst.sa.sa_family) {
 	case AF_INET:
-		return (ip_output(m, NULL, NULL, IP_RAWOUTPUT, NULL, NULL, 0));
-
+		error = ip_output(m, NULL, NULL, IP_RAWOUTPUT, NULL, NULL, 0);
+		break;
 #ifdef INET6
 	case AF_INET6:
 		/*
 		 * We don't need massage, IPv6 header fields are always in
 		 * net endian.
 		 */
-		return (ip6_output(m, NULL, NULL, 0, NULL, NULL));
+		error = ip6_output(m, NULL, NULL, 0, NULL, NULL);
+		break;
 #endif /* INET6 */
+	default:
+		error = EPFNOSUPPORT;
+		break;
 	}
-	error = EINVAL; /* Not reached. */
+	return error;
 
  drop:
 	m_freem(m);

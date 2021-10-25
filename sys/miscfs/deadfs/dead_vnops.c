@@ -1,4 +1,4 @@
-/*	$OpenBSD: dead_vnops.c,v 1.36 2021/10/02 08:51:41 semarie Exp $	*/
+/*	$OpenBSD: dead_vnops.c,v 1.38 2021/10/19 06:09:39 semarie Exp $	*/
 /*	$NetBSD: dead_vnops.c,v 1.16 1996/02/13 13:12:48 mycroft Exp $	*/
 
 /*
@@ -89,11 +89,11 @@ const struct vops dead_vops = {
 	.vop_inactive	= dead_inactive,
 	.vop_reclaim	= nullop,
 	.vop_lock	= dead_lock,
-	.vop_unlock	= vop_generic_unlock,
+	.vop_unlock	= nullop,
+	.vop_islocked	= nullop,
 	.vop_bmap	= dead_bmap,
 	.vop_strategy	= dead_strategy,
 	.vop_print	= dead_print,
-	.vop_islocked	= vop_generic_islocked,
 	.vop_pathconf	= dead_ebadf,
 	.vop_advlock	= dead_ebadf,
 	.vop_bwrite	= nullop,
@@ -227,7 +227,7 @@ dead_lock(void *v)
 	if (ap->a_flags & LK_DRAIN || !chkvnlock(vp))
 		return (0);
 
-	return ((vp->v_op->vop_lock)(ap));
+	return VOP_LOCK(vp, ap->a_flags);
 }
 
 /*

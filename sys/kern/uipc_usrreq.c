@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_usrreq.c,v 1.148 2021/05/25 22:45:09 bluhm Exp $	*/
+/*	$OpenBSD: uipc_usrreq.c,v 1.151 2021/10/23 20:44:42 mvs Exp $	*/
 /*	$NetBSD: uipc_usrreq.c,v 1.18 1996/02/09 19:00:50 christos Exp $	*/
 
 /*
@@ -219,8 +219,13 @@ uipc_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 		break;
 
 	case PRU_SEND:
-		if (control && (error = unp_internalize(control, p)))
-			break;
+		if (control) {
+			sounlock(so, SL_LOCKED);
+			error = unp_internalize(control, p);
+			solock(so);
+			if (error)
+				break;
+		}
 		switch (so->so_type) {
 
 		case SOCK_DGRAM: {
@@ -655,7 +660,7 @@ unp_connect(struct socket *so, struct mbuf *nam, struct proc *p)
 	}
 	if (so->so_proto->pr_flags & PR_CONNREQUIRED) {
 		if ((so2->so_options & SO_ACCEPTCONN) == 0 ||
-		    (so3 = sonewconn(so2, 0)) == 0) {
+		    (so3 = sonewconn(so2, 0)) == NULL) {
 			error = ECONNREFUSED;
 			goto put_locked;
 		}
@@ -817,8 +822,6 @@ unp_externalize(struct mbuf *rights, socklen_t controllen, int flags)
 	struct file *fp;
 	int nfds, error = 0;
 
-	rw_assert_wrlock(&unp_lock);
-
 	/*
 	 * This code only works because SCM_RIGHTS is the only supported
 	 * control message type on unix sockets. Enforce this here.
@@ -834,7 +837,7 @@ unp_externalize(struct mbuf *rights, socklen_t controllen, int flags)
 		controllen -= CMSG_ALIGN(sizeof(struct cmsghdr));
 	if (nfds > controllen / sizeof(int)) {
 		error = EMSGSIZE;
-		goto restart;
+		goto out;
 	}
 
 	/* Make sure the recipient should be able to see the descriptors.. */
@@ -868,18 +871,13 @@ unp_externalize(struct mbuf *rights, socklen_t controllen, int flags)
 
 	KERNEL_UNLOCK();
 
+	if (error)
+		goto out;
+
 	fds = mallocarray(nfds, sizeof(int), M_TEMP, M_WAITOK);
 
-restart:
 	fdplock(fdp);
-	if (error != 0) {
-		if (nfds > 0) {
-			rp = ((struct fdpass *)CMSG_DATA(cm));
-			unp_discard(rp, nfds);
-		}
-		goto out;
-	}
-
+restart:
 	/*
 	 * First loop -- allocate file descriptor table slots for the
 	 * new descriptors.
@@ -895,17 +893,19 @@ restart:
 
 			if (error == ENOSPC) {
 				fdexpand(p);
-				error = 0;
-			} else {
-				/*
-				 * This is the error that has historically
-				 * been returned, and some callers may
-				 * expect it.
-				 */
-				error = EMSGSIZE;
+				goto restart;
 			}
+
 			fdpunlock(fdp);
-			goto restart;
+
+			/*
+			 * This is the error that has historically
+			 * been returned, and some callers may
+			 * expect it.
+			 */
+
+			error = EMSGSIZE;
+			goto out;
 		}
 
 		/*
@@ -924,12 +924,15 @@ restart:
 
 		rp++;
 	}
+	fdpunlock(fdp);
 
 	/*
 	 * Now that adding them has succeeded, update all of the
 	 * descriptor passing state.
 	 */
 	rp = (struct fdpass *)CMSG_DATA(cm);
+
+	rw_enter_write(&unp_lock);
 	for (i = 0; i < nfds; i++) {
 		struct unpcb *unp;
 
@@ -939,6 +942,7 @@ restart:
 			unp->unp_msgcount--;
 		unp_rights--;
 	}
+	rw_exit_write(&unp_lock);
 
 	/*
 	 * Copy temporary array to message and adjust length, in case of
@@ -948,9 +952,18 @@ restart:
 	cm->cmsg_len = CMSG_LEN(nfds * sizeof(int));
 	rights->m_len = CMSG_LEN(nfds * sizeof(int));
  out:
-	fdpunlock(fdp);
 	if (fds != NULL)
 		free(fds, M_TEMP, nfds * sizeof(int));
+
+	if (error) {
+		if (nfds > 0) {
+			rp = ((struct fdpass *)CMSG_DATA(cm));
+			rw_enter_write(&unp_lock);
+			unp_discard(rp, nfds);
+			rw_exit_write(&unp_lock);
+		}
+	}
+
 	return (error);
 }
 
@@ -965,8 +978,6 @@ unp_internalize(struct mbuf *control, struct proc *p)
 	int i, error;
 	int nfds, *ip, fd, neededspace;
 
-	rw_assert_wrlock(&unp_lock);
-
 	/*
 	 * Check for two potential msg_controllen values because
 	 * IETF stuck their nose in a place it does not belong.
@@ -979,8 +990,13 @@ unp_internalize(struct mbuf *control, struct proc *p)
 		return (EINVAL);
 	nfds = (cm->cmsg_len - CMSG_ALIGN(sizeof(*cm))) / sizeof (int);
 
-	if (unp_rights + nfds > maxfiles / 10)
+	rw_enter_write(&unp_lock);
+	if (unp_rights + nfds > maxfiles / 10) {
+		rw_exit_write(&unp_lock);
 		return (EMFILE);
+	}
+	unp_rights += nfds;
+	rw_exit_write(&unp_lock);
 
 	/* Make sure we have room for the struct file pointers */
 morespace:
@@ -989,8 +1005,10 @@ morespace:
 	if (neededspace > m_trailingspace(control)) {
 		char *tmp;
 		/* if we already have a cluster, the message is just too big */
-		if (control->m_flags & M_EXT)
-			return (E2BIG);
+		if (control->m_flags & M_EXT) {
+			error = E2BIG;
+			goto nospace;
+		}
 
 		/* copy cmsg data temporarily out of the mbuf */
 		tmp = malloc(control->m_len, M_TEMP, M_WAITOK);
@@ -1000,7 +1018,8 @@ morespace:
 		MCLGET(control, M_WAIT);
 		if ((control->m_flags & M_EXT) == 0) {
 			free(tmp, M_TEMP, control->m_len);
-			return (ENOBUFS);       /* allocation failed */
+			error = ENOBUFS;       /* allocation failed */
+			goto nospace;
 		}
 
 		/* copy the data back into the cluster */
@@ -1017,6 +1036,7 @@ morespace:
 	ip = ((int *)CMSG_DATA(cm)) + nfds - 1;
 	rp = ((struct fdpass *)CMSG_DATA(cm)) + nfds - 1;
 	fdplock(fdp);
+	rw_enter_write(&unp_lock);
 	for (i = 0; i < nfds; i++) {
 		memcpy(&fd, ip, sizeof fd);
 		ip--;
@@ -1044,11 +1064,12 @@ morespace:
 			unp->unp_file = fp;
 			unp->unp_msgcount++;
 		}
-		unp_rights++;
 	}
+	rw_exit_write(&unp_lock);
 	fdpunlock(fdp);
 	return (0);
 fail:
+	rw_exit_write(&unp_lock);
 	fdpunlock(fdp);
 	if (fp != NULL)
 		FRELE(fp, p);
@@ -1056,11 +1077,17 @@ fail:
 	for ( ; i > 0; i--) {
 		rp++;
 		fp = rp->fp;
+		rw_enter_write(&unp_lock);
 		if ((unp = fptounp(fp)) != NULL)
 			unp->unp_msgcount--;
+		rw_exit_write(&unp_lock);
 		FRELE(fp, p);
-		unp_rights--;
 	}
+
+nospace:
+	rw_enter_write(&unp_lock);
+	unp_rights -= nfds;
+	rw_exit_write(&unp_lock);
 
 	return (error);
 }

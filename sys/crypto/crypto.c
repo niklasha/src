@@ -1,4 +1,4 @@
-/*	$OpenBSD: crypto.c,v 1.85 2021/07/26 21:27:56 bluhm Exp $	*/
+/*	$OpenBSD: crypto.c,v 1.92 2021/10/24 14:50:42 tobhe Exp $	*/
 /*
  * The author of this code is Angelos D. Keromytis (angelos@cis.upenn.edu)
  *
@@ -39,11 +39,6 @@ struct cryptocap *crypto_drivers;	/* [A] array allocated by driver
 int crypto_drivers_num = 0;		/* [A] attached drivers array size */
 
 struct pool cryptop_pool;		/* [I] set of crypto descriptors */
-
-struct taskq *crypto_taskq;		/* [I] run crypto_invoke() and callback
-					       with kernel lock */
-struct taskq *crypto_taskq_mpsafe;	/* [I] run crypto_invoke()
-					       without kernel lock */
 
 /*
  * Create a new session.
@@ -382,43 +377,6 @@ crypto_unregister(u_int32_t driverid, int alg)
 }
 
 /*
- * Add crypto request to a queue, to be processed by a kernel thread.
- */
-int
-crypto_dispatch(struct cryptop *crp)
-{
-	int error = 0, lock = 1, s;
-	u_int32_t hid;
-
-	s = splvm();
-	hid = (crp->crp_sid >> 32) & 0xffffffff;
-	if (hid < crypto_drivers_num) {
-		if (crypto_drivers[hid].cc_flags & CRYPTOCAP_F_MPSAFE)
-			lock = 0;
-	}
-	splx(s);
-
-	/* XXXSMP crypto_invoke() is not MP safe */
-	lock = 1;
-
-	if (crp->crp_flags & CRYPTO_F_NOQUEUE) {
-		if (lock)
-			KERNEL_LOCK();
-		error = crypto_invoke(crp);
-		if (lock)
-			KERNEL_UNLOCK();
-	} else {
-		struct taskq *tq;
-
-		tq = lock ? crypto_taskq : crypto_taskq_mpsafe;
-		task_set(&crp->crp_task, (void (*))crypto_invoke, crp);
-		task_add(tq, &crp->crp_task);
-	}
-
-	return error;
-}
-
-/*
  * Dispatch a crypto request to the appropriate crypto devices.
  */
 int
@@ -430,17 +388,14 @@ crypto_invoke(struct cryptop *crp)
 	int s, i;
 
 	/* Sanity checks. */
-	if (crp == NULL || crp->crp_callback == NULL)
-		return EINVAL;
+	KASSERT(crp != NULL);
 
 	KERNEL_ASSERT_LOCKED();
 
 	s = splvm();
 	if (crp->crp_ndesc < 1 || crypto_drivers == NULL) {
-		crp->crp_etype = EINVAL;
-		crypto_done(crp);
-		splx(s);
-		return 0;
+		error = EINVAL;
+		goto done;
 	}
 
 	hid = (crp->crp_sid >> 32) & 0xffffffff;
@@ -459,18 +414,14 @@ crypto_invoke(struct cryptop *crp)
 	crypto_drivers[hid].cc_bytes += crp->crp_ilen;
 
 	error = crypto_drivers[hid].cc_process(crp);
-	if (error) {
-		if (error == ERESTART) {
-			/* Unregister driver and migrate session. */
-			crypto_unregister(hid, CRYPTO_ALGORITHM_MAX + 1);
-			goto migrate;
-		} else {
-			crp->crp_etype = error;
-		}
+	if (error == ERESTART) {
+		/* Unregister driver and migrate session. */
+		crypto_unregister(hid, CRYPTO_ALGORITHM_MAX + 1);
+		goto migrate;
 	}
 
 	splx(s);
-	return 0;
+	return error;
 
  migrate:
 	/* Migrate session. */
@@ -481,10 +432,10 @@ crypto_invoke(struct cryptop *crp)
 	if (crypto_newsession(&nid, &(crp->crp_desc->CRD_INI), 0) == 0)
 		crp->crp_sid = nid;
 
-	crp->crp_etype = EAGAIN;
-	crypto_done(crp);
+	error = EAGAIN;
+ done:
 	splx(s);
-	return 0;
+	return error;
 }
 
 /*
@@ -532,30 +483,6 @@ crypto_getreq(int num)
 void
 crypto_init(void)
 {
-	crypto_taskq = taskq_create("crypto", 1, IPL_VM, 0);
-	crypto_taskq_mpsafe = taskq_create("crynlk", 1, IPL_VM, TASKQ_MPSAFE);
-
 	pool_init(&cryptop_pool, sizeof(struct cryptop), 0, IPL_VM, 0,
 	    "cryptop", NULL);
-}
-
-/*
- * Invoke the callback on behalf of the driver.
- */
-void
-crypto_done(struct cryptop *crp)
-{
-	crp->crp_flags |= CRYPTO_F_DONE;
-
-	if (crp->crp_flags & CRYPTO_F_NOQUEUE) {
-		/* not from the crypto queue, wakeup the userland process */
-		crp->crp_callback(crp);
-	} else {
-		struct taskq *tq;
-
-		tq = (crp->crp_flags & CRYPTO_F_MPSAFE) ?
-		    crypto_taskq_mpsafe : crypto_taskq;
-		task_set(&crp->crp_task, (void (*))crp->crp_callback, crp);
-		task_add(tq, &crp->crp_task);
-	}
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: part.c,v 1.108 2021/10/10 15:34:21 krw Exp $	*/
+/*	$OpenBSD: part.c,v 1.110 2021/10/18 20:27:32 krw Exp $	*/
 
 /*
  * Copyright (c) 1997 Tobias Weingartner
@@ -274,34 +274,19 @@ PRT_parse(const struct dos_partition *dp, const uint64_t lba_self,
 	uint32_t		t;
 
 	prt->prt_flag = dp->dp_flag;
-	prt->prt_shead = dp->dp_shd;
-
-	prt->prt_ssect = (dp->dp_ssect) & 0x3F;
-	prt->prt_scyl = ((dp->dp_ssect << 2) & 0xFF00) | dp->dp_scyl;
-
 	prt->prt_id = dp->dp_typ;
-	prt->prt_ehead = dp->dp_ehd;
-	prt->prt_esect = (dp->dp_esect) & 0x3F;
-	prt->prt_ecyl = ((dp->dp_esect << 2) & 0xFF00) | dp->dp_ecyl;
 
 	if ((prt->prt_id == DOSPTYP_EXTEND) || (prt->prt_id == DOSPTYP_EXTENDL))
 		off = lba_firstembr;
 	else
 		off = lba_self;
 
-#if 0 /* XXX */
-	prt->prt_bs = letoh32(dp->dp_start) + off;
-	prt->prt_ns = letoh32(dp->dp_size);
-	if (prt->prt_id == DOSPTYP_EFI && partn == UINT32_MAX)
-		prt->prt_ns = DL_GETDSIZE(&dl) - prt->prt_bs;
-#else
 	memcpy(&t, &dp->dp_start, sizeof(uint32_t));
 	prt->prt_bs = letoh32(t) + off;
 	memcpy(&t, &dp->dp_size, sizeof(uint32_t));
 	prt->prt_ns = letoh32(t);
 	if (prt->prt_id == DOSPTYP_EFI && prt->prt_ns == UINT32_MAX)
 		prt->prt_ns = DL_GETDSIZE(&dl) - prt->prt_bs;
-#endif
 
 	PRT_fix_CHS(prt);
 }

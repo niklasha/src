@@ -1,4 +1,4 @@
-/*	$OpenBSD: cryptosoft.c,v 1.88 2021/07/09 15:29:55 bluhm Exp $	*/
+/*	$OpenBSD: cryptosoft.c,v 1.91 2021/10/24 10:26:22 patrick Exp $	*/
 
 /*
  * The author of this code is Angelos D. Keromytis (angelos@cis.upenn.edu)
@@ -1032,22 +1032,21 @@ swcr_process(struct cryptop *crp)
 	struct swcr_list *session;
 	struct swcr_data *sw;
 	u_int32_t lid;
+	int err = 0;
 	int type;
 	int i;
 
-	/* Sanity check */
-	if (crp == NULL)
-		return EINVAL;
+	KASSERT(crp->crp_ndesc >= 1);
 
-	if (crp->crp_ndesc < 1 || crp->crp_buf == NULL) {
-		crp->crp_etype = EINVAL;
+	if (crp->crp_buf == NULL) {
+		err = EINVAL;
 		goto done;
 	}
 
 	lid = crp->crp_sid & 0xffffffff;
 	if (lid >= swcr_sesnum || lid == 0 ||
 	    SLIST_EMPTY(&swcr_sessions[lid])) {
-		crp->crp_etype = ENOENT;
+		err = ENOENT;
 		goto done;
 	}
 
@@ -1077,7 +1076,7 @@ swcr_process(struct cryptop *crp)
 
 		/* No such context ? */
 		if (sw == NULL) {
-			crp->crp_etype = EINVAL;
+			err = EINVAL;
 			goto done;
 		}
 
@@ -1090,7 +1089,7 @@ swcr_process(struct cryptop *crp)
 		case CRYPTO_RIJNDAEL128_CBC:
 		case CRYPTO_AES_CTR:
 		case CRYPTO_AES_XTS:
-			if ((crp->crp_etype = swcr_encdec(crd, sw,
+			if ((err = swcr_encdec(crd, sw,
 			    crp->crp_buf, type)) != 0)
 				goto done;
 			break;
@@ -1100,7 +1099,7 @@ swcr_process(struct cryptop *crp)
 		case CRYPTO_SHA2_256_HMAC:
 		case CRYPTO_SHA2_384_HMAC:
 		case CRYPTO_SHA2_512_HMAC:
-			if ((crp->crp_etype = swcr_authcompute(crp, crd, sw,
+			if ((err = swcr_authcompute(crp, crd, sw,
 			    crp->crp_buf, type)) != 0)
 				goto done;
 			break;
@@ -1112,11 +1111,11 @@ swcr_process(struct cryptop *crp)
 		case CRYPTO_AES_256_GMAC:
 		case CRYPTO_CHACHA20_POLY1305:
 		case CRYPTO_CHACHA20_POLY1305_MAC:
-			crp->crp_etype = swcr_authenc(crp);
+			err = swcr_authenc(crp);
 			goto done;
 
 		case CRYPTO_DEFLATE_COMP:
-			if ((crp->crp_etype = swcr_compdec(crd, sw,
+			if ((err = swcr_compdec(crd, sw,
 			    crp->crp_buf, type)) != 0)
 				goto done;
 			else
@@ -1125,14 +1124,13 @@ swcr_process(struct cryptop *crp)
 
 		default:
 			/* Unknown/unsupported algorithm */
-			crp->crp_etype = EINVAL;
+			err = EINVAL;
 			goto done;
 		}
 	}
 
 done:
-	crypto_done(crp);
-	return 0;
+	return err;
 }
 
 /*
