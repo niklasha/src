@@ -151,9 +151,9 @@ static void ttm_pool_free_page(struct ttm_pool *pool, enum ttm_caching caching,
 {
 #ifdef __linux__
 	unsigned long attr = DMA_ATTR_FORCE_CONTIGUOUS;
-#endif
 	struct ttm_pool_dma *dma;
 	void *vaddr;
+#endif
 
 #ifdef CONFIG_X86
 	/* We don't care that set_pages_wb is inefficient here. This is only
@@ -221,7 +221,9 @@ static int ttm_pool_map(struct ttm_pool *pool, unsigned int order,
 		return -ENOSYS;
 #endif
 	} else {
+#ifdef notyet
 		size_t size = (1ULL << order) * PAGE_SIZE;
+#endif
 
 		addr = dma_map_page(pool->dev, p, 0, size, DMA_BIDIRECTIONAL);
 		if (dma_mapping_error(pool->dev, addr))
@@ -378,12 +380,11 @@ static unsigned int ttm_pool_shrink(void)
 	return num_freed;
 }
 
+#ifdef notyet
+
 /* Return the allocation order based for a page */
 static unsigned int ttm_pool_page_order(struct ttm_pool *pool, struct vm_page *p)
 {
-	STUB();
-	return 0;
-#ifdef notyet
 	if (pool->use_dma_alloc) {
 		struct ttm_pool_dma *dma = (void *)p->private;
 
@@ -391,8 +392,9 @@ static unsigned int ttm_pool_page_order(struct ttm_pool *pool, struct vm_page *p
 	}
 
 	return p->private;
-#endif
 }
+
+#endif /* notyet */
 
 /**
  * ttm_pool_alloc - Fill a ttm_tt object
@@ -515,7 +517,6 @@ void ttm_pool_free(struct ttm_pool *pool, struct ttm_tt *tt)
 	unsigned int i;
 
 	for (i = 0; i < tt->num_pages; ) {
-		struct vm_page *p = tt->pages[i];
 		unsigned int order, num_pages;
 		struct ttm_pool_type *pt;
 
