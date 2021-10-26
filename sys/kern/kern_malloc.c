@@ -149,6 +149,11 @@ struct timeval malloc_errintvl = { 5, 0 };
 struct timeval malloc_lasterr;
 #endif
 
+#ifdef DDB
+int malloc_ddb_type = -1;
+int malloc_ddb_size = 0;
+#endif
+
 /*
  * Allocate a block of memory
  */
@@ -361,6 +366,10 @@ out:
 
 	TRACEPOINT(uvm, malloc, type, va, size, flags);
 
+#ifdef DDB
+	if (malloc_ddb_type >= 0 && malloc_ddb_size && type == malloc_ddb_type && size == malloc_ddb_size)
+		db_enter();
+#endif
 	return (va);
 }
 
