@@ -3,6 +3,9 @@
 #ifndef _LINUX_DMA_FENCE_CHAIN_H
 #define _LINUX_DMA_FENCE_CHAIN_H
 
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/pool.h>
 #include <linux/dma-fence.h>
 #include <linux/irq_work.h>
 
@@ -17,6 +20,8 @@ struct dma_fence_chain {
 	};
 	struct mutex lock;
 };
+
+extern struct pool dma_fence_chain_pool;
 
 int dma_fence_chain_find_seqno(struct dma_fence **, uint64_t);
 void dma_fence_chain_init(struct dma_fence_chain *, struct dma_fence *,
@@ -43,14 +48,13 @@ struct dma_fence *dma_fence_chain_next(struct dma_fence *);
 static inline struct dma_fence_chain *
 dma_fence_chain_alloc(void)
 {
-	return malloc(sizeof(struct dma_fence_chain), M_DRM,
-	    M_WAITOK | M_CANFAIL);
+	return pool_get(&dma_fence_chain_pool, PR_WAITOK);
 }
 
 static inline void
 dma_fence_chain_free(struct dma_fence_chain *dfc)
 {
-	free(dfc, M_DRM, sizeof(struct dma_fence_chain));
+	pool_put(&dma_fence_chain_pool, dfc);
 }
 
 #endif

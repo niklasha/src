@@ -1995,6 +1995,8 @@ const struct dma_fence_ops dma_fence_array_ops = {
 	.release = dma_fence_array_release,
 };
 
+struct pool dma_fence_chain_pool;
+
 int
 dma_fence_chain_find_seqno(struct dma_fence **df, uint64_t seqno)
 {
@@ -2533,6 +2535,8 @@ drm_linux_init(void)
 
 	pool_init(&idr_pool, sizeof(struct idr_entry), 0, IPL_TTY, 0,
 	    "idrpl", NULL);
+	pool_init(&dma_fence_chain_pool, sizeof(struct dma_fence_chain),
+	    0, IPL_TTY, 0, "dmafcpl", NULL);
 
 	kmap_atomic_va =
 	    (vaddr_t)km_alloc(PAGE_SIZE, &kv_any, &kp_none, &kd_waitok);
@@ -2542,6 +2546,7 @@ void
 drm_linux_exit(void)
 {
 	pool_destroy(&idr_pool);
+	pool_destroy(&dma_fence_chain_pool);
 
 	taskq_destroy(taskletq);
 
