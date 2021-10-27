@@ -2152,19 +2152,34 @@ dma_fence_chain_release(struct dma_fence *fence)
 }
 
 struct dma_fence *
-dma_fence_chain_next(struct dma_fence *fence)
+dma_fence_chain_walk(struct dma_fence *fence)
 {
-	struct dma_fence_chain *chain = to_dma_fence_chain(fence);
-	struct dma_fence *next;
+	struct dma_fence_chain *chain = to_dma_fence_chain(fence), *prev_chain;
+	struct dma_fence *next, *prev, *new_prev, *tmp;
 
 	if (chain == NULL) {
 		dma_fence_put(fence);
 		return NULL;
 	}
 
-	next = dma_fence_get(chain->prev);
+	while ((prev = dma_fence_get(chain->prev)) != NULL) {
+		prev_chain = to_dma_fence_chain(prev);
+		if (prev_chain != NULL) {
+			if (!dma_fence_is_signaled(prev_chain->fence))
+				break;
+			new_prev = dma_fence_get(prev_chain->prev);
+		} else {
+			if (!dma_fence_is_signaled(prev))
+				break;
+			new_prev = NULL;
+		}
+		tmp = atomic_cas_ptr(&chain->prev, prev, new_prev);
+		dma_fence_put(tmp == prev ? prev : new_prev);
+		dma_fence_put(prev);
+	}
+
 	dma_fence_put(fence);
-	return next;
+	return prev;
 }
 
 const struct dma_fence_ops dma_fence_chain_ops = {
