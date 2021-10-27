@@ -2017,12 +2017,14 @@ dma_fence_chain_init(struct dma_fence_chain *chain, struct dma_fence *prev,
 	chain->prev = prev;
 	mtx_init(&chain->lock, IPL_TTY);
 
-	if (prev_chain && seqno > prev->seqno) {
+	if (prev != NULL && seqno > prev->seqno) {
 		chain->prev_seqno = prev->seqno;
 		context = prev->context;
 	} else {
 		chain->prev_seqno = 0;
 		context = dma_fence_context_alloc(1);
+		if (prev != NULL)
+			seqno = max(prev->seqno, seqno);
 	}
 
 	dma_fence_init(&chain->base, &dma_fence_chain_ops, &chain->lock,
@@ -2109,49 +2111,49 @@ dma_fence_chain_signaled(struct dma_fence *fence)
 static void
 dma_fence_chain_release(struct dma_fence *fence)
 {
-	struct dma_fence_chain *chain = to_dma_fence_chain(fence);
+	struct dma_fence_chain *chain = to_dma_fence_chain(fence), *prev_chain;
 	struct dma_fence *prev;
 
-	/* Manually unlink the chain as much as possible to avoid recursion
-	 * and potential stack overflow.
-	 */
-	while ((prev = rcu_dereference_protected(chain->prev, true))) {
-		struct dma_fence_chain *prev_chain;
-
-		if (kref_read(&prev->refcount) > 1)
-		       break;
-
+	while ((prev = chain->prev) != NULL && kref_read(&prev->refcount) <= 1) {
 		prev_chain = to_dma_fence_chain(prev);
-		if (!prev_chain)
-			break;
-
-		/* No need for atomic operations since we hold the last
-		 * reference to prev_chain.
-		 */
 		chain->prev = prev_chain->prev;
-		RCU_INIT_POINTER(prev_chain->prev, NULL);
+		prev_chain->prev = NULL;
 		dma_fence_put(prev);
 	}
 	dma_fence_put(prev);
-
 	dma_fence_put(chain->fence);
-	dma_fence_free(fence);
+	dma_fence_chain_free(chain);
 }
 
 struct dma_fence *
-dma_fence_chain_next(struct dma_fence *fence)
+dma_fence_chain_walk(struct dma_fence *fence)
 {
-	struct dma_fence_chain *chain = to_dma_fence_chain(fence);
-	struct dma_fence *next;
+	struct dma_fence_chain *chain = to_dma_fence_chain(fence), *prev_chain;
+	struct dma_fence *next, *prev, *new_prev, *tmp;
 
 	if (chain == NULL) {
 		dma_fence_put(fence);
 		return NULL;
 	}
 
-	next = dma_fence_get(chain->prev);
+	while ((prev = dma_fence_get(chain->prev)) != NULL) {
+		prev_chain = to_dma_fence_chain(prev);
+		if (prev_chain != NULL) {
+			if (!dma_fence_is_signaled(prev_chain->fence))
+				break;
+			new_prev = dma_fence_get(prev_chain->prev);
+		} else {
+			if (!dma_fence_is_signaled(prev))
+				break;
+			new_prev = NULL;
+		}
+		atomic_cas_ptr(&chain->prev, prev, new_prev);
+		dma_fence_put(chain->prev);
+		dma_fence_put(prev);
+	}
+
 	dma_fence_put(fence);
-	return next;
+	return prev;
 }
 
 const struct dma_fence_ops dma_fence_chain_ops = {
