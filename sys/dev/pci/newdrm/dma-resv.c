@@ -474,10 +474,8 @@ int dma_resv_get_fences(struct dma_resv *obj,
 			nshared = kmalloc(sz, GFP_NOWAIT | __GFP_NOWARN);
 			if (nshared != NULL && shared != NULL)
 				memcpy(nshared, shared, sz);
-			if (nshared) {
+			if (nshared != NULL)
 				kfree(shared);
-				shared = NULL;
-			}
 #endif
 			if (!nshared) {
 				rcu_read_unlock();
@@ -491,8 +489,8 @@ int dma_resv_get_fences(struct dma_resv *obj,
 				nshared = kmalloc(sz, GFP_KERNEL);
 				if (nshared != NULL && shared != NULL)
 					memcpy(nshared, shared, sz);
-				kfree(shared);
-				shared = NULL;
+				if (nshared != NULL)
+					kfree(shared);
 #endif
 				if (nshared) {
 					shared = nshared;
