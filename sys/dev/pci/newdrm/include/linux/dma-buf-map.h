@@ -12,6 +12,8 @@ struct dma_buf_map {
 		void *vaddr;
 	};
 	bool is_iomem;
+	bus_space_handle_t bsh;
+	bus_size_t size;
 };
 
 static inline void
@@ -39,6 +41,15 @@ dma_buf_map_is_null(const struct dma_buf_map *dbm)
 		return (dbm->vaddr_iomem == NULL);
 	else
 		return (dbm->vaddr == NULL);
+}
+
+static inline bool
+dma_buf_map_is_set(const struct dma_buf_map *dbm)
+{
+	if (dbm->is_iomem)
+		return (dbm->vaddr_iomem != NULL);
+	else
+		return (dbm->vaddr != NULL);
 }
 
 static inline void
