@@ -280,6 +280,9 @@ ttm_kmap_iter_linear_io_init(struct ttm_kmap_iter_linear_io *iter_io,
 			     struct ttm_device *bdev,
 			     struct ttm_resource *mem)
 {
+	STUB();
+	return ERR_PTR(-ENOSYS);
+#ifdef notyet
 	int ret;
 
 	ret = ttm_mem_io_reserve(bdev, mem);
@@ -366,6 +369,7 @@ out_io_free:
 	ttm_mem_io_free(bdev, mem);
 out_err:
 	return ERR_PTR(ret);
+#endif
 }
 
 /**
@@ -382,6 +386,8 @@ ttm_kmap_iter_linear_io_fini(struct ttm_kmap_iter_linear_io *iter_io,
 			     struct ttm_device *bdev,
 			     struct ttm_resource *mem)
 {
+	STUB();
+#ifdef notyet
 	if (iter_io->needs_unmap && dma_buf_map_is_set(&iter_io->dmap)) {
 #ifdef __linux__
 		if (iter_io->dmap.is_iomem)
@@ -393,6 +399,7 @@ ttm_kmap_iter_linear_io_fini(struct ttm_kmap_iter_linear_io *iter_io,
 		    iter_io->dmap.size);
 #endif
 	}
+#endif
 
 	ttm_mem_io_free(bdev, mem);
 }
