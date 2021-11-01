@@ -1,4 +1,4 @@
-/* $OpenBSD: x509.h,v 1.82 2021/10/23 13:16:52 tb Exp $ */
+/* $OpenBSD: x509.h,v 1.85 2021/10/31 16:51:16 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -127,13 +127,6 @@ extern "C" {
 #define X509v3_KU_DECIPHER_ONLY		0x8000
 #define X509v3_KU_UNDEF			0xffff
 
-typedef struct X509_objects_st
-	{
-	int nid;
-	int (*a2i)(void);
-	int (*i2a)(void);
-	} X509_OBJECTS;
-
 struct X509_algor_st {
 	ASN1_OBJECT *algorithm;
 	ASN1_TYPE *parameter;
@@ -146,7 +139,7 @@ typedef struct X509_val_st {
 	ASN1_TIME *notAfter;
 } X509_VAL;
 
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 struct X509_pubkey_st {
 	X509_ALGOR *algor;
 	ASN1_BIT_STRING *public_key;
@@ -171,7 +164,7 @@ typedef struct X509_name_entry_st X509_NAME_ENTRY;
 
 DECLARE_STACK_OF(X509_NAME_ENTRY)
 
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 /* we always keep X509_NAMEs in 2 forms. */
 struct X509_name_st {
 	STACK_OF(X509_NAME_ENTRY) *entries;
@@ -191,7 +184,7 @@ DECLARE_STACK_OF(X509_NAME)
 
 #define X509_EX_V_NETSCAPE_HACK		0x8000
 #define X509_EX_V_INIT			0x0001
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 typedef struct X509_extension_st {
 	ASN1_OBJECT *object;
 	ASN1_BOOLEAN critical;
@@ -206,7 +199,7 @@ typedef STACK_OF(X509_EXTENSION) X509_EXTENSIONS;
 DECLARE_STACK_OF(X509_EXTENSION)
 
 /* a sequence of these are used */
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 typedef struct x509_attributes_st {
 	ASN1_OBJECT *object;
 	int single; /* 0 for a set, 1 for a single item (which is wrong) */
@@ -223,7 +216,7 @@ typedef struct x509_attributes_st X509_ATTRIBUTE;
 DECLARE_STACK_OF(X509_ATTRIBUTE)
 
 
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 typedef struct X509_req_info_st {
 	ASN1_ENCODING enc;
 	ASN1_INTEGER *version;
@@ -265,7 +258,7 @@ typedef struct x509_cinf_st X509_CINF;
  * the end of the certificate itself
  */
 
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 typedef struct x509_cert_aux_st {
 	STACK_OF(ASN1_OBJECT) *trust;		/* trusted uses */
 	STACK_OF(ASN1_OBJECT) *reject;		/* rejected uses */
@@ -279,7 +272,7 @@ typedef struct x509_cert_aux_st X509_CERT_AUX;
 
 struct x509_st;
 
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 struct x509_st {
 	X509_CINF *cert_info;
 	X509_ALGOR *sig_alg;
@@ -326,11 +319,6 @@ typedef struct x509_trust_st {
 } X509_TRUST;
 
 DECLARE_STACK_OF(X509_TRUST)
-
-typedef struct x509_cert_pair_st {
-	X509 *forward;
-	X509 *reverse;
-} X509_CERT_PAIR;
 
 /* standard trust ids */
 
@@ -434,7 +422,7 @@ typedef struct x509_cert_pair_st {
 			XN_FLAG_FN_LN | \
 			XN_FLAG_FN_ALIGN)
 
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 struct x509_revoked_st {
 	ASN1_INTEGER *serialNumber;
 	ASN1_TIME *revocationDate;
@@ -449,7 +437,7 @@ struct x509_revoked_st {
 
 DECLARE_STACK_OF(X509_REVOKED)
 
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 typedef struct X509_crl_info_st {
 	ASN1_INTEGER *version;
 	X509_ALGOR *sig_alg;
@@ -464,7 +452,7 @@ typedef struct X509_crl_info_st {
 typedef struct X509_crl_info_st X509_CRL_INFO;
 #endif
 
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 struct X509_crl_st {
 	/* actual signature */
 	X509_CRL_INFO *crl;
@@ -576,7 +564,7 @@ typedef struct PBKDF2PARAM_st {
 
 /* PKCS#8 private key info structure */
 
-#if defined(LIBRESSL_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 struct pkcs8_priv_key_info_st {
         ASN1_INTEGER *version;
         X509_ALGOR *pkeyalg;
@@ -907,12 +895,6 @@ void X509_CERT_AUX_free(X509_CERT_AUX *a);
 X509_CERT_AUX *d2i_X509_CERT_AUX(X509_CERT_AUX **a, const unsigned char **in, long len);
 int i2d_X509_CERT_AUX(X509_CERT_AUX *a, unsigned char **out);
 extern const ASN1_ITEM X509_CERT_AUX_it;
-
-X509_CERT_PAIR *X509_CERT_PAIR_new(void);
-void X509_CERT_PAIR_free(X509_CERT_PAIR *a);
-X509_CERT_PAIR *d2i_X509_CERT_PAIR(X509_CERT_PAIR **a, const unsigned char **in, long len);
-int i2d_X509_CERT_PAIR(X509_CERT_PAIR *a, unsigned char **out);
-extern const ASN1_ITEM X509_CERT_PAIR_it;
 
 int X509_get_ex_new_index(long argl, void *argp, CRYPTO_EX_new *new_func,
 	     CRYPTO_EX_dup *dup_func, CRYPTO_EX_free *free_func);

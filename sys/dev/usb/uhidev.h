@@ -1,4 +1,4 @@
-/*	$OpenBSD: uhidev.h,v 1.32 2021/09/12 06:58:08 anton Exp $	*/
+/*	$OpenBSD: uhidev.h,v 1.34 2021/10/30 11:56:19 ratchov Exp $	*/
 /*	$NetBSD: uhidev.h,v 1.3 2002/10/08 09:56:17 dan Exp $	*/
 
 /*

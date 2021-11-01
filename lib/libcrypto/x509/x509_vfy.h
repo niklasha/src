@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_vfy.h,v 1.37 2021/10/24 13:52:13 tb Exp $ */
+/* $OpenBSD: x509_vfy.h,v 1.44 2021/10/31 16:51:16 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -77,14 +77,6 @@
 extern "C" {
 #endif
 
-typedef struct x509_file_st
-	{
-	int num_paths;	/* number of paths to files or directories */
-	int num_alloced;
-	char **paths;	/* the list of paths or directories */
-	int *path_type;
-	} X509_CERT_FILE_CTX;
-
 /*
  * SSL_CTX -> X509_STORE
  *		-> X509_LOOKUP
@@ -102,32 +94,35 @@ typedef struct x509_file_st
  * certificate chain.
  */
 
-#define X509_LU_RETRY		-1
-#define X509_LU_FAIL		0
-#define X509_LU_X509		1
-#define X509_LU_CRL		2
-#define X509_LU_PKEY		3
+typedef enum {
+	X509_LU_NONE,
+	X509_LU_X509,
+	X509_LU_CRL,
+} X509_LOOKUP_TYPE;
 
-typedef struct x509_object_st
-	{
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+typedef struct x509_object_st {
 	/* one of the above types */
 	int type;
-	union	{
+	union {
 		char *ptr;
 		X509 *x509;
 		X509_CRL *crl;
 		EVP_PKEY *pkey;
-		} data;
-	} X509_OBJECT;
+	} data;
+} X509_OBJECT;
+#else
+typedef struct x509_object_st X509_OBJECT;
+#endif
 
 typedef struct x509_lookup_st X509_LOOKUP;
 
 DECLARE_STACK_OF(X509_LOOKUP)
 DECLARE_STACK_OF(X509_OBJECT)
 
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 /* This is a static that defines the function interface */
-typedef struct x509_lookup_method_st
-	{
+typedef struct x509_lookup_method_st {
 	const char *name;
 	int (*new_item)(X509_LOOKUP *ctx);
 	void (*free)(X509_LOOKUP *ctx);
@@ -143,7 +138,7 @@ typedef struct x509_lookup_method_st
 	    const unsigned char *bytes, int len, X509_OBJECT *ret);
 	int (*get_by_alias)(X509_LOOKUP *ctx, int type, const char *str,
 	    int len, X509_OBJECT *ret);
-	} X509_LOOKUP_METHOD;
+} X509_LOOKUP_METHOD;
 
 typedef struct X509_VERIFY_PARAM_ID_st X509_VERIFY_PARAM_ID;
 
@@ -152,8 +147,7 @@ typedef struct X509_VERIFY_PARAM_ID_st X509_VERIFY_PARAM_ID;
  * parameters used can be customized
  */
 
-typedef struct X509_VERIFY_PARAM_st
-	{
+typedef struct X509_VERIFY_PARAM_st {
 	char *name;
 	time_t check_time;	/* Time to use */
 	unsigned long inh_flags; /* Inheritance flags */
@@ -164,16 +158,22 @@ typedef struct X509_VERIFY_PARAM_st
 	STACK_OF(ASN1_OBJECT) *policies;	/* Permissible policies */
 	X509_VERIFY_PARAM_ID *id;	/* opaque ID data */
 } X509_VERIFY_PARAM;
+#else
+typedef struct x509_lookup_method_st X509_LOOKUP_METHOD;
+typedef struct X509_VERIFY_PARAM_st X509_VERIFY_PARAM;
+#endif
 
 DECLARE_STACK_OF(X509_VERIFY_PARAM)
 
-/* This is used to hold everything.  It is used for all certificate
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
+/*
+ * This is used to hold everything.  It is used for all certificate
  * validation.  Once we have a certificate chain, the 'verify'
- * function is then called to actually check the cert chain. */
-struct x509_store_st
-	{
+ * function is then called to actually check the cert chain.
+ */
+struct x509_store_st {
 	/* The following is a cache of trusted certs */
-	int cache; 	/* if true, stash any hits */
+	int cache;	/* if true, stash any hits */
 	STACK_OF(X509_OBJECT) *objs;	/* Cache of all objects */
 
 	/* These are external lookup methods */
@@ -196,29 +196,32 @@ struct x509_store_st
 
 	CRYPTO_EX_DATA ex_data;
 	int references;
-	} /* X509_STORE */;
+} /* X509_STORE */;
+#endif
 
 int X509_STORE_set_depth(X509_STORE *store, int depth);
 
-#define X509_STORE_set_verify_cb_func(ctx,func) ((ctx)->verify_cb=(func))
+#if !defined(LIBRESSL_NEW_API)
 #define X509_STORE_set_verify_func(ctx,func)	((ctx)->verify=(func))
+#endif
 
+#if defined(LIBRESSL_CRYPTO_INTERNAL) || !defined(LIBRESSL_OPAQUE_X509)
 /* This is the functions plus an instance of the local variables. */
-struct x509_lookup_st
-	{
+struct x509_lookup_st {
 	int init;			/* have we been started */
 	int skip;			/* don't use us. */
 	X509_LOOKUP_METHOD *method;	/* the functions */
 	char *method_data;		/* method data */
 
 	X509_STORE *store_ctx;	/* who owns us */
-	} /* X509_LOOKUP */;
+} /* X509_LOOKUP */;
 
-/* This is a used when verifying cert chains.  Since the
- * gathering of the cert chain can take some time (and have to be
- * 'retried', this needs to be kept and passed around. */
-struct x509_store_ctx_st      /* X509_STORE_CTX */
-	{
+/*
+ * This is used when verifying cert chains.  Since the gathering of the cert
+ * chain can take some time (and has to be 'retried'), this needs to be kept
+ * and passed around.
+ */
+struct x509_store_ctx_st {
 	X509_STORE *ctx;
 	int current_method;	/* used when looking up certs */
 
@@ -265,7 +268,8 @@ struct x509_store_ctx_st      /* X509_STORE_CTX */
 	X509_STORE_CTX *parent; /* For CRL path validation: parent context */
 
 	CRYPTO_EX_DATA ex_data;
-	} /* X509_STORE_CTX */;
+} /* X509_STORE_CTX */;
+#endif
 
 void X509_STORE_CTX_set_depth(X509_STORE_CTX *ctx, int depth);
 
@@ -425,12 +429,13 @@ void X509_STORE_CTX_set_depth(X509_STORE_CTX *ctx, int depth);
 X509_OBJECT *X509_OBJECT_new(void);
 void X509_OBJECT_free(X509_OBJECT *a);
 #endif
-int X509_OBJECT_idx_by_subject(STACK_OF(X509_OBJECT) *h, int type,
+int X509_OBJECT_idx_by_subject(STACK_OF(X509_OBJECT) *h, X509_LOOKUP_TYPE type,
 	     X509_NAME *name);
-X509_OBJECT *X509_OBJECT_retrieve_by_subject(STACK_OF(X509_OBJECT) *h,int type,X509_NAME *name);
+X509_OBJECT *X509_OBJECT_retrieve_by_subject(STACK_OF(X509_OBJECT) *h,
+    X509_LOOKUP_TYPE type, X509_NAME *name);
 X509_OBJECT *X509_OBJECT_retrieve_match(STACK_OF(X509_OBJECT) *h, X509_OBJECT *x);
 int X509_OBJECT_up_ref_count(X509_OBJECT *a);
-int X509_OBJECT_get_type(const X509_OBJECT *a);
+X509_LOOKUP_TYPE X509_OBJECT_get_type(const X509_OBJECT *a);
 void X509_OBJECT_free_contents(X509_OBJECT *a);
 X509 *X509_OBJECT_get0_X509(const X509_OBJECT *xo);
 X509_CRL *X509_OBJECT_get0_X509_CRL(X509_OBJECT *xo);
@@ -455,7 +460,9 @@ int X509_STORE_set1_param(X509_STORE *ctx, X509_VERIFY_PARAM *pm);
 X509_VERIFY_PARAM *X509_STORE_get0_param(X509_STORE *ctx);
 
 void X509_STORE_set_verify_cb(X509_STORE *ctx,
-				  int (*verify_cb)(int, X509_STORE_CTX *));
+    int (*verify_cb)(int, X509_STORE_CTX *));
+#define X509_STORE_set_verify_cb_func(ctx, func) \
+    X509_STORE_set_verify_cb((ctx), (func))
 
 X509_STORE_CTX *X509_STORE_CTX_new(void);
 
@@ -482,8 +489,13 @@ X509_LOOKUP_METHOD *X509_LOOKUP_mem(void);
 int X509_STORE_add_cert(X509_STORE *ctx, X509 *x);
 int X509_STORE_add_crl(X509_STORE *ctx, X509_CRL *x);
 
-int X509_STORE_get_by_subject(X509_STORE_CTX *vs,int type,X509_NAME *name,
-	X509_OBJECT *ret);
+int X509_STORE_CTX_get_by_subject(X509_STORE_CTX *vs, X509_LOOKUP_TYPE type,
+    X509_NAME *name, X509_OBJECT *ret);
+#define X509_STORE_get_by_subject X509_STORE_CTX_get_by_subject
+#if defined(LIBRESSL_NEW_API)
+X509_OBJECT *X509_STORE_CTX_get_obj_by_subject(X509_STORE_CTX *vs,
+    X509_LOOKUP_TYPE type, X509_NAME *name);
+#endif
 
 int X509_LOOKUP_ctrl(X509_LOOKUP *ctx, int cmd, const char *argc,
 	long argl, char **ret);
@@ -496,14 +508,14 @@ int X509_load_cert_crl_file(X509_LOOKUP *ctx, const char *file, int type);
 X509_LOOKUP *X509_LOOKUP_new(X509_LOOKUP_METHOD *method);
 void X509_LOOKUP_free(X509_LOOKUP *ctx);
 int X509_LOOKUP_init(X509_LOOKUP *ctx);
-int X509_LOOKUP_by_subject(X509_LOOKUP *ctx, int type, X509_NAME *name,
-	X509_OBJECT *ret);
-int X509_LOOKUP_by_issuer_serial(X509_LOOKUP *ctx, int type, X509_NAME *name,
-	ASN1_INTEGER *serial, X509_OBJECT *ret);
-int X509_LOOKUP_by_fingerprint(X509_LOOKUP *ctx, int type,
-	const unsigned char *bytes, int len, X509_OBJECT *ret);
-int X509_LOOKUP_by_alias(X509_LOOKUP *ctx, int type, const char *str,
-	int len, X509_OBJECT *ret);
+int X509_LOOKUP_by_subject(X509_LOOKUP *ctx, X509_LOOKUP_TYPE type,
+    X509_NAME *name, X509_OBJECT *ret);
+int X509_LOOKUP_by_issuer_serial(X509_LOOKUP *ctx, X509_LOOKUP_TYPE type,
+    X509_NAME *name, ASN1_INTEGER *serial, X509_OBJECT *ret);
+int X509_LOOKUP_by_fingerprint(X509_LOOKUP *ctx, X509_LOOKUP_TYPE type,
+    const unsigned char *bytes, int len, X509_OBJECT *ret);
+int X509_LOOKUP_by_alias(X509_LOOKUP *ctx, X509_LOOKUP_TYPE type,
+    const char *str, int len, X509_OBJECT *ret);
 int X509_LOOKUP_shutdown(X509_LOOKUP *ctx);
 
 int	X509_STORE_load_locations (X509_STORE *ctx,
@@ -545,6 +557,8 @@ void X509_STORE_CTX_set0_verified_chain(X509_STORE_CTX *ctx, STACK_OF(X509) *sk)
 int (*X509_STORE_CTX_get_verify(X509_STORE_CTX *ctx))(X509_STORE_CTX *);
 void X509_STORE_CTX_set_verify(X509_STORE_CTX *ctx,
     int (*verify)(X509_STORE_CTX *));
+#define X509_STORE_set_verify_func(ctx, func) \
+    X509_STORE_set_verify((ctx), (func))
 int (*X509_STORE_CTX_get_verify_cb(X509_STORE_CTX *ctx))(int, X509_STORE_CTX *);
 #endif
 void X509_STORE_CTX_set_verify_cb(X509_STORE_CTX *ctx,

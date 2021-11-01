@@ -1,4 +1,4 @@
-/* $OpenBSD: ssl_lib.c,v 1.275 2021/10/23 20:42:50 beck Exp $ */
+/* $OpenBSD: ssl_lib.c,v 1.277 2021/10/31 16:37:25 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -887,10 +887,10 @@ SSL_get_peer_cert_chain(const SSL *s)
 	STACK_OF(X509)	*r;
 
 	if ((s == NULL) || (s->session == NULL) ||
-	    (SSI(s)->sess_cert == NULL))
+	    (s->session->sess_cert == NULL))
 		r = NULL;
 	else
-		r = SSI(s)->sess_cert->cert_chain;
+		r = s->session->sess_cert->cert_chain;
 
 	/*
 	 * If we are a client, cert_chain includes the peer's own
@@ -2187,17 +2187,6 @@ SSL_CTX_set_verify_depth(SSL_CTX *ctx, int depth)
 	X509_VERIFY_PARAM_set_depth(ctx->param, depth);
 }
 
-static int
-ssl_cert_can_sign(X509 *x)
-{
-	/* This call populates extension flags (ex_flags). */
-	X509_check_purpose(x, -1, 0);
-
-	/* Key usage, if present, must allow signing. */
-	return ((x->ex_flags & EXFLAG_KUSAGE) == 0 ||
-	    (x->ex_kusage & X509v3_KU_DIGITAL_SIGNATURE));
-}
-
 void
 ssl_set_cert_masks(CERT *c, const SSL_CIPHER *cipher)
 {
@@ -2215,7 +2204,8 @@ ssl_set_cert_masks(CERT *c, const SSL_CIPHER *cipher)
 
 	cpk = &(c->pkeys[SSL_PKEY_ECC]);
 	if (cpk->x509 != NULL && cpk->privatekey != NULL) {
-		if (ssl_cert_can_sign(cpk->x509))
+		/* Key usage, if present, must allow signing. */
+		if (X509_get_key_usage(cpk->x509) & X509v3_KU_DIGITAL_SIGNATURE)
 			mask_a |= SSL_aECDSA;
 	}
 
@@ -2245,8 +2235,8 @@ ssl_using_ecc_cipher(SSL *s)
 	alg_a = S3I(s)->hs.cipher->algorithm_auth;
 	alg_k = S3I(s)->hs.cipher->algorithm_mkey;
 
-	return SSI(s)->tlsext_ecpointformatlist != NULL &&
-	    SSI(s)->tlsext_ecpointformatlist_length > 0 &&
+	return s->session->tlsext_ecpointformatlist != NULL &&
+	    s->session->tlsext_ecpointformatlist_length > 0 &&
 	    ((alg_k & SSL_kECDHE) || (alg_a & SSL_aECDSA));
 }
 
@@ -2259,12 +2249,8 @@ ssl_check_srvr_ecc_cert_and_alg(X509 *x, SSL *s)
 	alg_a = cs->algorithm_auth;
 
 	if (alg_a & SSL_aECDSA) {
-		/* This call populates extension flags (ex_flags). */
-		X509_check_purpose(x, -1, 0);
-
 		/* Key usage, if present, must allow signing. */
-		if ((x->ex_flags & EXFLAG_KUSAGE) &&
-		    ((x->ex_kusage & X509v3_KU_DIGITAL_SIGNATURE) == 0)) {
+		if (!(X509_get_key_usage(x) & X509v3_KU_DIGITAL_SIGNATURE)) {
 			SSLerror(s, SSL_R_ECC_CERT_NOT_FOR_SIGNING);
 			return (0);
 		}

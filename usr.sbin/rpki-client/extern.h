@@ -1,4 +1,4 @@
-/*	$OpenBSD: extern.h,v 1.77 2021/10/24 17:53:07 claudio Exp $ */
+/*	$OpenBSD: extern.h,v 1.86 2021/10/29 09:27:36 claudio Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -337,12 +337,12 @@ enum publish_type {
  * and parsed.
  */
 struct entity {
-	enum rtype	 type; /* type of entity (not RTYPE_EOF) */
-	char		*file; /* local path to file */
-	int		 has_pkey; /* whether pkey/sz is specified */
-	unsigned char	*pkey; /* public key (optional) */
-	size_t		 pkeysz; /* public key length (optional) */
-	char		*descr; /* tal description */
+	enum rtype	 type;		/* type of entity (not RTYPE_EOF) */
+	char		*file;		/* local path to file */
+	int		 has_data;	/* whether data blob is specified */
+	unsigned char	*data;		/* optional data blob */
+	size_t		 datasz; 	/* length of optional data blob */
+	char		*descr;		/* tal description */
 	TAILQ_ENTRY(entity) entries;
 };
 TAILQ_HEAD(entityq, entity);
@@ -397,35 +397,39 @@ extern int verbose;
 
 void		 tal_buffer(struct ibuf *, const struct tal *);
 void		 tal_free(struct tal *);
-struct tal	*tal_parse(const char *, char *);
-char		*tal_read_file(const char *);
+struct tal	*tal_parse(const char *, char *, size_t);
 struct tal	*tal_read(struct ibuf *);
 
 void		 cert_buffer(struct ibuf *, const struct cert *);
 void		 cert_free(struct cert *);
-struct cert	*cert_parse(X509 **, const char *);
-struct cert	*ta_parse(X509 **, const char *, const unsigned char *, size_t);
+struct cert	*cert_parse(X509 **, const char *, const unsigned char *,
+		    size_t);
+struct cert	*ta_parse(X509 **, const char *, const unsigned char *, size_t,
+		    const unsigned char *, size_t);
 struct cert	*cert_read(struct ibuf *);
 void		 cert_insert_brks(struct brk_tree *, struct cert *);
 
 void		 mft_buffer(struct ibuf *, const struct mft *);
 void		 mft_free(struct mft *);
-struct mft	*mft_parse(X509 **, const char *);
+struct mft	*mft_parse(X509 **, const char *, const unsigned char *,
+		    size_t);
 int		 mft_check(const char *, struct mft *);
 struct mft	*mft_read(struct ibuf *);
 
 void		 roa_buffer(struct ibuf *, const struct roa *);
 void		 roa_free(struct roa *);
-struct roa	*roa_parse(X509 **, const char *);
+struct roa	*roa_parse(X509 **, const char *, const unsigned char *,
+		    size_t);
 struct roa	*roa_read(struct ibuf *);
 void		 roa_insert_vrps(struct vrp_tree *, struct roa *, size_t *,
 		    size_t *);
 
 void		 gbr_free(struct gbr *);
-struct gbr	*gbr_parse(X509 **, const char *);
+struct gbr	*gbr_parse(X509 **, const char *, const unsigned char *,
+		    size_t);
 
 /* crl.c */
-X509_CRL	*crl_parse(const char *);
+X509_CRL	*crl_parse(const char *, const unsigned char *, size_t);
 void		 free_crl(struct crl *);
 
 /* Validation of our objects. */
@@ -440,9 +444,11 @@ int		 valid_roa(const char *, struct auth_tree *, struct roa *);
 int		 valid_filename(const char *);
 int		 valid_filehash(const char *, const char *, size_t);
 int		 valid_uri(const char *, size_t, const char *);
+int		 valid_origin(const char *, const char *);
 
 /* Working with CMS. */
 unsigned char	*cms_parse_validate(X509 **, const char *,
+		    const unsigned char *, size_t,
 		    const ASN1_OBJECT *, size_t *);
 int		 cms_econtent_version(const char *, const unsigned char **,
 		    size_t, long *);
@@ -528,8 +534,11 @@ void		 cryptoerrx(const char *, ...)
 
 /* Encoding functions for hex and base64. */
 
-int		 base64_decode(const unsigned char *, unsigned char **,
-		    size_t *);
+unsigned char	*load_file(const char *, size_t *);
+int		 base64_decode_len(size_t, size_t *);
+int		 base64_decode(const unsigned char *, size_t,
+		    unsigned char **, size_t *);
+int		 base64_encode_len(size_t, size_t *);
 int		 base64_encode(const unsigned char *, size_t, char **);
 char		*hex_encode(const unsigned char *, size_t);
 
@@ -552,7 +561,7 @@ struct ibuf	*io_buf_recvfd(int, struct ibuf **);
 char		*x509_get_aia(X509 *, const char *);
 char		*x509_get_aki(X509 *, int, const char *);
 char		*x509_get_ski(X509 *, const char *);
-time_t		 x509_get_expire(X509 *, const char *);
+int		 x509_get_expire(X509 *, const char *, time_t *);
 char		*x509_get_crl(X509 *, const char *);
 char		*x509_crl_get_aki(X509_CRL *, const char *);
 char		*x509_get_pubkey(X509 *, const char *);
@@ -589,12 +598,34 @@ int		 output_csv(FILE *, struct vrp_tree *, struct brk_tree *,
 int		 output_json(FILE *, struct vrp_tree *, struct brk_tree *,
 		    struct stats *);
 
-void	logx(const char *fmt, ...)
+void		logx(const char *fmt, ...)
 		    __attribute__((format(printf, 1, 2)));
 
 int	mkpath(const char *);
 
 #define		RPKI_PATH_OUT_DIR	"/var/db/rpki-client"
 #define		RPKI_PATH_BASE_DIR	"/var/cache/rpki-client"
+
+/*
+ * Maximum number of ip ranges and AS ranges we will accept in
+ * any single file
+ */
+#define MAX_IP_SIZE	200000
+#define MAX_AS_SIZE	200000
+
+/*
+ * Maximum URI length we will accept
+ */
+#define MAX_URI_LENGTH 2048
+
+/*
+ * Maximum File Size we will accept
+ */
+#define MAX_FILE_SIZE 2000000
+
+/*
+ * Maximum number of FileAndHash entries per Manifest.
+ */
+#define	MAX_MANIFEST_ENTRIES	100000
 
 #endif /* ! EXTERN_H */

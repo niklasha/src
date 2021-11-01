@@ -6,6 +6,9 @@
 #define LIBRESSL_HAS_TLS1_3
 #define LIBRESSL_HAS_DTLS1_2
 
+#define LIBRESSL_NEW_API
+#define LIBRESSL_OPAQUE_X509
+
 #define OPENSSL_THREADS
 
 #define OPENSSL_NO_BUF_FREELISTS
@@ -84,7 +87,7 @@
 /* #define OPENSSL_NO_RC4 */
 #define OPENSSL_NO_RC5
 /* #define OPENSSL_NO_RDRAND */
-#define OPENSSL_NO_RFC3779
+/* #define OPENSSL_NO_RFC3779 */
 /* #define OPENSSL_NO_RMD160 */
 /* #define OPENSSL_NO_RSA */
 /* #define OPENSSL_NO_SCRYPT */

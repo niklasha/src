@@ -1,4 +1,4 @@
-/* $OpenBSD: tmux.h,v 1.1148 2021/10/20 09:50:40 nicm Exp $ */
+/* $OpenBSD: tmux.h,v 1.1152 2021/10/28 18:54:33 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -1710,6 +1710,9 @@ struct client {
 	(CLIENT_DEAD|		\
 	 CLIENT_SUSPENDED|	\
 	 CLIENT_EXIT)
+#define CLIENT_NODETACHFLAGS 	\
+	(CLIENT_DEAD|		\
+	 CLIENT_EXIT)
 #define CLIENT_NOSIZEFLAGS	\
 	(CLIENT_DEAD|		\
 	 CLIENT_SUSPENDED|	\
@@ -2032,7 +2035,7 @@ char		*format_grid_line(struct grid *, u_int);
 /* format-draw.c */
 void		 format_draw(struct screen_write_ctx *,
 		     const struct grid_cell *, u_int, const char *,
-		     struct style_ranges *);
+		     struct style_ranges *, int);
 u_int		 format_width(const char *);
 char		*format_trim_left(const char *, u_int);
 char		*format_trim_right(const char *, u_int);
@@ -2616,6 +2619,7 @@ int	 input_key_get_mouse(struct screen *, struct mouse_event *, u_int,
 int	 colour_find_rgb(u_char, u_char, u_char);
 int	 colour_join_rgb(u_char, u_char, u_char);
 void	 colour_split_rgb(int, u_char *, u_char *, u_char *);
+int	 colour_force_rgb(int);
 const char *colour_tostring(int);
 int	 colour_fromstring(const char *s);
 int	 colour_256toRGB(int);
@@ -3155,7 +3159,8 @@ typedef void (*popup_finish_edit_cb)(char *, size_t, void *);
 int		 popup_display(int, int, struct cmdq_item *, u_int, u_int,
 		    u_int, u_int, struct environ *, const char *, int, char **,
 		    const char *, const char *, struct client *,
-		    struct session *, popup_close_cb, void *);
+		    struct session *, const char *, const char *,
+		    popup_close_cb, void *);
 int		 popup_editor(struct client *, const char *, size_t,
 		    popup_finish_edit_cb, void *);
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: tls13_server.c,v 1.86 2021/10/23 14:40:54 jsing Exp $ */
+/* $OpenBSD: tls13_server.c,v 1.88 2021/10/31 16:37:25 tb Exp $ */
 /*
  * Copyright (c) 2019, 2020 Joel Sing <jsing@openbsd.org>
  * Copyright (c) 2020 Bob Beck <beck@openbsd.org>
@@ -557,15 +557,11 @@ tls13_server_check_certificate(struct tls13_ctx *ctx, CERT_PKEY *cpk,
 	if (cpk->x509 == NULL || cpk->privatekey == NULL)
 		goto done;
 
-	if (!X509_check_purpose(cpk->x509, -1, 0))
-		return 0;
-
 	/*
 	 * The digitalSignature bit MUST be set if the Key Usage extension is
 	 * present as per RFC 8446 section 4.4.2.2.
 	 */
-	if ((cpk->x509->ex_flags & EXFLAG_KUSAGE) &&
-	    !(cpk->x509->ex_kusage & X509v3_KU_DIGITAL_SIGNATURE))
+	if (!(X509_get_key_usage(cpk->x509) & X509v3_KU_DIGITAL_SIGNATURE))
 		goto done;
 
 	if ((sigalg = ssl_sigalg_select(s, cpk->privatekey)) == NULL)
@@ -922,16 +918,16 @@ tls13_client_certificate_recv(struct tls13_ctx *ctx, CBS *cbs)
 	if ((cert_idx = ssl_cert_type(cert, pkey)) < 0)
 		goto err;
 
-	ssl_sess_cert_free(SSI(s)->sess_cert);
-	if ((SSI(s)->sess_cert = ssl_sess_cert_new()) == NULL)
+	ssl_sess_cert_free(s->session->sess_cert);
+	if ((s->session->sess_cert = ssl_sess_cert_new()) == NULL)
 		goto err;
 
-	SSI(s)->sess_cert->cert_chain = certs;
+	s->session->sess_cert->cert_chain = certs;
 	certs = NULL;
 
 	X509_up_ref(cert);
-	SSI(s)->sess_cert->peer_pkeys[cert_idx].x509 = cert;
-	SSI(s)->sess_cert->peer_key = &(SSI(s)->sess_cert->peer_pkeys[cert_idx]);
+	s->session->sess_cert->peer_pkeys[cert_idx].x509 = cert;
+	s->session->sess_cert->peer_key = &(s->session->sess_cert->peer_pkeys[cert_idx]);
 
 	X509_free(s->session->peer);
 

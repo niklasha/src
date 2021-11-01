@@ -44,7 +44,7 @@
 	} while (0)
 #endif
 
-#if SSH_SK_VERSION_MAJOR != 0x00070000
+#if SSH_SK_VERSION_MAJOR != 0x00080000
 # error SK API has changed, sk-dummy.c needs an update
 #endif
 
@@ -336,7 +336,7 @@ sig_ecdsa(const uint8_t *message, size_t message_len,
 	/* Prepare data to be signed */
 	dump("message", message, message_len);
 	SHA256Init(&ctx);
-	SHA256Update(&ctx, application, strlen(application));
+	SHA256Update(&ctx, (const u_char *)application, strlen(application));
 	SHA256Final(apphash, &ctx);
 	dump("apphash", apphash, sizeof(apphash));
 	countbuf[0] = (counter >> 24) & 0xff;
@@ -412,7 +412,7 @@ sig_ed25519(const uint8_t *message, size_t message_len,
 	/* Prepare data to be signed */
 	dump("message", message, message_len);
 	SHA256Init(&ctx);
-	SHA256Update(&ctx, application, strlen(application));
+	SHA256Update(&ctx, (const u_char *)application, strlen(application));
 	SHA256Final(apphash, &ctx);
 	dump("apphash", apphash, sizeof(apphash));
 

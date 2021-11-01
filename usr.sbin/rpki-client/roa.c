@@ -1,4 +1,4 @@
-/*	$OpenBSD: roa.c,v 1.27 2021/10/23 16:06:04 claudio Exp $ */
+/*	$OpenBSD: roa.c,v 1.30 2021/10/28 09:02:19 beck Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -327,7 +327,7 @@ out:
  * Returns the ROA or NULL if the document was malformed.
  */
 struct roa *
-roa_parse(X509 **x509, const char *fn)
+roa_parse(X509 **x509, const char *fn, const unsigned char *der, size_t len)
 {
 	struct parse	 p;
 	size_t		 cmsz;
@@ -348,7 +348,7 @@ roa_parse(X509 **x509, const char *fn)
 			    "1.2.840.113549.1.9.16.1.24");
 	}
 
-	cms = cms_parse_validate(x509, fn, roa_oid, &cmsz);
+	cms = cms_parse_validate(x509, fn, der, len, roa_oid, &cmsz);
 	if (cms == NULL)
 		return NULL;
 
@@ -374,12 +374,11 @@ roa_parse(X509 **x509, const char *fn)
 		warnx("%s: ASN1_time_parse failed", fn);
 		goto out;
 	}
-	if ((expires = mktime(&expires_tm)) == -1) {
+	if ((expires = mktime(&expires_tm)) == -1)
 		errx(1, "mktime failed");
-		goto out;
-	}
+
 	p.res->expires = expires;
-	
+
 	if (!roa_parse_econtent(cms, cmsz, &p))
 		goto out;
 

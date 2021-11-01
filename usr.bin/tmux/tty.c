@@ -1,4 +1,4 @@
-/* $OpenBSD: tty.c,v 1.407 2021/10/14 09:54:51 nicm Exp $ */
+/* $OpenBSD: tty.c,v 1.409 2021/10/28 18:57:06 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -1972,10 +1972,9 @@ tty_cmd_cell(struct tty *tty, const struct tty_ctx *ctx)
 		for (i = 0; i < OVERLAY_MAX_RANGES; i++)
 			vis += r.nx[i];
 		if (vis < gcp->data.width) {
-			tty_draw_line(tty, s, s->cx, s->cy,
-				    gcp->data.width, px, py, &ctx->defaults,
-				    ctx->palette);
-				return;
+			tty_draw_line(tty, s, s->cx, s->cy, gcp->data.width,
+			    px, py, &ctx->defaults, ctx->palette);
+			return;
 		}
 	}
 
@@ -2279,17 +2278,25 @@ tty_cursor(struct tty *tty, u_int cx, u_int cy)
 	if (tty->flags & TTY_BLOCK)
 		return;
 
-	if (cx > tty->sx - 1)
-		cx = tty->sx - 1;
-
 	thisx = tty->cx;
 	thisy = tty->cy;
+
+	/*
+	 * If in the automargin space, and want to be there, do not move.
+	 * Otherwise, force the cursor to be in range (and complain).
+	 */
+	if (cx == thisx && cy == thisy && cx == tty->sx)
+		return;
+	if (cx > tty->sx - 1) {
+		log_debug("%s: x too big %u > %u", __func__, cx, tty->sx - 1);
+		cx = tty->sx - 1;
+	}
 
 	/* No change. */
 	if (cx == thisx && cy == thisy)
 		return;
 
-	/* Very end of the line, just use absolute movement. */
+	/* Currently at the very end of the line - use absolute movement. */
 	if (thisx > tty->sx - 1)
 		goto absolute;
 
