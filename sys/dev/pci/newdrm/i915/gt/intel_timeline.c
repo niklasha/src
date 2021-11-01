@@ -64,7 +64,7 @@ intel_timeline_pin_map(struct intel_timeline *timeline)
 
 	timeline->hwsp_map = vaddr;
 	timeline->hwsp_seqno = memset(vaddr + ofs, 0, TIMELINE_SEQNO_BYTES);
-	clflush((vaddr_t)(vaddr + ofs));
+	clflush(vaddr + ofs);
 
 	return 0;
 }
@@ -225,7 +225,7 @@ void intel_timeline_reset_seqno(const struct intel_timeline *tl)
 
 	memset(hwsp_seqno + 1, 0, TIMELINE_SEQNO_BYTES - sizeof(*hwsp_seqno));
 	WRITE_ONCE(*hwsp_seqno, tl->seqno);
-	clflush((vaddr_t)hwsp_seqno);
+	clflush(hwsp_seqno);
 }
 
 void intel_timeline_enter(struct intel_timeline *tl)
