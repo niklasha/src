@@ -1902,10 +1902,9 @@ dma_fence_array_get_timeline_name(struct dma_fence *fence)
 }
 
 static void
-irq_dma_fence_array_work(struct irq_work *wrk)
+irq_dma_fence_array_work(void *arg)
 {
-	struct dma_fence_array *dfa = container_of(wrk, typeof(*dfa), work);
-
+	struct dma_fence_array *dfa = (struct dma_fence_array *)arg;
 	dma_fence_signal(&dfa->base);
 	dma_fence_put(&dfa->base);
 }
@@ -1918,7 +1917,7 @@ dma_fence_array_cb_func(struct dma_fence *f, struct dma_fence_cb *cb)
 	struct dma_fence_array *dfa = array_cb->array;
 	
 	if (atomic_dec_and_test(&dfa->num_pending))
-		irq_work_queue(&dfa->work);
+		timeout_add(&dfa->to, 1);
 	else
 		dma_fence_put(&dfa->base);
 }
@@ -1978,7 +1977,7 @@ dma_fence_array_create(int num_fences, struct dma_fence **fences, u64 context,
 	mtx_init(&dfa->lock, IPL_TTY);
 	dma_fence_init(&dfa->base, &dma_fence_array_ops, &dfa->lock,
 	    context, seqno);
-	init_irq_work(&dfa->work, irq_dma_fence_array_work);
+	timeout_set(&dfa->to, irq_dma_fence_array_work, dfa);
 
 	dfa->num_fences = num_fences;
 	atomic_set(&dfa->num_pending, signal_on_any ? 1 : num_fences);
