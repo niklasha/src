@@ -2110,7 +2110,22 @@ dma_fence_chain_signaled(struct dma_fence *fence)
 static void
 dma_fence_chain_release(struct dma_fence *fence)
 {
-	STUB();
+	struct dma_fence_chain *chain = to_dma_fence_chain(fence);
+	struct dma_fence_chain *prev_chain;
+	struct dma_fence *prev;
+
+	for (prev = chain->prev; prev != NULL; prev = chain->prev) {
+		if (kref_read(&prev->refcount) > 1)
+			break;
+		if ((prev_chain = to_dma_fence_chain(prev)) == NULL)
+			break;
+		chain->prev = prev_chain->prev;
+		prev_chain->prev = NULL;
+		dma_fence_put(prev);
+	}
+	dma_fence_put(prev);
+	dma_fence_put(chain->fence);
+	dma_fence_free(fence);
 }
 
 struct dma_fence *
