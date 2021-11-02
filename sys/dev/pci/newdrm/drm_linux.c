@@ -2038,10 +2038,51 @@ dma_fence_chain_get_timeline_name(struct dma_fence *fence)
 	return "unbound";
 }
 
+static bool dma_fence_chain_enable_signaling(struct dma_fence *);
+
+static void
+dma_fence_chain_timo(void *arg)
+{
+	struct dma_fence_chain *chain = (struct dma_fence_chain *)arg;
+
+	if (dma_fence_chain_enable_signaling(&chain->base) == false)
+		dma_fence_signal(&chain->base);
+	dma_fence_put(&chain->base);
+}
+
+static void
+dma_fence_chain_cb(struct dma_fence *f, struct dma_fence_cb *cb)
+{
+	struct dma_fence_chain *chain =
+	    container_of(cb, struct dma_fence_chain, cb);
+	timeout_set(&chain->to, dma_fence_chain_timo, chain);
+	timeout_add(&chain->to, 1);
+	dma_fence_put(f);
+}
+
 static bool
 dma_fence_chain_enable_signaling(struct dma_fence *fence)
 {
-	STUB();
+	struct dma_fence_chain *chain, *h;
+	struct dma_fence *f;
+
+	h = to_dma_fence_chain(fence);
+	dma_fence_get(&h->base);
+	dma_fence_chain_for_each(fence, &h->base) {
+		chain = to_dma_fence_chain(fence);
+		if (chain == NULL)
+			f = fence;
+		else
+			f = chain->fence;
+
+		dma_fence_get(f);
+		if (!dma_fence_add_callback(f, &h->cb, dma_fence_chain_cb)) {
+			dma_fence_put(fence);
+			return true;
+		}
+		dma_fence_put(f);
+	}
+	dma_fence_put(&h->base);
 	return false;
 }
 

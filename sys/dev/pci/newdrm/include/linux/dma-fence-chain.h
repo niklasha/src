@@ -11,6 +11,10 @@ struct dma_fence_chain {
 	struct dma_fence *prev;
 	uint64_t prev_seqno;
 	struct mutex lock;
+	union {
+		struct timeout to;
+		struct dma_fence_cb cb;
+	};
 };
 
 int dma_fence_chain_find_seqno(struct dma_fence **, uint64_t);
