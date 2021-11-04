@@ -954,9 +954,6 @@ EXPORT_SYMBOL(drm_gem_object_lookup);
 long drm_gem_dma_resv_wait(struct drm_file *filep, u32 handle,
 				    bool wait_all, unsigned long timeout)
 {
-	STUB();
-	return -ENOSYS;
-#ifdef notyet
 	long ret;
 	struct drm_gem_object *obj;
 
@@ -975,7 +972,6 @@ long drm_gem_dma_resv_wait(struct drm_file *filep, u32 handle,
 	drm_gem_object_put(obj);
 
 	return ret;
-#endif
 }
 EXPORT_SYMBOL(drm_gem_dma_resv_wait);
 
