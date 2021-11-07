@@ -1,4 +1,4 @@
-/*	$OpenBSD: validate.c,v 1.20 2021/10/29 09:27:36 claudio Exp $ */
+/*	$OpenBSD: validate.c,v 1.22 2021/11/04 11:32:55 claudio Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -29,14 +29,6 @@
 #include <unistd.h>
 
 #include "extern.h"
-
-static void
-tracewarn(const struct auth *a)
-{
-
-	for (; a != NULL; a = a->parent)
-		warnx(" ...inheriting from: %s", a->fn);
-}
 
 /*
  * Walk up the chain of certificates trying to match our AS number to
@@ -176,7 +168,6 @@ valid_cert(const char *fn, struct auth_tree *auths, const struct cert *cert)
 			continue;
 		warnx("%s: RFC 6487: uncovered AS: "
 		    "%u--%u", fn, min, max);
-		tracewarn(a);
 		return 0;
 	}
 
@@ -204,7 +195,6 @@ valid_cert(const char *fn, struct auth_tree *auths, const struct cert *cert)
 			    "(inherit)", fn);
 			break;
 		}
-		tracewarn(a);
 		return 0;
 	}
 
@@ -227,8 +217,7 @@ valid_roa(const char *fn, struct auth_tree *auths, struct roa *roa)
 	if (a == NULL)
 		return 0;
 
-	if ((roa->tal = strdup(a->tal)) == NULL)
-		err(1, NULL);
+	roa->talid = a->cert->talid;
 
 	for (i = 0; i < roa->ipsz; i++) {
 		if (valid_ip(a, roa->ips[i].afi, roa->ips[i].min,
@@ -238,7 +227,6 @@ valid_roa(const char *fn, struct auth_tree *auths, struct roa *roa)
 		    roa->ips[i].afi, buf, sizeof(buf));
 		warnx("%s: RFC 6482: uncovered IP: "
 		    "%s", fn, buf);
-		tracewarn(a);
 		return 0;
 	}
 

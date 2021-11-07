@@ -1,4 +1,4 @@
-/*	$OpenBSD: parser.c,v 1.21 2021/10/28 09:02:19 beck Exp $ */
+/*	$OpenBSD: parser.c,v 1.28 2021/11/04 18:26:48 claudio Exp $ */
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -41,9 +41,6 @@ static void		 build_chain(const struct auth *, STACK_OF(X509) **);
 static struct crl	*get_crl(const struct auth *);
 static void		 build_crls(const struct crl *, STACK_OF(X509_CRL) **);
 
-/* Limit how deep the RPKI tree can be. */
-#define	MAX_CERT_DEPTH	12
-
 static X509_STORE_CTX	*ctx;
 static struct auth_tree  auths = RB_INITIALIZER(&auths);
 static struct crl_tree	 crlt = RB_INITIALIZER(&crlt);
@@ -68,7 +65,6 @@ proc_parser_roa(struct entity *entp, const unsigned char *der, size_t len)
 		return NULL;
 
 	a = valid_ski_aki(entp->file, &auths, roa->ski, roa->aki);
-
 	build_chain(a, &chain);
 	crl = get_crl(a);
 	build_crls(crl, &crls);
@@ -99,14 +95,14 @@ proc_parser_roa(struct entity *entp, const unsigned char *der, size_t len)
 	/*
 	 * Check CRL to figure out the soonest transitive expiry moment
 	 */
-	if (roa->expires > crl->expires)
+	if (crl != NULL && roa->expires > crl->expires)
 		roa->expires = crl->expires;
 
 	/*
 	 * Scan the cert tree to figure out the soonest transitive
 	 * expiry moment
 	 */
-	for (; a->parent != NULL; a = a->parent) {
+	for (; a != NULL; a = a->parent) {
 		if (roa->expires > a->cert->expires)
 			roa->expires = a->cert->expires;
 	}
@@ -195,7 +191,7 @@ proc_parser_cert(const struct entity *entp, const unsigned char *der,
 	struct cert		*cert;
 	X509			*x509;
 	int			 c;
-	struct auth		*a = NULL, *na;
+	struct auth		*a = NULL;
 	STACK_OF(X509)		*chain;
 	STACK_OF(X509_CRL)	*crls;
 
@@ -236,40 +232,28 @@ proc_parser_cert(const struct entity *entp, const unsigned char *der,
 	X509_STORE_CTX_cleanup(ctx);
 	sk_X509_free(chain);
 	sk_X509_CRL_free(crls);
+	X509_free(x509);
+
+	cert->talid = a->cert->talid;
 
 	/* Validate the cert to get the parent */
 	if (!valid_cert(entp->file, &auths, cert)) {
-		X509_free(x509); // needed? XXX
-		return cert;
+		cert_free(cert);
+		return NULL;
 	}
 
 	/*
-	 * Add validated certs to the RPKI auth tree.
+	 * Add validated CA certs to the RPKI auth tree.
 	 */
-
-	cert->valid = 1;
-
-	na = malloc(sizeof(*na));
-	if (na == NULL)
-		err(1, NULL);
-
-	cert->tal = strdup(a->tal);
-	if (cert->tal == NULL)
-		err(1, NULL);
-
-	na->parent = a;
-	na->cert = cert;
-	na->tal = a->tal;
-	na->fn = strdup(entp->file);
-	if (na->fn == NULL)
-		err(1, NULL);
-
-	if (RB_INSERT(auth_tree, &auths, na) != NULL)
-		err(1, "auth tree corrupted");
+	if (cert->purpose == CERT_PURPOSE_CA) {
+		if (!auth_insert(&auths, cert, a)) {
+			cert_free(cert);
+			return NULL;
+		}
+	}
 
 	return cert;
 }
-
 
 /*
  * Root certificates come from TALs (has a pkey and is self-signed).
@@ -289,8 +273,6 @@ proc_parser_root_cert(const struct entity *entp, const unsigned char *der,
 	X509_NAME		*name;
 	struct cert		*cert;
 	X509			*x509;
-	struct auth		*na;
-	char			*tal;
 
 	assert(entp->has_data);
 
@@ -335,33 +317,24 @@ proc_parser_root_cert(const struct entity *entp, const unsigned char *der,
 		goto badcert;
 	}
 
+	X509_free(x509);
+
+	cert->talid = entp->talid;
+
 	/*
 	 * Add valid roots to the RPKI auth tree.
 	 */
-
-	cert->valid = 1;
-
-	na = malloc(sizeof(*na));
-	if (na == NULL)
-		err(1, NULL);
-
-	if ((tal = strdup(entp->descr)) == NULL)
-		err(1, NULL);
-
-	na->parent = NULL;
-	na->cert = cert;
-	na->tal = tal;
-	na->fn = strdup(entp->file);
-	if (na->fn == NULL)
-		err(1, NULL);
-
-	if (RB_INSERT(auth_tree, &auths, na) != NULL)
-		err(1, "auth tree corrupted");
+	if (!auth_insert(&auths, cert, NULL)) {
+		cert_free(cert);
+		return NULL;
+	}
 
 	return cert;
+
  badcert:
-	X509_free(x509); // needed? XXX
-	return cert;
+	X509_free(x509);
+	cert_free(cert);
+	return NULL;
 }
 
 /*
@@ -547,6 +520,7 @@ parse_entity(struct entityq *q, struct msgbuf *msgq)
 			    entp->datasz)) == NULL)
 				errx(1, "%s: could not parse tal file",
 				    entp->file);
+			tal->id = entp->talid;
 			tal_buffer(b, tal);
 			tal_free(tal);
 			break;

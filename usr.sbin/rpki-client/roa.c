@@ -1,4 +1,4 @@
-/*	$OpenBSD: roa.c,v 1.30 2021/10/28 09:02:19 beck Exp $ */
+/*	$OpenBSD: roa.c,v 1.32 2021/11/05 10:50:41 claudio Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -409,7 +409,6 @@ roa_free(struct roa *p)
 	free(p->aki);
 	free(p->ski);
 	free(p->ips);
-	free(p->tal);
 	free(p);
 }
 
@@ -420,25 +419,17 @@ roa_free(struct roa *p)
 void
 roa_buffer(struct ibuf *b, const struct roa *p)
 {
-	size_t	 i;
+	io_simple_buffer(b, &p->valid, sizeof(p->valid));
+	io_simple_buffer(b, &p->asid, sizeof(p->asid));
+	io_simple_buffer(b, &p->talid, sizeof(p->talid));
+	io_simple_buffer(b, &p->ipsz, sizeof(p->ipsz));
+	io_simple_buffer(b, &p->expires, sizeof(p->expires));
 
-	io_simple_buffer(b, &p->valid, sizeof(int));
-	io_simple_buffer(b, &p->asid, sizeof(uint32_t));
-	io_simple_buffer(b, &p->ipsz, sizeof(size_t));
-	io_simple_buffer(b, &p->expires, sizeof(time_t));
-
-	for (i = 0; i < p->ipsz; i++) {
-		io_simple_buffer(b, &p->ips[i].afi, sizeof(enum afi));
-		io_simple_buffer(b, &p->ips[i].maxlength, sizeof(size_t));
-		io_simple_buffer(b, p->ips[i].min, sizeof(p->ips[i].min));
-		io_simple_buffer(b, p->ips[i].max, sizeof(p->ips[i].max));
-		ip_addr_buffer(b, &p->ips[i].addr);
-	}
+	io_simple_buffer(b, p->ips, p->ipsz * sizeof(p->ips[0]));
 
 	io_str_buffer(b, p->aia);
 	io_str_buffer(b, p->aki);
 	io_str_buffer(b, p->ski);
-	io_str_buffer(b, p->tal);
 }
 
 /*
@@ -450,32 +441,24 @@ struct roa *
 roa_read(struct ibuf *b)
 {
 	struct roa	*p;
-	size_t		 i;
 
 	if ((p = calloc(1, sizeof(struct roa))) == NULL)
 		err(1, NULL);
 
-	io_read_buf(b, &p->valid, sizeof(int));
-	io_read_buf(b, &p->asid, sizeof(uint32_t));
-	io_read_buf(b, &p->ipsz, sizeof(size_t));
-	io_read_buf(b, &p->expires, sizeof(time_t));
+	io_read_buf(b, &p->valid, sizeof(p->valid));
+	io_read_buf(b, &p->asid, sizeof(p->asid));
+	io_read_buf(b, &p->talid, sizeof(p->talid));
+	io_read_buf(b, &p->ipsz, sizeof(p->ipsz));
+	io_read_buf(b, &p->expires, sizeof(p->expires));
 
 	if ((p->ips = calloc(p->ipsz, sizeof(struct roa_ip))) == NULL)
 		err(1, NULL);
-
-	for (i = 0; i < p->ipsz; i++) {
-		io_read_buf(b, &p->ips[i].afi, sizeof(enum afi));
-		io_read_buf(b, &p->ips[i].maxlength, sizeof(size_t));
-		io_read_buf(b, &p->ips[i].min, sizeof(p->ips[i].min));
-		io_read_buf(b, &p->ips[i].max, sizeof(p->ips[i].max));
-		ip_addr_read(b, &p->ips[i].addr);
-	}
+	io_read_buf(b, p->ips, p->ipsz * sizeof(p->ips[0]));
 
 	io_read_str(b, &p->aia);
 	io_read_str(b, &p->aki);
 	io_read_str(b, &p->ski);
-	io_read_str(b, &p->tal);
-	assert(p->aia && p->aki && p->ski && p->tal);
+	assert(p->aia && p->aki && p->ski);
 
 	return p;
 }
@@ -499,8 +482,7 @@ roa_insert_vrps(struct vrp_tree *tree, struct roa *roa, size_t *vrps,
 		v->addr = roa->ips[i].addr;
 		v->maxlength = roa->ips[i].maxlength;
 		v->asid = roa->asid;
-		if ((v->tal = strdup(roa->tal)) == NULL)
-			err(1, NULL);
+		v->talid = roa->talid;
 		v->expires = roa->expires;
 
 		/*
@@ -512,12 +494,9 @@ roa_insert_vrps(struct vrp_tree *tree, struct roa *roa, size_t *vrps,
 			/* already exists */
 			if (found->expires < v->expires) {
 				/* update found with preferred data */
-				found->expires = roa->expires;
-				free(found->tal);
-				found->tal = v->tal;
-				v->tal = NULL;
+				found->talid = v->talid;
+				found->expires = v->expires;
 			}
-			free(v->tal);
 			free(v);
 		} else
 			(*uniqs)++;
