@@ -31,14 +31,13 @@
 
 #include <drm/drm_device.h>
 #include <drm/drm_gem_cma_helper.h>
-#include <drm/ttm/ttm_bo_api.h>
 
 #include <uvm/uvm.h>
 
 static const struct uvm_pagerops drm_gem_cma_vm_ops = {
 	.pgo_fault = drm_gem_cma_fault,
-	.pgo_reference = drm_gem_cma_vm_reference,
-	.pgo_detach = drm_gem_cma_vm_detach
+	.pgo_reference = drm_ref,
+	.pgo_detach = drm_unref
 };
 
 static const struct drm_gem_object_funcs drm_gem_cma_default_funcs = {
@@ -186,7 +185,6 @@ drm_gem_cma_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
     vm_prot_t access_type, int flags)
 {
 	struct uvm_object *uobj = ufi->entry->object.uvm_obj;
-	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
 	struct drm_gem_object *gem_obj =
 	    container_of(uobj, struct drm_gem_object, uobj);
 	struct vm_map_entry *entry = ufi->entry;
@@ -268,20 +266,4 @@ drm_gem_cma_vmap(struct drm_gem_object *gem_obj, struct dma_buf_map *map)
 	dma_buf_map_set_vaddr(map, obj->vaddr);
 
 	return 0;
-}
-
-void
-drm_gem_cma_vm_reference(struct uvm_object *uobj)
-{
-	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
-
-	ttm_bo_get(bo);
-}
-
-void
-drm_gem_cma_vm_detach(struct uvm_object *uobj)
-{
-	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
-
-	ttm_bo_put(bo);
 }

@@ -17,9 +17,6 @@ struct sg_table *drm_gem_cma_get_sg_table(struct drm_gem_object *);
 
 int drm_gem_cma_vmap(struct drm_gem_object *, struct dma_buf_map *);
 
-void drm_gem_cma_vm_reference(struct uvm_object *);
-void drm_gem_cma_vm_detach(struct uvm_object *);
-
 struct drm_gem_cma_object {
 	struct drm_gem_object	base;
 	bus_dma_tag_t		dmat;

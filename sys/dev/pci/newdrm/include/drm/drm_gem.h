@@ -440,4 +440,7 @@ int drm_gem_fence_array_add_implicit(struct xarray *fence_array,
 int drm_gem_dumb_map_offset(struct drm_file *file, struct drm_device *dev,
 			    u32 handle, u64 *offset);
 
+void drm_ref(struct uvm_object *);
+void drm_unref(struct uvm_object *);
+
 #endif /* __DRM_GEM_H__ */
