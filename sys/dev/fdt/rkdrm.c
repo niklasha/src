@@ -71,16 +71,11 @@ vmem_t	*rkdrm_alloc_cma_pool(struct drm_device *, size_t);
 int	rkdrm_load(struct drm_device *, unsigned long);
 int	rkdrm_unload(struct drm_device *);
 
-int	rkdrm_gem_fault(struct drm_gem_object *, struct uvm_faultinfo *,
-	    off_t, vaddr_t, vm_page_t *, int, int, vm_prot_t, int);
-
 struct drm_driver rkdrm_driver = {
 	.driver_features = DRIVER_ATOMIC | DRIVER_MODESET | DRIVER_GEM,
 
 	.dumb_create = drm_gem_cma_dumb_create,
 	.dumb_map_offset = drm_gem_dumb_map_offset,
-
-	.gem_fault = drm_gem_cma_fault,
 
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,

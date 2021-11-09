@@ -10,8 +10,15 @@ int drm_gem_cma_dumb_map_offset(struct drm_file *, struct drm_device *,
 struct drm_gem_cma_object *drm_gem_cma_create(struct drm_device *,
     size_t);
 
-int drm_gem_cma_fault(struct drm_gem_object *, struct uvm_faultinfo *,
-    off_t, vaddr_t, vm_page_t *, int, int, vm_prot_t, int);
+int drm_gem_cma_fault(struct uvm_faultinfo *, vaddr_t, vm_page_t *,
+    int, int, vm_fault_t, vm_prot_t, int);
+
+struct sg_table *drm_gem_cma_get_sg_table(struct drm_gem_object *);
+
+int drm_gem_cma_vmap(struct drm_gem_object *, struct dma_buf_map *);
+
+void drm_gem_cma_vm_reference(struct uvm_object *);
+void drm_gem_cma_vm_detach(struct uvm_object *);
 
 struct drm_gem_cma_object {
 	struct drm_gem_object	base;
