@@ -178,14 +178,14 @@ EXPORT_SYMBOL(ttm_tt_init);
 
 void ttm_tt_fini(struct ttm_tt *ttm)
 {
-	if (ttm->pages) {
+	if (ttm->pages)
 		kvfree(ttm->pages);
-		kvfree(ttm->orders);
-	} else
+	else
 		kvfree(ttm->dma_address);
+	kvfree(ttm->orders);
 	ttm->pages = NULL;
-	ttm->orders = NULL;
 	ttm->dma_address = NULL;
+	ttm->orders = NULL;
 
 	bus_dmamap_destroy(ttm->dmat, ttm->map);
 	km_free(ttm->segs, round_page(ttm->num_pages *
