@@ -26,7 +26,7 @@ extern const struct dma_fence_ops dma_fence_chain_ops;
 static inline struct dma_fence_chain *
 to_dma_fence_chain(struct dma_fence *fence)
 {
-	if (fence && fence->ops != &dma_fence_chain_ops)
+	if ((fence == NULL) || (fence->ops != &dma_fence_chain_ops))
 		return NULL;
 
 	return container_of(fence, struct dma_fence_chain, base);
