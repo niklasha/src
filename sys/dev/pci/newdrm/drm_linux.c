@@ -2024,16 +2024,22 @@ void
 dma_fence_chain_init(struct dma_fence_chain *chain, struct dma_fence *prev,
     struct dma_fence *fence, uint64_t seqno)
 {
-	struct dma_fence_chain *prev_chain = to_dma_fence_chain(prev);
 	uint64_t context;
 
 	chain->fence = fence;
 	chain->prev = prev;
 	mtx_init(&chain->lock, IPL_TTY);
 
-	if (prev_chain && seqno > prev->seqno) {
-		chain->prev_seqno = prev->seqno;
-		context = prev->context;
+	/* if prev is a chain */
+	if (to_dma_fence_chain(prev) != NULL) {
+		if (seqno > prev->seqno) {
+			chain->prev_seqno = prev->seqno;
+			context = prev->context;
+		} else {
+			chain->prev_seqno = 0;
+			context = dma_fence_context_alloc(1);
+			seqno = prev->seqno;
+		}
 	} else {
 		chain->prev_seqno = 0;
 		context = dma_fence_context_alloc(1);
