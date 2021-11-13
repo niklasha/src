@@ -89,7 +89,6 @@ static struct amdgpu_bo_va_mapping *
 amdgpu_vm_it_iter_next(struct amdgpu_bo_va_mapping *node, uint64_t start,
     uint64_t last)
 {
-	STUB();
 	struct rb_node *rb = &node->rb;
 
 	for (rb = rb_next(rb); rb; rb = rb_next(rb)) {
