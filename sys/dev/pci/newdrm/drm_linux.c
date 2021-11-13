@@ -1519,7 +1519,7 @@ dma_fence_put(struct dma_fence *fence)
 }
 
 int
-dma_fence_signal_locked(struct dma_fence *fence)
+dma_fence_signal_timestamp_locked(struct dma_fence *fence, ktime_t timestamp)
 {
 	struct dma_fence_cb *cur, *tmp;
 	struct list_head cb_list;
@@ -1532,7 +1532,7 @@ dma_fence_signal_locked(struct dma_fence *fence)
 
 	list_replace(&fence->cb_list, &cb_list);
 
-	fence->timestamp = ktime_get();
+	fence->timestamp = timestamp;
 	set_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &fence->flags);
 
 	list_for_each_entry_safe(cur, tmp, &cb_list, node) {
@@ -1552,17 +1552,34 @@ dma_fence_signal(struct dma_fence *fence)
 		return -EINVAL;
 
 	mtx_enter(fence->lock);
-	r = dma_fence_signal_locked(fence);
+	r = dma_fence_signal_timestamp_locked(fence, ktime_get());
 	mtx_leave(fence->lock);
 
 	return r;
 }
 
 int
+dma_fence_signal_locked(struct dma_fence *fence)
+{
+	if (fence == NULL)
+		return -EINVAL;
+
+	return dma_fence_signal_timestamp_locked(fence, ktime_get());
+}
+
+int
 dma_fence_signal_timestamp(struct dma_fence *fence, ktime_t timestamp)
 {
-	STUB();
-	return -ENOSYS;
+	int r;
+
+	if (fence == NULL)
+		return -EINVAL;
+
+	mtx_enter(fence->lock);
+	r = dma_fence_signal_timestamp_locked(fence, timestamp);
+	mtx_leave(fence->lock);
+
+	return r;
 }
 
 bool
