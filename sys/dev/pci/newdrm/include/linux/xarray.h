@@ -108,9 +108,7 @@ static inline void *
 xa_load(struct xarray *xa, unsigned long index)
 {
 	void *r;
-	mtx_enter(&xa->xa_lock);
 	r = __xa_load(xa, index);
-	mtx_leave(&xa->xa_lock);
 	return r;
 }
 
