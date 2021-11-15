@@ -1,4 +1,4 @@
-/*	$OpenBSD: fetch.c,v 1.206 2021/11/06 14:27:45 kn Exp $	*/
+/*	$OpenBSD: fetch.c,v 1.208 2021/11/10 07:32:55 kn Exp $	*/
 /*	$NetBSD: fetch.c,v 1.14 1997/08/18 10:20:20 lukem Exp $	*/
 
 /*-

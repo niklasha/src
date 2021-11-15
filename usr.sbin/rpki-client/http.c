@@ -1,4 +1,4 @@
-/*	$OpenBSD: http.c,v 1.48 2021/11/04 14:24:41 claudio Exp $  */
+/*	$OpenBSD: http.c,v 1.50 2021/11/10 09:13:30 claudio Exp $  */
 /*
  * Copyright (c) 2020 Nils Fisher <nils_fisher@hotmail.com>
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -159,7 +159,7 @@ static uint8_t *tls_ca_mem;
 static size_t tls_ca_size;
 
 /* HTTP request API */
-static void	http_req_new(size_t, char *, char *, int);
+static void	http_req_new(size_t, char *, char *, int, int);
 static void	http_req_free(struct http_request *);
 static void	http_req_done(size_t, enum http_result, const char *);
 static void	http_req_fail(size_t);
@@ -211,14 +211,17 @@ http_info(const char *uri)
 }
 
 /*
- * Determine whether the character needs encoding, per RFC1738:
- *	- No corresponding graphic US-ASCII.
- *	- Unsafe characters.
+ * Determine whether the character needs encoding, per RFC2396.
  */
 static int
-unsafe_char(const char *c0)
+to_encode(const char *c0)
 {
-	const char *unsafe_chars = " <>\"#{}|\\^~[]`";
+	/* 2.4.3. Excluded US-ASCII Characters */
+	const char *excluded_chars =
+	    " "         /* space */
+	    "<>#\""     /* delims (modulo "%", see below) */
+	    "{}|\\^[]`" /* unwise */
+	    ;
 	const unsigned char *c = (const unsigned char *)c0;
 
 	/*
@@ -228,16 +231,15 @@ unsafe_char(const char *c0)
 	return (iscntrl(*c) || !isascii(*c) ||
 
 	    /*
-	     * Unsafe characters.
-	     * '%' is also unsafe, if is not followed by two
+	     * '%' is also reserved, if is not followed by two
 	     * hexadecimal digits.
 	     */
-	    strchr(unsafe_chars, *c) != NULL ||
+	    strchr(excluded_chars, *c) != NULL ||
 	    (*c == '%' && (!isxdigit(c[1]) || !isxdigit(c[2]))));
 }
 
 /*
- * Encode given URL, per RFC1738.
+ * Encode given URL, per RFC2396.
  * Allocate and return string to the caller.
  */
 static char *
@@ -254,7 +256,7 @@ url_encode(const char *path)
 	 * final URL.
 	 */
 	for (i = 0; i < length; i++)
-		if (unsafe_char(path + i))
+		if (to_encode(path + i))
 			new_length += 2;
 
 	epath = epathp = malloc(new_length + 1);	/* One more for '\0'. */
@@ -266,7 +268,7 @@ url_encode(const char *path)
 	 * Encode, and copy final URL.
 	 */
 	for (i = 0; i < length; i++)
-		if (unsafe_char(path + i)) {
+		if (to_encode(path + i)) {
 			snprintf(epathp, 4, "%%" "%02x",
 			    (unsigned char)path[i]);
 			epathp += 3;
@@ -507,7 +509,7 @@ http_resolv(struct addrinfo **res, const char *host, const char *port)
  * Create and queue a new request.
  */
 static void
-http_req_new(size_t id, char *uri, char *modified_since, int outfd)
+http_req_new(size_t id, char *uri, char *modified_since, int count, int outfd)
 {
 	struct http_request *req;
 	char *host, *port, *path;
@@ -530,6 +532,7 @@ http_req_new(size_t id, char *uri, char *modified_since, int outfd)
 	req->path = path;
 	req->uri = uri;
 	req->modified_since = modified_since;
+	req->redirect_loop = count;
 
 	TAILQ_INSERT_TAIL(&queue, req, entry);
 }
@@ -1135,7 +1138,8 @@ http_redirect(struct http_connection *conn)
 			err(1, NULL);
 
 	logx("redirect to %s", http_info(uri));
-	http_req_new(conn->req->id, uri, mod_since, outfd);	
+	http_req_new(conn->req->id, uri, mod_since, conn->req->redirect_loop,
+	    outfd);	
 
 	/* clear request before moving connection to idle */
 	http_req_free(conn->req);
@@ -1867,7 +1871,7 @@ proc_http(char *bind_addr, int fd)
 				io_read_str(b, &mod);
 
 				/* queue up new requests */
-				http_req_new(id, uri, mod, b->fd);
+				http_req_new(id, uri, mod, 0, b->fd);
 				ibuf_free(b);
 			}
 		}

@@ -983,7 +983,6 @@
 ./usr/include/net/if_pppoe.h
 ./usr/include/net/if_pppvar.h
 ./usr/include/net/if_sppp.h
-./usr/include/net/if_switch.h
 ./usr/include/net/if_trunk.h
 ./usr/include/net/if_tun.h
 ./usr/include/net/if_types.h
@@ -1014,7 +1013,6 @@
 ./usr/include/net80211/ieee80211_amrr.h
 ./usr/include/net80211/ieee80211_crypto.h
 ./usr/include/net80211/ieee80211_ioctl.h
-./usr/include/net80211/ieee80211_mira.h
 ./usr/include/net80211/ieee80211_node.h
 ./usr/include/net80211/ieee80211_priv.h
 ./usr/include/net80211/ieee80211_proto.h
@@ -1759,7 +1757,10 @@
 ./usr/share/man/man3/ASN1_generate_nconf.3
 ./usr/share/man/man3/ASN1_get_object.3
 ./usr/share/man/man3/ASN1_item_d2i.3
+./usr/share/man/man3/ASN1_item_digest.3
 ./usr/share/man/man3/ASN1_item_new.3
+./usr/share/man/man3/ASN1_item_sign.3
+./usr/share/man/man3/ASN1_item_verify.3
 ./usr/share/man/man3/ASN1_mbstring_copy.3
 ./usr/share/man/man3/ASN1_parse_dump.3
 ./usr/share/man/man3/ASN1_put_object.3
@@ -2215,9 +2216,11 @@
 ./usr/share/man/man3/X509_get_subject_name.3
 ./usr/share/man/man3/X509_get_version.3
 ./usr/share/man/man3/X509_keyid_set1.3
+./usr/share/man/man3/X509_load_cert_file.3
 ./usr/share/man/man3/X509_new.3
 ./usr/share/man/man3/X509_ocspid_print.3
 ./usr/share/man/man3/X509_policy_check.3
+./usr/share/man/man3/X509_policy_tree_get0_policies.3
 ./usr/share/man/man3/X509_policy_tree_level_count.3
 ./usr/share/man/man3/X509_print_ex.3
 ./usr/share/man/man3/X509_sign.3
