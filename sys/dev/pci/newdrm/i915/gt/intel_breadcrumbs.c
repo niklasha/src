@@ -274,7 +274,7 @@ intel_breadcrumbs_create(struct intel_engine_cs *irq_engine)
 
 	kref_init(&b->ref);
 
-	mtx_init(&b->signalers_lock, IPL_NONE);
+	mtx_init(&b->signalers_lock, IPL_TTY);
 	INIT_LIST_HEAD(&b->signalers);
 	init_llist_head(&b->signaled_requests);
 
