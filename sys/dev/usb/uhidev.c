@@ -1,4 +1,4 @@
-/*	$OpenBSD: uhidev.c,v 1.99 2021/11/11 07:04:45 anton Exp $	*/
+/*	$OpenBSD: uhidev.c,v 1.101 2021/11/17 06:20:30 anton Exp $	*/
 /*	$NetBSD: uhidev.c,v 1.14 2003/03/11 16:44:00 augustss Exp $	*/
 
 /*
@@ -248,7 +248,7 @@ uhidev_attach(struct device *parent, struct device *self, void *aux)
 
 	uha.uaa = uaa;
 	uha.parent = sc;
-	uha.reportid = UHIDEV_CLAIM_MULTIPLE_REPORTID;
+	uha.reportid = __UHIDEV_CLAIM_MULTIPLE_REPORTID;
 	uha.nreports = nrepid;
 	uha.claimed = malloc(nrepid, M_TEMP, M_WAITOK|M_ZERO);
 
@@ -360,7 +360,7 @@ uhidevprint(void *aux, const char *pnp)
 
 	if (pnp)
 		printf("uhid at %s", pnp);
-	if (uha->reportid != 0 && uha->reportid != UHIDEV_CLAIM_MULTIPLE_REPORTID)
+	if (uha->reportid != 0 && uha->reportid != __UHIDEV_CLAIM_MULTIPLE_REPORTID)
 		printf(" reportid %d", uha->reportid);
 	return (UNCONF);
 }
@@ -592,6 +592,7 @@ out2:
 out1:
 	DPRINTF(("uhidev_open: failed in someway"));
 	free(sc->sc_ibuf, M_USBDEV, sc->sc_isize);
+	sc->sc_ibuf = NULL;
 	scd->sc_state &= ~UHIDEV_OPEN;
 	sc->sc_refcnt = 0;
 	sc->sc_ipipe = NULL;
