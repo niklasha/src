@@ -336,7 +336,6 @@ EXPORT_SYMBOL(drm_aperture_remove_conflicting_framebuffers);
 int drm_aperture_remove_conflicting_pci_framebuffers(struct pci_dev *pdev,
 						     const struct drm_driver *req_driver)
 {
-	STUB();
 	return 0;
 #ifdef notyet
 	resource_size_t base, size;
