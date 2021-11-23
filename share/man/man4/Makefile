@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.812 2021/11/11 09:45:27 claudio Exp $
+#	$OpenBSD: Makefile,v 1.814 2021/11/22 20:24:41 kettenis Exp $
 
 MAN=	aac.4 abcrtc.4 abl.4 ac97.4 acphy.4 acrtc.4 \
 	acpi.4 acpiac.4 acpials.4 acpiasus.4 acpibat.4 \
@@ -42,12 +42,13 @@ MAN=	aac.4 abcrtc.4 abl.4 ac97.4 acphy.4 acrtc.4 \
 	hireset.4 hitemp.4 hme.4 hotplug.4 hsq.4 \
 	hvn.4 hvs.4 hyperv.4 \
 	iatp.4 iavf.4 ichiic.4 ichwdt.4 icmp.4 icmp6.4 icsphy.4 ifmedia.4 \
-	igc.4 iha.4 ihidev.4 iic.4 ikbd.4 ims.4 imt.4 imxanatop.4 imxdog.4 \
-	imxesdhc.4 imxgpc.4 imxgpio.4 imxiic.4 imxpciephy.4 imxpwm.4 imxrtc.4 \
-	imxspi.4 imxsrc.4 imxtmu.4 imxuart.4 inet.4 inet6.4 inphy.4 iophy.4 \
-	ip.4 ip6.4 ipcomp.4 ipgphy.4 ipmi.4 ips.4 ipsec.4 ipw.4 \
-	isa.4 isagpio.4 isapnp.4 islrtc.4 it.4 itherm.4 iwi.4 iwn.4 iwm.4 \
-	iwx.4 ix.4 ixgb.4 ixl.4 jmb.4 jme.4 jmphy.4 \
+	igc.4 iha.4 ihidev.4 iic.4 iicmux.4 ikbd.4 ims.4 imt.4 imxanatop.4 \
+	imxdog.4 imxesdhc.4 imxgpc.4 imxgpio.4 imxiic.4 imxpciephy.4 \
+	imxpwm.4 imxrtc.4 imxspi.4 imxsrc.4 imxtmu.4 imxuart.4 \
+	inet.4 inet6.4 inphy.4 iophy.4 ip.4 ip6.4 ipcomp.4 ipgphy.4 \
+	ipmi.4 ips.4 ipsec.4 ipw.4 isa.4 isagpio.4 isapnp.4 islrtc.4 \
+	it.4 itherm.4 iwi.4 iwn.4 iwm.4 iwx.4 ix.4 ixgb.4 ixl.4 \
+	jmb.4 jme.4 jmphy.4 \
 	kate.4 kcov.4 km.4 ksmn.4 ksyms.4 kubsan.4 kue.4 lc.4 lge.4 lii.4 \
 	lisa.4 lm.4 lmenv.4 lmn.4 lmtemp.4 lo.4 lpt.4 lxtphy.4 luphy.4 \
 	maestro.4 mainbus.4 malo.4 maxds.4 maxrtc.4 maxtmp.4 mbg.4 \
@@ -64,7 +65,8 @@ MAN=	aac.4 abcrtc.4 abl.4 ac97.4 acphy.4 acrtc.4 \
 	pair.4 pcagpio.4 pcaled.4 pcamux.4 \
 	pcdisplay.4 pchb.4 pchtemp.4 pci.4 pcib.4 \
 	pcfadc.4 pcfiic.4 pcfrtc.4 pchgpio.4 pciide.4 pckbc.4 pckbd.4 \
-	pcmcia.4 pcn.4 pcppi.4 pcscp.4 pcxrtc.4 pf.4 pflog.4 pflow.4 pfsync.4 \
+	pcmcia.4 pcn.4 pcppi.4 pcscp.4 pcxrtc.4 pcyrtc.4 \
+	pf.4 pflog.4 pflow.4 pfsync.4 \
 	pgt.4 piixpm.4 pinctrl.4 pipex.4 plgpio.4 plrtc.4 pluart.4 \
 	pms.4 ppb.4 ppp.4 pppoe.4 pppx.4 psci.4 pty.4 puc.4 pvbus.4 \
 	pvclock.4 pwdog.4 pwmbl.4 pwmfan.4 pwmreg.4 \

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_ipsp.c,v 1.250 2021/11/16 13:53:14 bluhm Exp $	*/
+/*	$OpenBSD: ip_ipsp.c,v 1.253 2021/11/21 16:17:48 mvs Exp $	*/
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr),
@@ -335,8 +335,8 @@ reserve_spi(u_int rdomain, u_int32_t sspi, u_int32_t tspi,
  * is really one of our addresses if we received the packet!
  */
 struct tdb *
-gettdb_dir(u_int rdomain, u_int32_t spi, union sockaddr_union *dst, u_int8_t proto,
-    int reverse)
+gettdb_dir(u_int rdomain, u_int32_t spi, union sockaddr_union *dst,
+    u_int8_t proto, int reverse)
 {
 	u_int32_t hashval;
 	struct tdb *tdbp;
@@ -591,8 +591,8 @@ tdb_printit(void *addr, int full, int (*pr)(const char *, ...))
 		DUMP(ids_swapped, "%d");
 		DUMP(mtu, "%d");
 		DUMP(mtutimeout, "%lld");
-		pr("%18s: %08x\n", "udpencap_port",
-		    ntohl(tdb->tdb_udpencap_port));
+		pr("%18s: %d\n", "udpencap_port",
+		    ntohs(tdb->tdb_udpencap_port));
 		DUMP(tag, "%d");
 		DUMP(tap, "%d");
 		DUMP(rdomain, "%d");
@@ -652,8 +652,10 @@ tdb_timeout(void *v)
 	NET_LOCK();
 	if (tdb->tdb_flags & TDBF_TIMER) {
 		/* If it's an "invalid" TDB do a silent expiration. */
-		if (!(tdb->tdb_flags & TDBF_INVALID))
+		if (!(tdb->tdb_flags & TDBF_INVALID)) {
+			ipsecstat_inc(ipsec_exctdb);
 			pfkeyv2_expire(tdb, SADB_EXT_LIFETIME_HARD);
+		}
 		tdb_delete(tdb);
 	}
 	NET_UNLOCK();
@@ -667,8 +669,10 @@ tdb_firstuse(void *v)
 	NET_LOCK();
 	if (tdb->tdb_flags & TDBF_SOFT_FIRSTUSE) {
 		/* If the TDB hasn't been used, don't renew it. */
-		if (tdb->tdb_first_use != 0)
+		if (tdb->tdb_first_use != 0) {
+			ipsecstat_inc(ipsec_exctdb);
 			pfkeyv2_expire(tdb, SADB_EXT_LIFETIME_HARD);
+		}
 		tdb_delete(tdb);
 	}
 	NET_UNLOCK();
@@ -1166,7 +1170,7 @@ ipsp_ids_free(struct ipsec_ids *ids)
 	if (--ids->id_refcount > 0)
 		return;
 
-	/* 
+	/*
 	 * Add second for the case ipsp_ids_gc() is already running and
 	 * awaits netlock to be released.
 	 */

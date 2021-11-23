@@ -1,5 +1,7 @@
-#	$OpenBSD: Makefile,v 1.1 2021/10/29 13:13:04 mpi Exp $
+#	$OpenBSD: Makefile,v 1.3 2021/11/23 01:14:26 deraadt Exp $
 
-PROG=	pollnval
+PROGS=		poll_close pollnval pollretval
+LDADD=		-lpthread
+WARNINGS=	yes
 
 .include <bsd.regress.mk>

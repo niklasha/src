@@ -1,12 +1,14 @@
-# $OpenBSD: Makefile,v 1.216 2021/11/17 16:08:32 schwarze Exp $
+# $OpenBSD: Makefile,v 1.220 2021/11/22 16:19:54 schwarze Exp $
 
 .include <bsd.own.mk>
 
 MAN=	\
 	ACCESS_DESCRIPTION_new.3 \
 	AES_encrypt.3 \
+	ASN1_BIT_STRING_num_asc.3 \
 	ASN1_BIT_STRING_set.3 \
 	ASN1_INTEGER_get.3 \
+	ASN1_NULL_new.3 \
 	ASN1_OBJECT_new.3 \
 	ASN1_PRINTABLE_type.3 \
 	ASN1_STRING_TABLE_add.3 \
@@ -366,7 +368,9 @@ MAN=	\
 	X509at_add1_attr.3 \
 	X509at_get_attr.3 \
 	X509v3_get_ext_by_NID.3 \
+	a2d_ASN1_OBJECT.3 \
 	crypto.3 \
+	d2i_ASN1_BOOLEAN.3 \
 	d2i_ASN1_NULL.3 \
 	d2i_ASN1_OBJECT.3 \
 	d2i_ASN1_OCTET_STRING.3 \
