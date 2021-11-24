@@ -35,20 +35,10 @@
 #include <machine/fdt.h>
 
 #include <dev/ofw/openfirm.h>
-#include <dev/ofw/ofw_clock.h>
-#include <dev/ofw/ofw_gpio.h>
 #include <dev/ofw/ofw_misc.h>
-#include <dev/ofw/fdt.h>
 
-#include <uvm/uvm_extern.h>
-#include <uvm/uvm_object.h>
-#include <uvm/uvm_device.h>
-
-#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
-#include <drm/drm_vblank.h>
-#include <drm/drm_crtc_helper.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_gem.h>
 
