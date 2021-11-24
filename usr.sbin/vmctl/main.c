@@ -708,10 +708,15 @@ ctl_convert(const char *srcfile, const char *dstfile, int dsttype, size_t dstsiz
 		/*
 		 * No need to copy empty buffers.  This allows the backend,
 		 * sparse files or QCOW2 images, to save space in the
-		 * destination file.
+		 * destination file.  If the input has run out, break out
+		 * early.
 		 */
-		if (memcmp(buf, zerobuf, buflen) == 0)
-			continue;
+		if (memcmp(buf, zerobuf, buflen) == 0) {
+			if (off < src.size)
+				continue;
+			else
+				break;
+		}
 
 		log_debug("%s: writing %zd of %lld bytes at offset %lld",
 		    format, len, dst.size, off);
