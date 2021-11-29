@@ -1,4 +1,4 @@
-/*	$OpenBSD: policy.c,v 1.85 2021/10/26 17:31:22 tobhe Exp $	*/
+/*	$OpenBSD: policy.c,v 1.88 2021/11/27 21:50:05 tobhe Exp $	*/
 
 /*
  * Copyright (c) 2020-2021 Tobias Heider <tobhe@openbsd.org>
@@ -103,14 +103,23 @@ policy_lookup(struct iked *env, struct iked_message *msg,
 		pol.pol_flags |= IKED_POLICY_TRANSPORT;
 	memcpy(&pol.pol_peer.addr, &msg->msg_peer, sizeof(msg->msg_peer));
 	memcpy(&pol.pol_local.addr, &msg->msg_local, sizeof(msg->msg_local));
-	if (msg->msg_id.id_type &&
-	    ikev2_print_id(&msg->msg_id, idstr, IKED_ID_SIZE) == 0 &&
+	if (msg->msg_peerid.id_type &&
+	    ikev2_print_id(&msg->msg_peerid, idstr, IKED_ID_SIZE) == 0 &&
 	    (s = strchr(idstr, '/')) != NULL) {
-		pol.pol_peerid.id_type = msg->msg_id.id_type;
+		pol.pol_peerid.id_type = msg->msg_peerid.id_type;
 		pol.pol_peerid.id_length = strlen(s+1);
 		strlcpy(pol.pol_peerid.id_data, s+1,
 		    sizeof(pol.pol_peerid.id_data));
 		log_debug("%s: peerid '%s'", __func__, s+1);
+	}
+	if (msg->msg_localid.id_type &&
+	    ikev2_print_id(&msg->msg_localid, idstr, IKED_ID_SIZE) == 0 &&
+	    (s = strchr(idstr, '/')) != NULL) {
+		pol.pol_localid.id_type = msg->msg_localid.id_type;
+		pol.pol_localid.id_length = strlen(s+1);
+		strlcpy(pol.pol_localid.id_data, s+1,
+		    sizeof(pol.pol_localid.id_data));
+		log_debug("%s: localid '%s'", __func__, s+1);
 	}
 
 	/* Try to find a matching policy for this message */
@@ -644,7 +653,7 @@ sa_free_flows(struct iked *env, struct iked_saflows *head)
 		if (flow->flow_loaded)
 			RB_REMOVE(iked_flows, &env->sc_activeflows, flow);
 		TAILQ_REMOVE(head, flow, flow_entry);
-		(void)pfkey_flow_delete(env->sc_pfkey, flow);
+		(void)pfkey_flow_delete(env, flow);
 		flow_free(flow);
 	}
 }

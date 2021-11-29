@@ -1,4 +1,4 @@
-/*	$OpenBSD: utvfu.c,v 1.12 2021/11/22 10:17:14 mglocker Exp $ */
+/*	$OpenBSD: utvfu.c,v 1.15 2021/11/28 14:10:32 mglocker Exp $ */
 /*
  * Copyright (c) 2013 Lubomir Rintel
  * Copyright (c) 2013 Federico Simoncelli
@@ -124,11 +124,13 @@ utvfu_set_regs(struct utvfu_softc *sc, const uint16_t regs[][2], int size)
 int
 utvfu_max_frame_size(void)
 {
-	int	i, sz = 0;
+	int i, sz = 0;
+
 	for (i = 0; i < nitems(utvfu_norm_params); i++) {
 		if (sz < utvfu_norm_params[i].frame_len)
 			sz = utvfu_norm_params[i].frame_len;
 	}
+
 	return (sz);
 }
 
@@ -490,6 +492,7 @@ utvfu_querycap(void *v, struct v4l2_capability *cap)
 	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE;
 	cap->device_caps |= V4L2_CAP_READWRITE | V4L2_CAP_STREAMING;
 	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
+
 	return (0);
 }
 
@@ -511,6 +514,7 @@ utvfu_enum_input(void *v, struct v4l2_input *i)
 
 	i->type = V4L2_INPUT_TYPE_CAMERA;
 	i->std = utvfu_norm_params[sc->sc_normi].norm;
+
 	return (0);
 }
 
@@ -523,6 +527,7 @@ utvfu_enum_fmt_vid_cap(void *v, struct v4l2_fmtdesc *f)
 	strlcpy(f->description, "16 bpp YUY2, 4:2:2, packed",
 					sizeof(f->description));
 	f->pixelformat = V4L2_PIX_FMT_YUYV;
+
 	return (0);
 }
 
@@ -534,9 +539,14 @@ utvfu_enum_fsizes(void *v, struct v4l2_frmsizeenum *fsizes)
 	if (fsizes->pixel_format != V4L2_PIX_FMT_YUYV)
 		return (EINVAL);
 
+	/* The device only supports one frame size. */
+	if (fsizes->index >= 1)
+		return (EINVAL);
+
 	fsizes->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	fsizes->discrete.width = utvfu_norm_params[sc->sc_normi].cap_width;
 	fsizes->discrete.height = utvfu_norm_params[sc->sc_normi].cap_height;
+
 	return (0);
 }
 
@@ -552,6 +562,7 @@ utvfu_g_fmt(void *v, struct v4l2_format *f)
 	f->fmt.pix.bytesperline = f->fmt.pix.width * 2;
 	f->fmt.pix.sizeimage = (f->fmt.pix.bytesperline * f->fmt.pix.height);
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE170M;
+
 	return (0);
 }
 
@@ -560,6 +571,7 @@ utvfu_s_fmt(void *v, struct v4l2_format *f)
 {
 	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV)
 		return (EINVAL);
+
 	return (0);
 }
 
@@ -567,7 +579,9 @@ int
 utvfu_g_std(void *v, v4l2_std_id *norm)
 {
 	struct utvfu_softc *sc = v;
+
 	*norm = utvfu_norm_params[sc->sc_normi].norm;
+
 	return (0);
 }
 
@@ -587,7 +601,9 @@ int
 utvfu_g_input(void *v, int *i)
 {
 	struct utvfu_softc *sc = v;
+
 	*i = sc->sc_input;
+
 	return (0);
 }
 
@@ -1262,6 +1278,7 @@ void
 utvfu_vs_start_isoc(struct utvfu_softc *sc)
 {
 	int i;
+
 	for (i = 0; i < UTVFU_ISOC_TRANSFERS; i++)
 		utvfu_vs_start_isoc_ixfer(sc, &sc->sc_iface.ixfer[i]);
 }
@@ -1345,7 +1362,7 @@ skip:	/* setup new transfer */
 int
 utvfu_find_queued(struct utvfu_softc *sc)
 {
-	int	i;
+	int i;
 
 	/* find a buffer which is ready for queueing */
 	for (i = 0; i < sc->sc_mmap_count; i++) {
@@ -1354,6 +1371,7 @@ utvfu_find_queued(struct utvfu_softc *sc)
 		if (sc->sc_mmap[i].v4l2_buf.flags & V4L2_BUF_FLAG_QUEUED)
 			return (i);
 	}
+
 	return (-1);
 }
 
@@ -1418,6 +1436,7 @@ int
 utvfu_get_bufsize(void *v)
 {
 	struct utvfu_softc *sc = v;
+
 	/* YUYV/YUV-422: 4 bytes/2 pixel */
 	return (utvfu_norm_params[sc->sc_normi].cap_width *
 	    utvfu_norm_params[sc->sc_normi].cap_height * 2);
@@ -1786,6 +1805,7 @@ int
 utvfu_streamoff(void *v, int type)
 {
 	utvfu_vs_close(v);
+
 	return (0);
 }
 
@@ -1793,6 +1813,7 @@ int
 utvfu_queryctrl(void *v, struct v4l2_queryctrl *qctrl)
 {
 	qctrl->flags = V4L2_CTRL_FLAG_DISABLED;
+
 	return (0);
 }
 
@@ -1803,6 +1824,7 @@ utvfu_g_parm(void *v, struct v4l2_streamparm *parm)
 
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return (EINVAL);
+
 	/*
 	 * XXX Unsure whether there is a way to negotiate this with the
 	 * device, but returning 0 will allow xenocara's video to run
@@ -1823,6 +1845,7 @@ utvfu_g_parm(void *v, struct v4l2_streamparm *parm)
 		parm->parm.capture.timeperframe.denominator = 1;
 		break;
 	}
+
 	return (0);
 }
 
@@ -1831,6 +1854,7 @@ utvfu_s_parm(void *v, struct v4l2_streamparm *parm)
 {
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return (EINVAL);
+
 	return (0);
 }
 
@@ -1926,8 +1950,11 @@ utvfu_audio_mixer_set_port(void *v, struct mixer_ctrl *cp)
 	if (cp->type != AUDIO_MIXER_ENUM ||
 	    cp->un.ord < 0 || cp->un.ord > 1)
 		return (EINVAL);
-/* XXX TODO */
+
+	/* XXX TODO */
+
 	DPRINTF(1, "%s %s: cp->un.ord=%d\n", DEVNAME(sc), __func__, cp->un.ord);
+
 	return (0);
 }
 
@@ -1944,8 +1971,11 @@ utvfu_audio_mixer_get_port(void *v, struct mixer_ctrl *cp)
 	if (cp->type != AUDIO_MIXER_ENUM ||
 	    cp->un.ord < 0 || cp->un.ord > 1)
 		return (EINVAL);
-/* XXX TODO */
+
+	/* XXX TODO */
+
 	DPRINTF(1, "%s %s: cp->un.ord=%d\n", DEVNAME(sc), __func__, cp->un.ord);
+
 	return (0);
 }
 
@@ -1962,7 +1992,7 @@ utvfu_audio_query_devinfo(void *v, struct mixer_devinfo *mi)
 	if (mi->index != 0)
 		return (EINVAL);
 
-/* XXX SOMEONE WITH AUDIO EXPERTIZE NEEDS TO HELP HERE */
+	/* XXX SOMEONE WITH AUDIO EXPERTIZE NEEDS TO HELP HERE */
 	strlcpy(mi->label.name, "mix0-i0", sizeof(mi->label.name));
 	mi->type = AUDIO_MIXER_ENUM;
 	mi->un.e.num_mem = 2;

@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.3 2021/11/23 01:14:26 deraadt Exp $
+#	$OpenBSD: Makefile,v 1.5 2021/11/27 15:07:26 visa Exp $
 
 PROGS=		poll_close pollnval pollretval
 LDADD=		-lpthread
