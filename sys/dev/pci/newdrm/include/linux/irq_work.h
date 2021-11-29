@@ -44,8 +44,7 @@ irq_work_queue(struct irq_work *work)
 static inline void
 irq_work_sync(struct irq_work *work)
 {
-	while (timeout_triggered(&work->to))
-		CPU_BUSY_CYCLE();
+	timeout_del_barrier(&work->to);
 }
 
 #endif
