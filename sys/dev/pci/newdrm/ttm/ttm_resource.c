@@ -161,10 +161,8 @@ EXPORT_SYMBOL(ttm_resource_manager_debug);
 
 static void ttm_kmap_iter_iomap_map_local(struct ttm_kmap_iter *iter,
 					  struct dma_buf_map *dmap,
-					  pgoff_t i)
+					  pgoff_t i, bus_space_tag_t bst)
 {
-	STUB();
-#ifdef notyet
 	struct ttm_kmap_iter_iomap *iter_io =
 		container_of(iter, typeof(*iter_io), base);
 	void __iomem *addr;
@@ -186,19 +184,31 @@ retry:
 		goto retry;
 	}
 
+#ifdef __linux__
 	addr = io_mapping_map_local_wc(iter_io->iomap, iter_io->cache.offs +
 				       (((resource_size_t)i - iter_io->cache.i)
 					<< PAGE_SHIFT));
-	dma_buf_map_set_vaddr_iomem(dmap, addr);
+#else
+	if (bus_space_map(bst, iter_io->cache.offs +
+	    (((resource_size_t)i - iter_io->cache.i) << PAGE_SHIFT),
+	    PAGE_SIZE, BUS_SPACE_MAP_LINEAR | BUS_SPACE_MAP_PREFETCHABLE,
+	    &dmap->bsh)) {
+		printf("%s bus_space_map failed\n", __func__);
+		addr = 0;
+	} else {
+		addr = bus_space_vaddr(bst, dmap->bsh);
+	}
 #endif
+	dma_buf_map_set_vaddr_iomem(dmap, addr);
 }
 
 static void ttm_kmap_iter_iomap_unmap_local(struct ttm_kmap_iter *iter,
-					    struct dma_buf_map *map)
+					    struct dma_buf_map *map, bus_space_tag_t bst)
 {
-	STUB();
 #ifdef notyet
 	io_mapping_unmap_local(map->vaddr_iomem);
+#else
+	bus_space_unmap(bst, map->bsh, PAGE_SIZE);
 #endif
 }
 
@@ -249,7 +259,7 @@ EXPORT_SYMBOL(ttm_kmap_iter_iomap_init);
 
 static void ttm_kmap_iter_linear_io_map_local(struct ttm_kmap_iter *iter,
 					      struct dma_buf_map *dmap,
-					      pgoff_t i)
+					      pgoff_t i, bus_space_tag_t bst)
 {
 	struct ttm_kmap_iter_linear_io *iter_io =
 		container_of(iter, typeof(*iter_io), base);
@@ -280,9 +290,6 @@ ttm_kmap_iter_linear_io_init(struct ttm_kmap_iter_linear_io *iter_io,
 			     struct ttm_device *bdev,
 			     struct ttm_resource *mem)
 {
-	STUB();
-	return ERR_PTR(-ENOSYS);
-#ifdef notyet
 	int ret;
 
 	ret = ttm_mem_io_reserve(bdev, mem);
@@ -369,7 +376,6 @@ out_io_free:
 	ttm_mem_io_free(bdev, mem);
 out_err:
 	return ERR_PTR(ret);
-#endif
 }
 
 /**
@@ -386,8 +392,6 @@ ttm_kmap_iter_linear_io_fini(struct ttm_kmap_iter_linear_io *iter_io,
 			     struct ttm_device *bdev,
 			     struct ttm_resource *mem)
 {
-	STUB();
-#ifdef notyet
 	if (iter_io->needs_unmap && dma_buf_map_is_set(&iter_io->dmap)) {
 #ifdef __linux__
 		if (iter_io->dmap.is_iomem)
@@ -399,7 +403,6 @@ ttm_kmap_iter_linear_io_fini(struct ttm_kmap_iter_linear_io *iter_io,
 		    iter_io->dmap.size);
 #endif
 	}
-#endif
 
 	ttm_mem_io_free(bdev, mem);
 }

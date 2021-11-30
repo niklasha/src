@@ -484,7 +484,7 @@ void ttm_tt_mgr_init(unsigned long num_pages, unsigned long num_dma32_pages)
 
 static void ttm_kmap_iter_tt_map_local(struct ttm_kmap_iter *iter,
 				       struct dma_buf_map *dmap,
-				       pgoff_t i)
+				       pgoff_t i, bus_space_tag_t bst)
 {
 	struct ttm_kmap_iter_tt *iter_tt =
 		container_of(iter, typeof(*iter_tt), base);
@@ -499,7 +499,7 @@ static void ttm_kmap_iter_tt_map_local(struct ttm_kmap_iter *iter,
 }
 
 static void ttm_kmap_iter_tt_unmap_local(struct ttm_kmap_iter *iter,
-					 struct dma_buf_map *map)
+					 struct dma_buf_map *map, bus_space_tag_t bst)
 {
 #ifdef __linux__
 	kunmap_local(map->vaddr);

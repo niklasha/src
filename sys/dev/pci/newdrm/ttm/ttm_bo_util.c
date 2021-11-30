@@ -107,27 +107,27 @@ void ttm_move_memcpy(struct ttm_buffer_object *bo,
 			return;
 
 		for (i = 0; i < num_pages; ++i) {
-			dst_ops->map_local(dst_iter, &dst_map, i);
+			dst_ops->map_local(dst_iter, &dst_map, i, bo->bdev->memt);
 			if (dst_map.is_iomem)
 				memset_io(dst_map.vaddr_iomem, 0, PAGE_SIZE);
 			else
 				memset(dst_map.vaddr, 0, PAGE_SIZE);
 			if (dst_ops->unmap_local)
-				dst_ops->unmap_local(dst_iter, &dst_map);
+				dst_ops->unmap_local(dst_iter, &dst_map, bo->bdev->memt);
 		}
 		return;
 	}
 
 	for (i = 0; i < num_pages; ++i) {
-		dst_ops->map_local(dst_iter, &dst_map, i);
-		src_ops->map_local(src_iter, &src_map, i);
+		dst_ops->map_local(dst_iter, &dst_map, i, bo->bdev->memt);
+		src_ops->map_local(src_iter, &src_map, i, bo->bdev->memt);
 
 		drm_memcpy_from_wc(&dst_map, &src_map, PAGE_SIZE);
 
 		if (src_ops->unmap_local)
-			src_ops->unmap_local(src_iter, &src_map);
+			src_ops->unmap_local(src_iter, &src_map, bo->bdev->memt);
 		if (dst_ops->unmap_local)
-			dst_ops->unmap_local(dst_iter, &dst_map);
+			dst_ops->unmap_local(dst_iter, &dst_map, bo->bdev->memt);
 	}
 }
 EXPORT_SYMBOL(ttm_move_memcpy);
