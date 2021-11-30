@@ -486,12 +486,14 @@ static void ttm_kmap_iter_tt_map_local(struct ttm_kmap_iter *iter,
 				       struct dma_buf_map *dmap,
 				       pgoff_t i)
 {
-	STUB();
-#ifdef notyet
 	struct ttm_kmap_iter_tt *iter_tt =
 		container_of(iter, typeof(*iter_tt), base);
 
+#ifdef __linux__
 	dma_buf_map_set_vaddr(dmap, kmap_local_page_prot(iter_tt->tt->pages[i],
+							 iter_tt->prot));
+#else
+	dma_buf_map_set_vaddr(dmap, kmap_atomic_prot(iter_tt->tt->pages[i],
 							 iter_tt->prot));
 #endif
 }
@@ -499,9 +501,10 @@ static void ttm_kmap_iter_tt_map_local(struct ttm_kmap_iter *iter,
 static void ttm_kmap_iter_tt_unmap_local(struct ttm_kmap_iter *iter,
 					 struct dma_buf_map *map)
 {
-	STUB();
-#ifdef notyet
+#ifdef __linux__
 	kunmap_local(map->vaddr);
+#else
+	kunmap_atomic(map->vaddr);
 #endif
 }
 
