@@ -43,7 +43,6 @@ file	dev/pci/newdrm/drm_gem.c			drm
 file	dev/pci/newdrm/drm_gem_atomic_helper.c		drm
 #file	dev/pci/newdrm/drm_gem_cma_helper.c		drm
 file	dev/pci/newdrm/drm_gem_framebuffer_helper.c	drm
-file	dev/pci/newdrm/drm_gem_ttm_helper.c		drm
 file	dev/pci/newdrm/drm_hashtab.c			drm
 file	dev/pci/newdrm/drm_hdcp.c			drm
 #file	dev/pci/newdrm/drm_ioc32.c			drm
@@ -87,6 +86,7 @@ file	dev/pci/newdrm/linux_list_sort.c		drm
 file	dev/pci/newdrm/linux_radix.c			drm
 
 define	ttm
+file	dev/pci/newdrm/drm_gem_ttm_helper.c		ttm
 file	dev/pci/newdrm/ttm/ttm_agp_backend.c		ttm & agp
 file	dev/pci/newdrm/ttm/ttm_bo.c			ttm
 file	dev/pci/newdrm/ttm/ttm_bo_util.c		ttm
