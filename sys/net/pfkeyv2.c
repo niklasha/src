@@ -1,4 +1,4 @@
-/* $OpenBSD: pfkeyv2.c,v 1.223 2021/11/26 16:16:35 tobhe Exp $ */
+/* $OpenBSD: pfkeyv2.c,v 1.226 2021/12/03 19:04:49 tobhe Exp $ */
 
 /*
  *	@(#)COPYRIGHT	1.1 (NRL) 17 January 1995
@@ -1042,16 +1042,8 @@ int
 pfkeyv2_sa_flush(struct tdb *tdb, void *satype_vp, int last)
 {
 	if (!(*((u_int8_t *) satype_vp)) ||
-	    tdb->tdb_satype == *((u_int8_t *) satype_vp)) {
-		/* keep in sync with tdb_delete() */
-		NET_ASSERT_LOCKED();
-
-		if (tdb_unlink_locked(tdb) == 0)
-			return (0);
-		tdb_unbundle(tdb);
-		tdb_deltimeouts(tdb);
-		tdb_unref(tdb);
-	}
+	    tdb->tdb_satype == *((u_int8_t *) satype_vp))
+		tdb_delete_locked(tdb);
 	return (0);
 }
 
@@ -1324,22 +1316,18 @@ pfkeyv2_send(struct socket *so, void *message, int len)
 			int alg;
 
 			/* Create new TDB */
-			freeme_sz = 0;
-			freeme = tdb_alloc(rdomain);
-			bzero(&ii, sizeof(struct ipsecinit));
-
-			newsa = (struct tdb *) freeme;
+			newsa = tdb_alloc(rdomain);
 			newsa->tdb_satype = smsg->sadb_msg_satype;
 
 			if ((rval = pfkeyv2_get_proto_alg(newsa->tdb_satype,
 			    &newsa->tdb_sproto, &alg))) {
-				tdb_unref(freeme);
-				freeme = NULL;
+				tdb_unref(newsa);
 				NET_UNLOCK();
 				goto ret;
 			}
 
 			/* Initialize SA */
+			bzero(&ii, sizeof(struct ipsecinit));
 			import_sa(newsa, headers[SADB_EXT_SA], &ii);
 			import_address(&newsa->tdb_src.sa,
 			    headers[SADB_EXT_ADDRESS_SRC]);
@@ -1369,8 +1357,7 @@ pfkeyv2_send(struct socket *so, void *message, int len)
 			    headers[SADB_X_EXT_DST_MASK],
 			    headers[SADB_X_EXT_PROTOCOL],
 			    headers[SADB_X_EXT_FLOW_TYPE]))) {
-				tdb_unref(freeme);
-				freeme = NULL;
+				tdb_unref(newsa);
 				NET_UNLOCK();
 				goto ret;
 			}
@@ -1392,8 +1379,7 @@ pfkeyv2_send(struct socket *so, void *message, int len)
 			rval = tdb_init(newsa, alg, &ii);
 			if (rval) {
 				rval = EINVAL;
-				tdb_unref(freeme);
-				freeme = NULL;
+				tdb_unref(newsa);
 				NET_UNLOCK();
 				goto ret;
 			}
@@ -1402,8 +1388,7 @@ pfkeyv2_send(struct socket *so, void *message, int len)
 
 			/* Delete old version of the SA, insert new one */
 			tdb_delete(sa2);
-			puttdb((struct tdb *) freeme);
-			freeme = NULL;
+			puttdb(newsa);
 		} else {
 			/*
 			 * The SA is already initialized, so we're only allowed to
@@ -1497,26 +1482,24 @@ pfkeyv2_send(struct socket *so, void *message, int len)
 			goto ret;
 		}
 
-		/* Allocate and initialize new TDB */
-		freeme_sz = 0;
-		freeme = tdb_alloc(rdomain);
-
 		{
-			struct tdb *newsa = (struct tdb *) freeme;
+			struct tdb *newsa;
 			struct ipsecinit ii;
 			int alg;
 
-			bzero(&ii, sizeof(struct ipsecinit));
-
+			/* Create new TDB */
+			newsa = tdb_alloc(rdomain);
 			newsa->tdb_satype = smsg->sadb_msg_satype;
+
 			if ((rval = pfkeyv2_get_proto_alg(newsa->tdb_satype,
 			    &newsa->tdb_sproto, &alg))) {
-				tdb_unref(freeme);
-				freeme = NULL;
+				tdb_unref(newsa);
 				NET_UNLOCK();
 				goto ret;
 			}
 
+			/* Initialize SA */
+			bzero(&ii, sizeof(struct ipsecinit));
 			import_sa(newsa, headers[SADB_EXT_SA], &ii);
 			import_address(&newsa->tdb_src.sa,
 			    headers[SADB_EXT_ADDRESS_SRC]);
@@ -1549,8 +1532,7 @@ pfkeyv2_send(struct socket *so, void *message, int len)
 			    headers[SADB_X_EXT_DST_MASK],
 			    headers[SADB_X_EXT_PROTOCOL],
 			    headers[SADB_X_EXT_FLOW_TYPE]))) {
-				tdb_unref(freeme);
-				freeme = NULL;
+				tdb_unref(newsa);
 				NET_UNLOCK();
 				goto ret;
 			}
@@ -1572,18 +1554,16 @@ pfkeyv2_send(struct socket *so, void *message, int len)
 			rval = tdb_init(newsa, alg, &ii);
 			if (rval) {
 				rval = EINVAL;
-				tdb_unref(freeme);
-				freeme = NULL;
+				tdb_unref(newsa);
 				NET_UNLOCK();
 				goto ret;
 			}
-		}
 
-		/* Add TDB in table */
-		puttdb((struct tdb *) freeme);
+			/* Add TDB in table */
+			puttdb(newsa);
+		}
 		NET_UNLOCK();
 
-		freeme = NULL;
 		break;
 
 	case SADB_DELETE:

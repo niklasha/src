@@ -1,4 +1,4 @@
-/*	$OpenBSD: iked.h,v 1.199 2021/11/27 21:50:05 tobhe Exp $	*/
+/*	$OpenBSD: iked.h,v 1.201 2021/12/01 16:42:12 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -28,6 +28,10 @@
 
 #include "types.h"
 #include "dh.h"
+
+#define MAXIMUM(a,b) (((a)>(b))?(a):(b))
+#define MINIMUM(a,b) (((a)<(b))?(a):(b))
+#define roundup(x, y)   ((((x)+((y)-1))/(y))*(y))
 
 #ifndef IKED_H
 #define IKED_H
@@ -493,8 +497,8 @@ struct iked_sa {
 	int				 sa_mobike;	/* MOBIKE */
 	int				 sa_frag;	/* fragmentation */
 
-	int			 	 sa_use_transport_mode;	/* peer requested */
-	int			 	 sa_used_transport_mode; /* we enabled */
+	int				 sa_use_transport_mode;	/* peer requested */
+	int				 sa_used_transport_mode; /* we enabled */
 
 	struct iked_timer		 sa_timer;	/* SA timeouts */
 #define IKED_IKE_SA_EXCHANGE_TIMEOUT	 300		/* 5 minutes */

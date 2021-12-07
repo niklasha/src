@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_bridge.c,v 1.359 2021/11/25 13:46:02 bluhm Exp $	*/
+/*	$OpenBSD: if_bridge.c,v 1.361 2021/12/03 17:18:34 bluhm Exp $	*/
 
 /*
  * Copyright (c) 1999, 2000 Jason L. Wright (jason@thought.net)
@@ -1594,9 +1594,9 @@ bridge_ipsec(struct ifnet *ifp, struct ether_header *eh, int hassnap,
 			return (0);
 		}
 	} else { /* Outgoing from the bridge. */
-		tdb = ipsp_spd_lookup(m, af, hlen, &error,
-		    IPSP_DIRECTION_OUT, NULL, NULL, 0);
-		if (tdb != NULL) {
+		error = ipsp_spd_lookup(m, af, hlen, IPSP_DIRECTION_OUT,
+		    NULL, NULL, &tdb, 0);
+		if (error == 0 && tdb != NULL) {
 			/*
 			 * We don't need to do loop detection, the
 			 * bridge will do that for us.
@@ -1606,11 +1606,14 @@ bridge_ipsec(struct ifnet *ifp, struct ether_header *eh, int hassnap,
 			    tdb->tdb_tap)) == NULL ||
 			    pf_test(af, dir, encif, &m) != PF_PASS) {
 				m_freem(m);
+				tdb_unref(tdb);
 				return (1);
 			}
-			if (m == NULL)
+			if (m == NULL) {
+				tdb_unref(tdb);
 				return (1);
-			else if (af == AF_INET)
+			}
+			if (af == AF_INET)
 				in_proto_cksum_out(m, encif);
 #ifdef INET6
 			else if (af == AF_INET6)
@@ -1628,6 +1631,7 @@ bridge_ipsec(struct ifnet *ifp, struct ether_header *eh, int hassnap,
 				    ICMP_UNREACH, ICMP_UNREACH_NEEDFRAG);
 			else
 				error = ipsp_process_packet(m, tdb, af, 0);
+			tdb_unref(tdb);
 			return (1);
 		} else
 			return (0);

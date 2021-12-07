@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_ipsp.c,v 1.256 2021/11/26 19:24:41 bluhm Exp $	*/
+/*	$OpenBSD: ip_ipsp.c,v 1.261 2021/12/03 19:04:49 tobhe Exp $	*/
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr),
@@ -90,6 +90,7 @@ void		tdb_firstuse(void *);
 void		tdb_soft_timeout(void *);
 void		tdb_soft_firstuse(void *);
 int		tdb_hash(u_int32_t, union sockaddr_union *, u_int8_t);
+void		tdb_dodelete(struct tdb *, int locked);
 
 int ipsec_in_use = 0;
 u_int64_t ipsec_last_added = 0;
@@ -186,7 +187,7 @@ const struct xformsw *const xformswNXFORMSW = &xformsw[nitems(xformsw)];
 #define	TDB_HASHSIZE_INIT	32
 
 /* Protected by the tdb_sadb_mtx. */
-struct mutex tdb_sadb_mtx = MUTEX_INITIALIZER(IPL_NET);
+struct mutex tdb_sadb_mtx = MUTEX_INITIALIZER(IPL_SOFTNET);
 static SIPHASH_KEY tdbkey;
 static struct tdb **tdbh;
 static struct tdb **tdbdst;
@@ -324,7 +325,7 @@ reserve_spi(u_int rdomain, u_int32_t sspi, u_int32_t tspi,
 	}
 
 	(*errval) = EEXIST;
-	tdb_free(tdbp);
+	tdb_unref(tdbp);
 	return 0;
 }
 
@@ -661,7 +662,9 @@ tdb_timeout(void *v)
 	if (tdb->tdb_flags & TDBF_TIMER) {
 		/* If it's an "invalid" TDB do a silent expiration. */
 		if (!(tdb->tdb_flags & TDBF_INVALID)) {
+#ifdef IPSEC
 			ipsecstat_inc(ipsec_exctdb);
+#endif /* IPSEC */
 			pfkeyv2_expire(tdb, SADB_EXT_LIFETIME_HARD);
 		}
 		tdb_delete(tdb);
@@ -680,7 +683,9 @@ tdb_firstuse(void *v)
 	if (tdb->tdb_flags & TDBF_SOFT_FIRSTUSE) {
 		/* If the TDB hasn't been used, don't renew it. */
 		if (tdb->tdb_first_use != 0) {
+#ifdef IPSEC
 			ipsecstat_inc(ipsec_exctdb);
+#endif /* IPSEC */
 			pfkeyv2_expire(tdb, SADB_EXT_LIFETIME_HARD);
 		}
 		tdb_delete(tdb);
@@ -843,27 +848,21 @@ puttdb_locked(struct tdb *tdbp)
 	ipsec_last_added = getuptime();
 }
 
-int
+void
 tdb_unlink(struct tdb *tdbp)
 {
-	int r;
-
 	mtx_enter(&tdb_sadb_mtx);
-	r = tdb_unlink_locked(tdbp);
+	tdb_unlink_locked(tdbp);
 	mtx_leave(&tdb_sadb_mtx);
-	return (r);
 }
 
-int
+void
 tdb_unlink_locked(struct tdb *tdbp)
 {
 	struct tdb *tdbpp;
 	u_int32_t hashval;
 
 	MUTEX_ASSERT_LOCKED(&tdb_sadb_mtx);
-
-	if (tdbp->tdb_dnext == NULL && tdbp->tdb_snext == NULL)
-		return (0);
 
 	hashval = tdb_hash(tdbp->tdb_spi, &tdbp->tdb_dst, tdbp->tdb_sproto);
 
@@ -921,8 +920,6 @@ tdb_unlink_locked(struct tdb *tdbp)
 		ipsecstat_inc(ipsec_prevtunnels);
 	}
 #endif /* IPSEC */
-
-	return (1);
 }
 
 void
@@ -981,11 +978,29 @@ tdb_unref(struct tdb *tdb)
 void
 tdb_delete(struct tdb *tdbp)
 {
-	/* keep in sync with pfkeyv2_sa_flush() */
+	tdb_dodelete(tdbp, 0);
+}
+
+void
+tdb_delete_locked(struct tdb *tdbp)
+{
+	MUTEX_ASSERT_LOCKED(&tdb_sadb_mtx);
+	tdb_dodelete(tdbp, 1);
+}
+
+void
+tdb_dodelete(struct tdb *tdbp, int locked)
+{
 	NET_ASSERT_LOCKED();
 
-	if (tdb_unlink(tdbp) == 0)
+	if (tdbp->tdb_flags & TDBF_DELETED)
 		return;
+	tdbp->tdb_flags |= TDBF_DELETED;
+	if (locked)
+		tdb_unlink_locked(tdbp);
+	else
+		tdb_unlink(tdbp);
+
 	/* release tdb_onext/tdb_inext references */
 	tdb_unbundle(tdbp);
 	/* delete timeouts and release references */

@@ -1,4 +1,4 @@
-/* $OpenBSD: tty.c,v 1.411 2021/11/03 13:37:17 nicm Exp $ */
+/* $OpenBSD: tty.c,v 1.413 2021/12/06 10:08:42 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -302,7 +302,7 @@ tty_start_tty(struct tty *tty)
 {
 	struct client	*c = tty->client;
 	struct termios	 tio;
-	struct timeval	 tv = { .tv_sec = 1 };
+	struct timeval	 tv = { .tv_sec = 3 };
 
 	setblocking(c->fd, 0);
 	event_add(&tty->event_in, NULL);
@@ -937,7 +937,9 @@ tty_update_window_offset(struct window *w)
 	struct client	*c;
 
 	TAILQ_FOREACH(c, &clients, entry) {
-		if (c->session != NULL && c->session->curw->window == w)
+		if (c->session != NULL &&
+		    c->session->curw != NULL &&
+		    c->session->curw->window == w)
 			tty_update_client_offset(c);
 	}
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_ipsp.h,v 1.223 2021/11/26 16:16:35 tobhe Exp $	*/
+/*	$OpenBSD: ip_ipsp.h,v 1.227 2021/12/03 19:04:49 tobhe Exp $	*/
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr),
@@ -337,6 +337,7 @@ struct tdb {				/* tunnel descriptor block */
 #define	TDBF_ALLOCATIONS	0x00008	/* Check the flows counters */
 #define	TDBF_INVALID		0x00010	/* This SPI is not valid yet/anymore */
 #define	TDBF_FIRSTUSE		0x00020	/* Expire after first use */
+#define	TDBF_DELETED		0x00040	/* This TDB has already been deleted */
 #define	TDBF_SOFT_TIMER		0x00080	/* Soft expiration */
 #define	TDBF_SOFT_BYTES		0x00100	/* Soft expiration */
 #define	TDBF_SOFT_ALLOCATIONS	0x00200	/* Soft expiration */
@@ -351,7 +352,7 @@ struct tdb {				/* tunnel descriptor block */
 
 #define TDBF_BITS ("\20" \
 	"\1UNIQUE\2TIMER\3BYTES\4ALLOCATIONS" \
-	"\5INVALID\6FIRSTUSE\10SOFT_TIMER" \
+	"\5INVALID\6FIRSTUSE\7DELETED\10SOFT_TIMER" \
 	"\11SOFT_BYTES\12SOFT_ALLOCATIONS\13SOFT_FIRSTUSE\14PFS" \
 	"\15TUNNELING" \
 	"\21USEDTUNNEL\22UDPENCAP\23PFSYNC\24PFSYNC_RPL" \
@@ -568,13 +569,14 @@ struct	tdb *gettdbbysrcdst_dir(u_int, u_int32_t, union sockaddr_union *,
 void	puttdb(struct tdb *);
 void	puttdb_locked(struct tdb *);
 void	tdb_delete(struct tdb *);
+void	tdb_delete_locked(struct tdb *);
 struct	tdb *tdb_alloc(u_int);
 struct	tdb *tdb_ref(struct tdb *);
 void	tdb_unref(struct tdb *);
 void	tdb_free(struct tdb *);
 int	tdb_init(struct tdb *, u_int16_t, struct ipsecinit *);
-int	tdb_unlink(struct tdb *);
-int	tdb_unlink_locked(struct tdb *);
+void	tdb_unlink(struct tdb *);
+void	tdb_unlink_locked(struct tdb *);
 void	tdb_unbundle(struct tdb *);
 void	tdb_deltimeouts(struct tdb *);
 int	tdb_walk(u_int, int (*)(struct tdb *, void *, int), void *);
@@ -632,10 +634,8 @@ int	checkreplaywindow(struct tdb *, u_int64_t, u_int32_t, u_int32_t *, int);
 /* Packet processing */
 int	ipsp_process_packet(struct mbuf *, struct tdb *, int, int);
 int	ipsp_process_done(struct mbuf *, struct tdb *);
-struct	tdb *ipsp_spd_lookup(struct mbuf *, int, int, int *, int,
-	    struct tdb *, struct inpcb *, u_int32_t);
-struct	tdb *ipsp_spd_inp(struct mbuf *, int, int, int *, int,
-	    struct tdb *, struct inpcb *, struct ipsec_policy *);
+int	ipsp_spd_lookup(struct mbuf *, int, int, int, struct tdb *,
+	    struct inpcb *, struct tdb **, u_int32_t);
 int	ipsp_is_unspecified(union sockaddr_union);
 int	ipsp_aux_match(struct tdb *, struct ipsec_ids *,
 	    struct sockaddr_encap *, struct sockaddr_encap *);

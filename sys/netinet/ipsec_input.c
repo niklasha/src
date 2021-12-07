@@ -1,4 +1,4 @@
-/*	$OpenBSD: ipsec_input.c,v 1.193 2021/11/25 13:46:02 bluhm Exp $	*/
+/*	$OpenBSD: ipsec_input.c,v 1.196 2021/12/02 13:46:42 bluhm Exp $	*/
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr) and
@@ -377,9 +377,9 @@ ipsec_common_input_cb(struct mbuf **mp, struct tdb *tdbp, int skip, int protoff)
 #if NBPFILTER > 0
 	struct ifnet *encif;
 #endif
-	struct ip *ip, ipn;
+	struct ip *ip;
 #ifdef INET6
-	struct ip6_hdr *ip6, ip6n;
+	struct ip6_hdr *ip6;
 #endif /* INET6 */
 	struct m_tag *mtag;
 	struct tdb_ident *tdbi;
@@ -408,32 +408,6 @@ ipsec_common_input_cb(struct mbuf **mp, struct tdb *tdbp, int skip, int protoff)
 		ip->ip_sum = 0;
 		ip->ip_sum = in_cksum(m, ip->ip_hl << 2);
 		prot = ip->ip_p;
-
-		/* IP-in-IP encapsulation */
-		if (prot == IPPROTO_IPIP) {
-			if (m->m_pkthdr.len - skip < sizeof(struct ip)) {
-				IPSEC_ISTAT(esps_hdrops, ahs_hdrops,
-				    ipcomps_hdrops);
-				goto baddone;
-			}
-			/* ipn will now contain the inner IPv4 header */
-			m_copydata(m, skip, sizeof(struct ip),
-			    (caddr_t) &ipn);
-		}
-
-#ifdef INET6
-		/* IPv6-in-IP encapsulation. */
-		if (prot == IPPROTO_IPV6) {
-			if (m->m_pkthdr.len - skip < sizeof(struct ip6_hdr)) {
-				IPSEC_ISTAT(esps_hdrops, ahs_hdrops,
-				    ipcomps_hdrops);
-				goto baddone;
-			}
-			/* ip6n will now contain the inner IPv6 header. */
-			m_copydata(m, skip, sizeof(struct ip6_hdr),
-			    (caddr_t) &ip6n);
-		}
-#endif /* INET6 */
 	}
 
 #ifdef INET6
@@ -454,29 +428,6 @@ ipsec_common_input_cb(struct mbuf **mp, struct tdb *tdbp, int skip, int protoff)
 
 		/* Save protocol */
 		m_copydata(m, protoff, 1, (caddr_t) &prot);
-
-		/* IP-in-IP encapsulation */
-		if (prot == IPPROTO_IPIP) {
-			if (m->m_pkthdr.len - skip < sizeof(struct ip)) {
-				IPSEC_ISTAT(esps_hdrops, ahs_hdrops,
-				    ipcomps_hdrops);
-				goto baddone;
-			}
-			/* ipn will now contain the inner IPv4 header */
-			m_copydata(m, skip, sizeof(struct ip), (caddr_t) &ipn);
-		}
-
-		/* IPv6-in-IP encapsulation */
-		if (prot == IPPROTO_IPV6) {
-			if (m->m_pkthdr.len - skip < sizeof(struct ip6_hdr)) {
-				IPSEC_ISTAT(esps_hdrops, ahs_hdrops,
-				    ipcomps_hdrops);
-				goto baddone;
-			}
-			/* ip6n will now contain the inner IPv6 header. */
-			m_copydata(m, skip, sizeof(struct ip6_hdr),
-			    (caddr_t) &ip6n);
-		}
 	}
 #endif /* INET6 */
 
@@ -1009,8 +960,10 @@ esp4_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *v)
 int
 ipsec_protoff(struct mbuf *m, int off, int af)
 {
+#ifdef INET6
 	struct ip6_ext ip6e;
 	int protoff, nxt, l;
+#endif /* INET6 */
 
 	switch (af) {
 	case AF_INET:
@@ -1018,11 +971,12 @@ ipsec_protoff(struct mbuf *m, int off, int af)
 #ifdef INET6
 	case AF_INET6:
 		break;
-#endif
+#endif /* INET6 */
 	default:
 		unhandled_af(af);
 	}
 
+#ifdef INET6
 	if (off < sizeof(struct ip6_hdr))
 		return -1;
 
@@ -1057,6 +1011,7 @@ ipsec_protoff(struct mbuf *m, int off, int af)
 
 	protoff += offsetof(struct ip6_ext, ip6e_nxt);
 	return protoff;
+#endif /* INET6 */
 }
 
 int
@@ -1077,7 +1032,8 @@ ipsec_forward_check(struct mbuf *m, int hlen, int af)
 		tdb = gettdb(tdbi->rdomain, tdbi->spi, &tdbi->dst, tdbi->proto);
 	} else
 		tdb = NULL;
-	ipsp_spd_lookup(m, af, hlen, &error, IPSP_DIRECTION_IN, tdb, NULL, 0);
+	error = ipsp_spd_lookup(m, af, hlen, IPSP_DIRECTION_IN,
+	    tdb, NULL, NULL, 0);
 	tdb_unref(tdb);
 
 	return error;
@@ -1149,8 +1105,8 @@ ipsec_local_check(struct mbuf *m, int hlen, int proto, int af)
 		    tdbi->proto);
 	} else
 		tdb = NULL;
-	ipsp_spd_lookup(m, af, hlen, &error, IPSP_DIRECTION_IN,
-	    tdb, NULL, 0);
+	error = ipsp_spd_lookup(m, af, hlen, IPSP_DIRECTION_IN,
+	    tdb, NULL, NULL, 0);
 	tdb_unref(tdb);
 
 	return error;

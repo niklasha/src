@@ -1,4 +1,4 @@
-/* $OpenBSD: asn1_lib.c,v 1.46 2021/11/13 20:44:00 schwarze Exp $ */
+/* $OpenBSD: asn1_lib.c,v 1.48 2021/12/03 17:03:54 jsing Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -359,18 +359,15 @@ ASN1_STRING_new(void)
 ASN1_STRING *
 ASN1_STRING_type_new(int type)
 {
-	ASN1_STRING *ret;
+	ASN1_STRING *a;
 
-	ret = malloc(sizeof(ASN1_STRING));
-	if (ret == NULL) {
+	if ((a = calloc(1, sizeof(ASN1_STRING))) == NULL) {
 		ASN1error(ERR_R_MALLOC_FAILURE);
-		return (NULL);
+		return NULL;
 	}
-	ret->length = 0;
-	ret->type = type;
-	ret->data = NULL;
-	ret->flags = 0;
-	return (ret);
+	a->type = type;
+
+	return a;
 }
 
 void
@@ -386,19 +383,16 @@ ASN1_STRING_free(ASN1_STRING *a)
 int
 ASN1_STRING_cmp(const ASN1_STRING *a, const ASN1_STRING *b)
 {
-	int i;
+	int cmp;
 
 	if (a == NULL || b == NULL)
 		return -1;
-	i = (a->length - b->length);
-	if (i == 0) {
-		i = memcmp(a->data, b->data, a->length);
-		if (i == 0)
-			return (a->type - b->type);
-		else
-			return (i);
-	} else
-		return (i);
+	if ((cmp = (a->length - b->length)) != 0)
+		return cmp;
+	if ((cmp = memcmp(a->data, b->data, a->length)) != 0)
+		return cmp;
+
+	return (a->type - b->type);
 }
 
 void

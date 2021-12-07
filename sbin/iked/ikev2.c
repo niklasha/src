@@ -1,4 +1,4 @@
-/*	$OpenBSD: ikev2.c,v 1.337 2021/11/27 21:50:05 tobhe Exp $	*/
+/*	$OpenBSD: ikev2.c,v 1.341 2021/12/04 13:07:17 tobhe Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -17,7 +17,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/param.h>	/* roundup */
+#include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -1464,7 +1464,7 @@ ikev2_init_ike_auth(struct iked *env, struct iked_sa *sa)
 	struct ikev2_payload		*pld;
 	struct ikev2_cert		*cert;
 	struct ikev2_auth		*auth;
-	struct iked_id			*id, *certid;
+	struct iked_id			*id, *certid, peerid;
 	struct ibuf			*e = NULL;
 	uint8_t				 firstpayload;
 	int				 ret = -1;
@@ -1485,13 +1485,28 @@ ikev2_init_ike_auth(struct iked *env, struct iked_sa *sa)
 	id = &sa->sa_iid;
 	certid = &sa->sa_icert;
 
-	/* ID payload */
+	/* ID payloads */
 	if ((pld = ikev2_add_payload(e)) == NULL)
 		goto done;
 	firstpayload = IKEV2_PAYLOAD_IDi;
 	if (ibuf_cat(e, id->id_buf) != 0)
 		goto done;
 	len = ibuf_size(id->id_buf);
+
+	if (pol->pol_peerid.id_type) {
+		bzero(&peerid, sizeof(peerid));
+		if (ikev2_policy2id(&pol->pol_peerid, &peerid, 0) != 0) {
+			log_debug("%s: failed to get remote id", __func__);
+			goto done;
+		}
+		if (ikev2_next_payload(pld, len, IKEV2_PAYLOAD_IDr) == -1)
+			goto done;
+		if ((pld = ikev2_add_payload(e)) == NULL)
+			goto done;
+		if (ibuf_cat(e, peerid.id_buf) != 0)
+			goto done;
+		len = ibuf_size(peerid.id_buf);
+	}
 
 	/* CERT payload */
 	if ((sa->sa_stateinit & IKED_REQ_CERT) &&
@@ -3095,7 +3110,7 @@ ikev2_handle_notifies(struct iked *env, struct iked_message *msg)
 		case IKEV2_EXCHANGE_CREATE_CHILD_SA:
 			if (!(sa->sa_stateflags & IKED_REQ_CHILDSA)) {
 				log_debug("%s: IKED_REQ_CHILDSA missing",
-				     __func__);
+				    __func__);
 				return (-1);
 			}
 			sa->sa_stateflags &= ~IKED_REQ_CHILDSA;
@@ -4177,7 +4192,7 @@ ikev2_nonce_cmp(struct ibuf *a, struct ibuf *b)
 
 	alen = ibuf_length(a);
 	blen = ibuf_length(b);
-	len = MIN(alen, blen);
+	len = MINIMUM(alen, blen);
 	ret = memcmp(ibuf_data(a), ibuf_data(b), len);
 	if (ret == 0)
 		ret = (alen < blen ? -1 : 1);
@@ -4525,7 +4540,7 @@ ikev2_ikesa_enable(struct iked *env, struct iked_sa *sa, struct iked_sa *nsa)
 	nsa->sa_cp_dns = sa->sa_cp_dns;
 	sa->sa_cp_dns = NULL;
 	/* Transfer other attributes */
-        if (sa->sa_dstid_entry_valid) {
+	if (sa->sa_dstid_entry_valid) {
 		sa_dstid_remove(env, sa);
 		sa_dstid_insert(env, nsa);
 	}
@@ -4836,8 +4851,8 @@ ikev2_resp_create_child_sa(struct iked *env, struct iked_message *msg)
 		goto done;
 
 	if ((len = ikev2_add_proposals(env, nsa ? nsa : sa, e,
-		nsa ? &nsa->sa_proposals : &proposals,
-		protoid, 0, nsa ? 1 : 0, 0)) == -1)
+	    nsa ? &nsa->sa_proposals : &proposals,
+	    protoid, 0, nsa ? 1 : 0, 0)) == -1)
 		goto done;
 
 	if (ikev2_next_payload(pld, len, IKEV2_PAYLOAD_NONCE) == -1)
@@ -6939,7 +6954,7 @@ ikev2_cp_setaddr_pool(struct iked *env, struct iked_sa *sa,
 				return (-1);
 			}
 			if (RB_FIND(iked_addrpool, &env->sc_addrpool,
-			     &key)) {
+			    &key)) {
 				*errstr = "requested addr in use";
 				return (-1);
 			}
@@ -7161,7 +7176,7 @@ ikev2_update_sa_addresses(struct iked *env, struct iked_sa *sa)
 		if ((ipcomp = csa->csa_bundled) != NULL &&
 		    ipcomp->csa_loaded)
 			if (pfkey_sa_update_addresses(env, ipcomp)
-			     != 0)
+			    != 0)
 				log_debug("%s: failed to update sa", __func__);
 	}
 

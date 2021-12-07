@@ -1,4 +1,4 @@
-/* $OpenBSD: bn_lib.c,v 1.48 2021/09/08 12:19:17 tb Exp $ */
+/* $OpenBSD: bn_lib.c,v 1.52 2021/12/04 16:02:44 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -136,6 +136,30 @@ BN_get_params(int which)
 		return (0);
 }
 #endif
+
+void
+BN_set_flags(BIGNUM *b, int n)
+{
+	b->flags |= n;
+}
+
+int
+BN_get_flags(const BIGNUM *b, int n)
+{
+	return b->flags & n;
+}
+
+void
+BN_with_flags(BIGNUM *dest, const BIGNUM *b, int flags)
+{
+	int dest_flags;
+
+	dest_flags = (dest->flags & BN_FLG_MALLOCED) |
+	    (b->flags & ~BN_FLG_MALLOCED) | BN_FLG_STATIC_DATA | flags;
+
+	*dest = *b;
+	dest->flags = dest_flags;
+}
 
 const BIGNUM *
 BN_value_one(void)
@@ -1037,6 +1061,50 @@ BN_swap_ct(BN_ULONG condition, BIGNUM *a, BIGNUM *b, size_t nwords)
 	return 1;
 }
 
+void
+BN_zero_ex(BIGNUM *a)
+{
+	a->neg = 0;
+	a->top = 0;
+	/* XXX: a->flags &= ~BN_FIXED_TOP */
+}
+
+int
+BN_abs_is_word(const BIGNUM *a, const BN_ULONG w)
+{
+	return (a->top == 1 && a->d[0] == w) || (w == 0 && a->top == 0);
+}
+
+int
+BN_is_zero(const BIGNUM *a)
+{
+	return a->top == 0;
+}
+
+int
+BN_is_one(const BIGNUM *a)
+{
+	return BN_abs_is_word(a, 1) && !a->neg;
+}
+
+int
+BN_is_word(const BIGNUM *a, const BN_ULONG w)
+{
+	return BN_abs_is_word(a, w) && (w == 0 || !a->neg);
+}
+
+int
+BN_is_odd(const BIGNUM *a)
+{
+	return a->top > 0 && (a->d[0] & 1);
+}
+
+int
+BN_is_negative(const BIGNUM *a)
+{
+	return a->neg != 0;
+}
+
 BN_GENCB *
 BN_GENCB_new(void)
 {
@@ -1054,6 +1122,24 @@ BN_GENCB_free(BN_GENCB *cb)
 	if (cb == NULL)
 		return;
 	free(cb);
+}
+
+/* Populate a BN_GENCB structure with an "old"-style callback */
+void
+BN_GENCB_set_old(BN_GENCB *gencb, void (*cb)(int, int, void *), void *cb_arg)
+{
+	gencb->ver = 1;
+	gencb->cb.cb_1 = cb;
+	gencb->arg = cb_arg;
+}
+
+/* Populate a BN_GENCB structure with a "new"-style callback */
+void
+BN_GENCB_set(BN_GENCB *gencb, int (*cb)(int, int, BN_GENCB *), void *cb_arg)
+{
+	gencb->ver = 2;
+	gencb->cb.cb_2 = cb;
+	gencb->arg = cb_arg;
 }
 
 void *

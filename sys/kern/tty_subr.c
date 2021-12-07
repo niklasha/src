@@ -1,4 +1,4 @@
-/*	$OpenBSD: tty_subr.c,v 1.33 2016/03/14 23:08:06 krw Exp $	*/
+/*	$OpenBSD: tty_subr.c,v 1.35 2021/12/02 15:13:49 deraadt Exp $	*/
 /*	$NetBSD: tty_subr.c,v 1.13 1996/02/09 19:00:43 christos Exp $	*/
 
 /*
@@ -240,12 +240,8 @@ putc(int c, struct clist *clp)
 	}
 
 	if (clp->c_cc == 0) {
-		if (!clp->c_cs) {
-#if defined(DIAGNOSTIC)
-			printf("putc: required clalloc\n");
-#endif
-			clalloc(clp, 1024, 1);
-		}
+		if (!clp->c_cs)
+			panic("%s: tty has no clist", __func__);
 		clp->c_cf = clp->c_cl = clp->c_cs;
 	}
 
@@ -323,12 +319,8 @@ b_to_q(u_char *cp, int count, struct clist *clp)
 		goto out;
 
 	if (clp->c_cc == 0) {
-		if (!clp->c_cs) {
-#if defined(DIAGNOSTIC)
-			printf("b_to_q: required clalloc\n");
-#endif
-			clalloc(clp, 1024, 1);
-		}
+		if (!clp->c_cs)
+			panic("%s: tty has no clist", __func__);
 		clp->c_cf = clp->c_cl = clp->c_cs;
 	}
 
@@ -354,8 +346,6 @@ out:
 	return count;
 }
 
-static int cc;
-
 /*
  * Given a non-NULL pointer into the clist return the pointer
  * to the next character in the list or return NULL if no more chars.
@@ -365,18 +355,18 @@ static int cc;
  * masked.
  */
 u_char *
-nextc(struct clist *clp, u_char *cp, int *c)
+nextc(struct clist *clp, u_char *cp, int *c, int *ccp)
 {
 
 	if (clp->c_cf == cp) {
 		/*
 		 * First time initialization.
 		 */
-		cc = clp->c_cc;
+		*ccp = clp->c_cc;
 	}
-	if (cc == 0 || cp == NULL)
+	if (*ccp == 0 || cp == NULL)
 		return NULL;
-	if (--cc == 0)
+	if (--(*ccp) == 0)
 		return NULL;
 	if (++cp == clp->c_ce)
 		cp = clp->c_cs;
@@ -399,12 +389,12 @@ nextc(struct clist *clp, u_char *cp, int *c)
  * *c is set to the NEXT character
  */
 u_char *
-firstc(struct clist *clp, int *c)
+firstc(struct clist *clp, int *c, int *ccp)
 {
 	u_char *cp;
 
-	cc = clp->c_cc;
-	if (cc == 0)
+	*ccp = clp->c_cc;
+	if (*ccp == 0)
 		return NULL;
 	cp = clp->c_cf;
 	*c = *cp & 0xff;
