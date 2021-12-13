@@ -1,4 +1,4 @@
-/*	$OpenBSD: exec_elf.c,v 1.161 2021/12/06 21:21:10 guenther Exp $	*/
+/*	$OpenBSD: exec_elf.c,v 1.165 2021/12/09 00:26:10 guenther Exp $	*/
 
 /*
  * Copyright (c) 1996 Per Fogelstrom
@@ -99,15 +99,8 @@ int	elf_check_header(Elf_Ehdr *);
 int	elf_read_from(struct proc *, struct vnode *, u_long, void *, int);
 void	elf_load_psection(struct exec_vmcmd_set *, struct vnode *,
 	    Elf_Phdr *, Elf_Addr *, Elf_Addr *, int *, int);
-int	coredump_elf(struct proc *, void *);
-int	exec_elf_fixup(struct proc *, struct exec_package *);
 int	elf_os_pt_note_name(Elf_Note *);
 int	elf_os_pt_note(struct proc *, struct exec_package *, Elf_Ehdr *, int *);
-
-extern char sigcode[], esigcode[], sigcoderet[];
-#ifdef SYSCALL_DEBUG
-extern char *syscallnames[];
-#endif
 
 /* round up and down to page boundaries. */
 #define ELF_ROUND(a, b)		(((a) + (b) - 1) & ~((b) - 1))
@@ -118,34 +111,6 @@ extern char *syscallnames[];
  * be a reasonable limit for ELF, the most we have seen so far is 12
  */
 #define ELF_MAX_VALID_PHDR 32
-
-/*
- * How many entries are in the AuxInfo array we pass to the process?
- */
-#define ELF_AUX_ENTRIES	9
-
-/*
- * This is the OpenBSD ELF emul
- */
-struct emul emul_elf = {
-	"native",
-	NULL,
-	SYS_syscall,
-	SYS_MAXSYSCALL,
-	sysent,
-#ifdef SYSCALL_DEBUG
-	syscallnames,
-#else
-	NULL,
-#endif
-	(sizeof(AuxInfo) * ELF_AUX_ENTRIES / sizeof(char *)),
-	setregs,
-	exec_elf_fixup,
-	coredump_elf,
-	sigcode,
-	esigcode,
-	sigcoderet
-};
 
 #define ELF_NOTE_NAME_OPENBSD	0x01
 
@@ -572,12 +537,6 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 		/* randomize exe_base for PIE */
 		exe_base = uvm_map_pie(base_ph->p_align);
 	}
-
-	/*
-	 * OK, we want a slightly different twist of the
-	 * standard emulation package for "real" elf.
-	 */
-	epp->ep_emul = &emul_elf;
 
 	/*
 	 * Verify this is an OpenBSD executable.  If it's marked that way
@@ -1255,7 +1214,7 @@ coredump_notes_elf(struct proc *p, void *iocookie, size_t *sizep)
 
 	/* Second, write an NT_OPENBSD_AUXV note. */
 	notesize = sizeof(nhdr) + elfround(sizeof("OpenBSD")) +
-	    elfround(pr->ps_emul->e_arglen * sizeof(char *));
+	    elfround(ELF_AUX_WORDS * sizeof(char *));
 	if (iocookie) {
 		iov.iov_base = &pss;
 		iov.iov_len = sizeof(pss);
@@ -1275,7 +1234,7 @@ coredump_notes_elf(struct proc *p, void *iocookie, size_t *sizep)
 			return (EIO);
 
 		nhdr.namesz = sizeof("OpenBSD");
-		nhdr.descsz = pr->ps_emul->e_arglen * sizeof(char *);
+		nhdr.descsz = ELF_AUX_WORDS * sizeof(char *);
 		nhdr.type = NT_OPENBSD_AUXV;
 
 		error = coredump_write(iocookie, UIO_SYSSPACE,

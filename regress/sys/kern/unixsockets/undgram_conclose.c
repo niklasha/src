@@ -1,4 +1,4 @@
-/* $OpenBSD: unconacc.c,v 1.4 2021/12/01 10:24:40 mvs Exp $ */
+/* $OpenBSD: undgram_conclose.c,v 1.1 2021/12/10 00:33:25 mvs Exp $ */
 
 /*
  * Copyright (c) 2021 Vitaliy Makkoveev <mvs@openbsd.org>
@@ -17,8 +17,9 @@
  */
 
 /*
- * Provide multithreaded connect(2) and accept(2) stress test on
- * unix(4) socket.
+ * Try to kill the datagram socket connected to the dying socket while
+ * it cleaning it's list of connected sockets. Incorrect handling of
+ * this case could produce kernel crash.
  */
 
 #include <sys/types.h>
@@ -30,7 +31,6 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <err.h>
-#include <errno.h>
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
@@ -63,24 +63,19 @@ therrc(int eval, int code, const char *fmt, ...)
 }
 
 static void *
-thr_acc(void *arg)
+thr_close(void *arg)
 {
-	int s = *(int *)arg;
+	struct sockaddr_un *sun = arg;
+	int s;
 
 	while (1) {
-		int n;
+		unlink(sun->sun_path);
 
-		if ((n = accept(s, NULL, NULL)) < 0) {
-			switch (errno) {
-			case EMFILE:
-			case ENFILE:
-				continue;
-			default:
-				therr(1, "accept");
-			}
-		}
-
-		close(n);
+		if ((s = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0)
+			therr(1, "socket");
+		if (bind(s, (struct sockaddr *)sun, sizeof(*sun)) < 0)
+			therr(1, "bind");
+		close(s);
 	}
 
 	return NULL;
@@ -93,26 +88,9 @@ thr_conn(void *arg)
 	int s;
 
 	while (1) {
-		if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
-			switch (errno) {
-			case EMFILE:
-			case ENFILE:
-			case ENOBUFS:
-				continue;
-			default:
-				therr(1, "socket");
-			}
-		}
-
-		if (connect(s, (struct sockaddr *)sun, sizeof(*sun)) < 0) {
-			switch (errno) {
-			case ECONNREFUSED:
-				continue;
-			default:
-				therr(1, "connect");
-			}
-		}
-
+		if ((s = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0)
+			therr(1, "socket");
+		connect(s, (struct sockaddr *)sun, sizeof(*sun));
 		close(s);
 	}
 
@@ -129,12 +107,11 @@ main(int argc, char *argv[])
 		.tv_nsec = 0,
 	};
 
-	int s;
-
 	int mib[2], ncpu;
 	size_t len;
 
-	int i;
+	pthread_t thr;
+	int error, i;
 
 	umask(0077);
 
@@ -153,30 +130,13 @@ main(int argc, char *argv[])
 	memset(&sun, 0, sizeof(sun));
 	sun.sun_len = sizeof(sun);
 	sun.sun_family = AF_UNIX;
-	snprintf(sun.sun_path, sizeof(sun.sun_path) - 1, "unconacc.socket");
+	snprintf(sun.sun_path, sizeof(sun.sun_path) - 1,
+	    "undgram_conclose.socket");
 
-	if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
-		err(1, "socket");
+	if ((error = pthread_create(&thr, NULL, thr_close, &sun)))
+		therrc(1, error, "pthread_create");
 
-	unlink(sun.sun_path);
-
-	if (bind(s, (struct sockaddr *)&sun, sizeof(sun)) < 0)
-		err(1, "bind");
-	if (listen(s, 10) < 0)
-		err(1, "listen");
-
-	for (i = 0; i < (ncpu * 2); ++i) {
-		pthread_t thr;
-		int error;
-
-		if ((error = pthread_create(&thr, NULL, thr_acc, &s)))
-			therrc(1, error, "pthread_create");
-	}
-
-	for (i = 0; i < (ncpu * 2); ++i) {
-		pthread_t thr;
-		int error;
-
+	for (i = 0; i < (ncpu * 4); ++i) {
 		if ((error = pthread_create(&thr, NULL, thr_conn, &sun)))
 			therrc(1, error, "pthread_create");
 	}

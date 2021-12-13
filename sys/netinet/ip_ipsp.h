@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_ipsp.h,v 1.227 2021/12/03 19:04:49 tobhe Exp $	*/
+/*	$OpenBSD: ip_ipsp.h,v 1.230 2021/12/11 16:33:47 bluhm Exp $	*/
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr),
@@ -309,6 +309,13 @@ struct ipsec_policy {
 #define	IPSP_IDENTITY_USERFQDN		3
 #define	IPSP_IDENTITY_ASN1_DN		4
 
+/*
+ * Locks used to protect struct members in this file:
+ *	I	immutable after creation
+ *	N	net lock
+ *	s	tdb_sadb_mtx
+ *	m	tdb_mtx
+ */
 struct tdb {				/* tunnel descriptor block */
 	/*
 	 * Each TDB is on three hash tables: one keyed on dst/spi/sproto,
@@ -318,13 +325,14 @@ struct tdb {				/* tunnel descriptor block */
 	 * policy matching. The following three fields maintain the hash
 	 * queues in those three tables.
 	 */
-	struct tdb	*tdb_hnext;	/* dst/spi/sproto table */
-	struct tdb	*tdb_dnext;	/* dst/sproto table */
-	struct tdb	*tdb_snext;	/* src/sproto table */
+	struct tdb	*tdb_hnext;	/* [s] dst/spi/sproto table */
+	struct tdb	*tdb_dnext;	/* [s] dst/sproto table */
+	struct tdb	*tdb_snext;	/* [s] src/sproto table */
 	struct tdb	*tdb_inext;
 	struct tdb	*tdb_onext;
 
 	struct refcnt	tdb_refcnt;
+	struct mutex	tdb_mtx;
 
 	const struct xformsw	*tdb_xform;		/* Transform to use */
 	const struct enc_xform	*tdb_encalgxform;	/* Enc algorithm */
@@ -358,7 +366,7 @@ struct tdb {				/* tunnel descriptor block */
 	"\21USEDTUNNEL\22UDPENCAP\23PFSYNC\24PFSYNC_RPL" \
 	"\25ESN")
 
-	u_int32_t	tdb_flags;	/* Flags related to this TDB */
+	u_int32_t	tdb_flags;	/* [m] Flags related to this TDB */
 
 	struct timeout	tdb_timer_tmo;
 	struct timeout	tdb_first_tmo;
@@ -390,17 +398,17 @@ struct tdb {				/* tunnel descriptor block */
 	struct tdb_data	tdb_data;	/* stats about this TDB */
 	u_int64_t	tdb_cryptoid;	/* Crypto session ID */
 
-	u_int32_t	tdb_spi;	/* SPI */
+	u_int32_t	tdb_spi;	/* [I] SPI */
 	u_int16_t	tdb_amxkeylen;	/* Raw authentication key length */
 	u_int16_t	tdb_emxkeylen;	/* Raw encryption key length */
 	u_int16_t	tdb_ivlen;	/* IV length */
-	u_int8_t	tdb_sproto;	/* IPsec protocol */
+	u_int8_t	tdb_sproto;	/* [I] IPsec protocol */
 	u_int8_t	tdb_wnd;	/* Replay window */
 	u_int8_t	tdb_satype;	/* SA type (RFC2367, PF_KEY) */
 	u_int8_t	tdb_updates;	/* pfsync update counter */
 
-	union sockaddr_union	tdb_dst;	/* Destination address */
-	union sockaddr_union	tdb_src;	/* Source address */
+	union sockaddr_union	tdb_dst;	/* [N] Destination address */
+	union sockaddr_union	tdb_src;	/* [N] Source address */
 
 	u_int8_t	*tdb_amxkey;	/* Raw authentication key */
 	u_int8_t	*tdb_emxkey;	/* Raw encryption key */
@@ -424,8 +432,8 @@ struct tdb {				/* tunnel descriptor block */
 	u_int16_t	tdb_tag;		/* Packet filter tag */
 	u_int32_t	tdb_tap;		/* Alternate enc(4) interface */
 
-	u_int		tdb_rdomain;		/* Routing domain */
-	u_int		tdb_rdomain_post;	/* Change domain */
+	u_int		tdb_rdomain;		/* [I] Routing domain */
+	u_int		tdb_rdomain_post;	/* [I] Change domain */
 
 	struct sockaddr_encap   tdb_filter; /* What traffic is acceptable */
 	struct sockaddr_encap   tdb_filtermask; /* And the mask */
@@ -577,6 +585,7 @@ void	tdb_free(struct tdb *);
 int	tdb_init(struct tdb *, u_int16_t, struct ipsecinit *);
 void	tdb_unlink(struct tdb *);
 void	tdb_unlink_locked(struct tdb *);
+void	tdb_cleanspd(struct tdb *);
 void	tdb_unbundle(struct tdb *);
 void	tdb_deltimeouts(struct tdb *);
 int	tdb_walk(u_int, int (*)(struct tdb *, void *, int), void *);

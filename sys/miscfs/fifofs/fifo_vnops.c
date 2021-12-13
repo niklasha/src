@@ -1,4 +1,4 @@
-/*	$OpenBSD: fifo_vnops.c,v 1.85 2021/10/24 11:23:22 mpi Exp $	*/
+/*	$OpenBSD: fifo_vnops.c,v 1.87 2021/12/11 09:28:26 visa Exp $	*/
 /*	$NetBSD: fifo_vnops.c,v 1.18 1996/03/16 23:52:42 christos Exp $	*/
 
 /*
@@ -531,7 +531,7 @@ fifo_kqfilter(void *v)
 	case EVFILT_WRITE:
 		if (!(ap->a_fflag & FWRITE)) {
 			/* Tell upper layer to ask for POLLUP only */
-			if (ap->a_kn->kn_flags & __EV_POLL)
+			if (ap->a_kn->kn_flags & (__EV_POLL | __EV_SELECT))
 				return (EPERM);
 			return (EINVAL);
 		}
@@ -540,6 +540,10 @@ fifo_kqfilter(void *v)
 		sb = &so->so_snd;
 		break;
 	case EVFILT_EXCEPT:
+		if (ap->a_kn->kn_flags & __EV_SELECT) {
+			/* Prevent triggering exceptfds. */
+			return (EPERM);
+		}
 		ap->a_kn->kn_fop = &fifoexcept_filtops;
 		so = fip->fi_readsock;
 		sb = &so->so_rcv;

@@ -1,4 +1,4 @@
-/* $OpenBSD: ungc.c,v 1.1 2021/06/01 13:13:10 mvs Exp $ */
+/* $OpenBSD: unfdpassfail.c,v 1.1 2021/12/09 23:26:48 mvs Exp $ */
 
 /*
  * Copyright (c) 2021 Vitaliy Makkoveev <mvs@openbsd.org>
@@ -17,13 +17,14 @@
  */
 
 #include <sys/types.h>
+#include <sys/event.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <sys/un.h>
 #include <stdio.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -33,6 +34,12 @@ union msg_control{
 	char control[CMSG_SPACE(sizeof(int)*2)];
 };
 
+static void *thr_close(void *arg)
+{
+	close(*(int *)arg);
+	return NULL;
+}
+
 int main(int argc, char *argv[])
 {
 	struct timespec ts_start, ts_now, ts_time;
@@ -41,11 +48,15 @@ int main(int argc, char *argv[])
 	struct iovec iov;
 	struct msghdr msgh;
 	struct cmsghdr *cmsgh;
-	int s[2];
-	int infinite = 0;
+	pthread_t thr;
+	int s[2], fd, kqfd;
+	int infinite = 0, error;
 
 	if (argc > 1 && !strcmp(argv[1], "--infinite"))
 		infinite = 1;
+
+	if ((kqfd = kqueue()) < 0)
+		err(1, "kqueue");
 
 	if (!infinite)
 		if (clock_gettime(CLOCK_BOOTTIME, &ts_start) <0)
@@ -54,6 +65,8 @@ int main(int argc, char *argv[])
 	while (1) {
 		if (socketpair(AF_UNIX, SOCK_STREAM|O_NONBLOCK, 0, s) < 0)
 			err(1, "socketpair");
+		if ((fd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0)
+			err(1, "open");
 	
 		iov_buf = 0;
 		iov.iov_base = &iov_buf;
@@ -68,16 +81,25 @@ int main(int argc, char *argv[])
 		cmsgh->cmsg_len = CMSG_LEN(sizeof(int) * 2);
 		cmsgh->cmsg_level = SOL_SOCKET;
 		cmsgh->cmsg_type = SCM_RIGHTS;
-		*((int *)CMSG_DATA(cmsgh) + 0) = s[0];
-		*((int *)CMSG_DATA(cmsgh) + 1) = s[1];
+		*((int *)CMSG_DATA(cmsgh) + 0) = fd;
+		*((int *)CMSG_DATA(cmsgh) + 1) = kqfd;
+
+		error = pthread_create(&thr, NULL, thr_close, &fd);
+		if (error)
+			errc(1, error, "pthread_create");
 
 		if (sendmsg(s[0], &msgh, 0) < 0) {
-			if (errno != EMFILE)
+			if (errno != EINVAL)
 				err(1, "sendmsg");
 		}
 
+		error = pthread_join(thr, NULL);
+		if (error)
+			errc(1, error, "pthread_join");
+
 		close(s[0]);
 		close(s[1]);
+		close(fd);
 
 		if (!infinite) {
 			if (clock_gettime(CLOCK_BOOTTIME, &ts_now) <0)
@@ -88,6 +110,8 @@ int main(int argc, char *argv[])
 				break;
 		}
 	}
+
+	close(kqfd);
 
 	return 0;
 }

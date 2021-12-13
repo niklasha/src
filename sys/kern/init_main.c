@@ -1,4 +1,4 @@
-/*	$OpenBSD: init_main.c,v 1.309 2021/12/06 21:21:10 guenther Exp $	*/
+/*	$OpenBSD: init_main.c,v 1.313 2021/12/09 00:26:10 guenther Exp $	*/
 /*	$NetBSD: init_main.c,v 1.84.4.1 1996/06/02 09:08:06 mrg Exp $	*/
 
 /*
@@ -154,31 +154,6 @@ void	timeout_proc_init(void);
 void	pool_gc_pages(void *);
 void	percpu_init(void);
 
-extern char sigcode[], esigcode[], sigcoderet[];
-#ifdef SYSCALL_DEBUG
-extern char *syscallnames[];
-#endif
-
-struct emul emul_native = {
-	"native",
-	NULL,
-	SYS_syscall,
-	SYS_MAXSYSCALL,
-	sysent,
-#ifdef SYSCALL_DEBUG
-	syscallnames,
-#else
-	NULL,
-#endif
-	0,
-	setregs,
-	NULL,		/* fixup */
-	NULL,		/* coredump */
-	sigcode,
-	esigcode,
-	sigcoderet
-};
-
 #ifdef DIAGNOSTIC
 int pdevinit_done = 0;
 #endif
@@ -316,7 +291,6 @@ main(void *framep)
 	atomic_setbits_int(&p->p_flag, P_SYSTEM);
 	p->p_stat = SONPROC;
 	pr->ps_nice = NZERO;
-	pr->ps_emul = &emul_native;
 	strlcpy(pr->ps_comm, "swapper", sizeof(pr->ps_comm));
 
 	/* Init timeouts. */
@@ -435,7 +409,7 @@ main(void *framep)
 	kqueue_init_percpu();
 	uvm_init_percpu();
 
-	/* init exec and emul */
+	/* init exec */
 	init_exec();
 
 	/* Start the scheduler */

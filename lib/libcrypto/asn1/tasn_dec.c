@@ -1,4 +1,4 @@
-/* $OpenBSD: tasn_dec.c,v 1.41 2021/12/03 17:27:34 jsing Exp $ */
+/* $OpenBSD: tasn_dec.c,v 1.44 2021/12/09 17:01:41 jsing Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 2000.
  */
@@ -76,8 +76,6 @@ static int asn1_find_end(const unsigned char **in, long len, char inf);
 
 static int asn1_collect(BUF_MEM *buf, const unsigned char **in, long len,
     char inf, int tag, int aclass, int depth);
-
-static int collect_data(BUF_MEM *buf, const unsigned char **p, long plen);
 
 static int asn1_check_tlen(long *olen, int *otag, unsigned char *oclass,
     char *inf, char *cst, const unsigned char **in, long len, int exptag,
@@ -1020,14 +1018,14 @@ asn1_collect(BUF_MEM *buf, const unsigned char **in, long len, char inf,
 	long plen;
 	char cst, ininf;
 
+	if (depth > ASN1_MAX_STRING_NEST) {
+		ASN1error(ASN1_R_NESTED_ASN1_STRING);
+		return 0;
+	}
+
 	p = *in;
 	inf &= 1;
-	/* If no buffer and not indefinite length constructed just pass over
-	 * the encoded data */
-	if (!buf && !inf) {
-		*in += len;
-		return 1;
-	}
+
 	while (len > 0) {
 		q = p;
 		/* Check for EOC */
@@ -1050,15 +1048,20 @@ asn1_collect(BUF_MEM *buf, const unsigned char **in, long len, char inf,
 
 		/* If indefinite length constructed update max length */
 		if (cst) {
-			if (depth >= ASN1_MAX_STRING_NEST) {
-				ASN1error(ASN1_R_NESTED_ASN1_STRING);
-				return 0;
-			}
 			if (!asn1_collect(buf, &p, plen, ininf, tag, aclass,
 			    depth + 1))
 				return 0;
-		} else if (plen && !collect_data(buf, &p, plen))
-			return 0;
+		} else if (plen > 0) {
+			size_t len = buf->length;
+
+			if (!BUF_MEM_grow_clean(buf, len + plen)) {
+				ASN1error(ERR_R_MALLOC_FAILURE);
+				return 0;
+			}
+			memcpy(buf->data + len, p, plen);
+
+			p += plen;
+		}
 		len -= p - q;
 	}
 	if (inf) {
@@ -1066,22 +1069,6 @@ asn1_collect(BUF_MEM *buf, const unsigned char **in, long len, char inf,
 		return 0;
 	}
 	*in = p;
-	return 1;
-}
-
-static int
-collect_data(BUF_MEM *buf, const unsigned char **p, long plen)
-{
-	int len;
-	if (buf) {
-		len = buf->length;
-		if (!BUF_MEM_grow_clean(buf, len + plen)) {
-			ASN1error(ERR_R_MALLOC_FAILURE);
-			return 0;
-		}
-		memcpy(buf->data + len, *p, plen);
-	}
-	*p += plen;
 	return 1;
 }
 

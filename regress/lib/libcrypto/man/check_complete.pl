@@ -20,13 +20,14 @@ use warnings;
 my @obsolete = qw(
     d2i_PBEPARAM d2i_PBE2PARAM d2i_PBKDF2PARAM
     i2d_PBEPARAM i2d_PBE2PARAM i2d_PBKDF2PARAM
+    NETSCAPE_SPKAC NETSCAPE_SPKI
     PBEPARAM PBEPARAM_free PBEPARAM_new
     PBE2PARAM PBE2PARAM_free PBE2PARAM_new
     PBKDF2PARAM PBKDF2PARAM_free PBKDF2PARAM_new
     PKCS5_pbe_set PKCS5_pbe_set0_algor
     PKCS5_pbe2_set PKCS5_pbe2_set_iv
     PKCS5_pbkdf2_set
-    X509_EX_V_INIT
+    X509_EX_V_INIT X509_EX_V_NETSCAPE_HACK
     X509_EXT_PACK_STRING X509_EXT_PACK_UNKNOWN
     X509_VERIFY_PARAM_ID
 );
@@ -66,8 +67,8 @@ try_again:
 		$in_comment = 0;
 	}
 	while (/\/\*/) {
-		s/\/\*.*?\*\/// and next;
-		s/\/\*.*// and $in_comment = 1;
+		s/\s*\/\*.*?\*\/// and next;
+		s/\s*\/\*.*// and $in_comment = 1;
 	}
 
 	# End C++ stuff.
@@ -81,11 +82,19 @@ try_again:
 	# End declarations of structs.
 
 	if ($in_struct) {
+		if (/^\s*union\s+{$/) {
+			print "-s $line\n" if $verbose;
+			$in_struct++;
+			next;
+		}
 		unless (s/^\s*\}//) {
 			print "-s $line\n" if $verbose;
 			next;
 		}
-		$in_struct = 0;
+		if (--$in_struct && /^\s+\w+;$/) {
+			print "-s $line\n" if $verbose;
+			next;
+		}
 		unless ($in_typedef_struct) {
 			/^\s*;$/ or die "at end of struct: $_";
 			print "-s $line\n" if $verbose;
@@ -96,10 +105,6 @@ try_again:
 		    or die "at end of typedef struct: $_";
 		unless (system "$MANW -k Vt=$id > /dev/null 2>&1") {
 			print "Vt $line\n" if $verbose;
-			next;
-		}
-		if ($id =~ /NETSCAPE/) {
-			print "V- $line\n" if $verbose;
 			next;
 		}
 		if (grep { $_ eq $id } @obsolete) {
@@ -143,11 +148,13 @@ try_again:
 
 	if (/^\s*$/ ||
 	    /^DECLARE_STACK_OF\(\w+\)$/ ||
+	    /^TYPEDEF_D2I2D_OF\(\w+\);$/ ||
 	    /^#define HEADER_\w+_H$/ ||
 	    /^#endif$/ ||
 	    /^extern\s+const\s+ASN1_ITEM\s+\w+_it;$/ ||
 	    /^#include\s/ ||
-	    /^#ifn?def\s/) {
+	    /^#ifn?def\s/ ||
+	    /^#if defined/) {
 		print "-- $line\n" if $verbose;
 		next;
 	}
@@ -163,7 +170,7 @@ try_again:
 
 	# Handle macros.
 
-	if (my ($id) = /^#define\s+(\w+)\s+\S/) {
+	if (my ($id) = /^#\s*define\s+(\w+)\s+\S/) {
 		/\\$/ and $in_define = 1;
 		unless (system "$MANW -k Dv=$id > /dev/null 2>&1") {
 			print "Dv $line\n" if $verbose;
@@ -178,11 +185,7 @@ try_again:
 			print "D- $line\n" if $verbose;
 			next;
 		}
-		if ($id =~ /NETSCAPE/) {
-			print "D- $line\n" if $verbose;
-			next;
-		}
-		if ($id =~ /^X509_[FR]_\w+$/) {
+		if ($id =~ /^(?:ASN1|X509(?:V3)?)_[FR]_\w+$/) {
 			print "D- $line\n" if $verbose;
 			next;
 		}
@@ -201,7 +204,7 @@ try_again:
 		}
 		next;
 	}
-	if (my ($id) = /^#define\s+(\w+)\(/) {
+	if (my ($id) = /^#\s*define\s+(\w+)\(/) {
 		/\\$/ and $in_define = 1;
 		unless (system "$MANW $id > /dev/null 2>&1") {
 			print "Fn $line\n" if $verbose;
@@ -220,9 +223,22 @@ try_again:
 		next;
 	}
 
-	# Handle variable type definitions.
+	# Handle variable type declarations.
 
-	if (my ($id) = /^typedef\s+(?:struct\s+)?\S+\s+(\w+);$/) {
+	if (my ($id) = /^struct\s+(\w+);$/) {
+		unless (system "$MANW -k Vt=$id > /dev/null 2>&1") {
+			print "Vt $line\n" if $verbose;
+			next;
+		}
+		if ($verbose) {
+			print "XX $line\n";
+		} else {
+			warn "not found: struct $id";
+		}
+		next;
+	}
+
+	if (my ($id) = /^typedef\s+(?:const\s+)?(?:struct\s+)?\S+\s+(\w+);$/) {
 		unless (system "$MANW -k Vt=$id > /dev/null 2>&1") {
 			print "Vt $line\n" if $verbose;
 			next;
@@ -239,16 +255,34 @@ try_again:
 		next;
 	}
 
+	if (my ($id) =/^typedef\s+\w+(?:\s+\*)?\s+\(\*(\w+)\)\(/) {
+		/\);$/ or $in_function = 1;
+		unless (system "$MANW $id > /dev/null 2>&1") {
+			print "Fn $line\n" if $verbose;
+			next;
+		}
+		if ($verbose) {
+			print "XX $line\n";
+		} else {
+			warn "not found: function type (*$id)()";
+		}
+		next;
+	}
+
 	# Handle function declarations.
 
-	if (/^\w+(?:\(\w+\))?(?:\s+\w+)?\s+(?:\(?\*\s*)?(\w+)\(/) {
+	if (/^\w+(?:\(\w+\))?(?:\s+\w+)*\s+(?:\(?\*\s*)?(\w+)\(/) {
 		my $id = $1;
 		/\);$/ or $in_function = 1;
 		unless (system "$MANW $id > /dev/null 2>&1") {
 			print "Fn $line\n" if $verbose;
 			next;
 		}
-		if ($id =~ /NETSCAPE/) {
+		# These functions are still provided by OpenSSL
+		# and still used by the Python test suite,
+		# but intentionally undocumented because nothing
+		# else uses them according to tb@, Dec 3, 2021.
+		if ($id =~ /NETSCAPE_(?:CERT_SEQUENCE|SPKAC|SPKI)/) {
 			print "F- $line\n" if $verbose;
 			next;
 		}
