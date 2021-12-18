@@ -34,18 +34,11 @@
 
 #include <uvm/uvm.h>
 
-static const struct uvm_pagerops drm_gem_cma_vm_ops = {
-	.pgo_fault = drm_gem_cma_fault,
-	.pgo_reference = drm_ref,
-	.pgo_detach = drm_unref
-};
-
 static const struct drm_gem_object_funcs drm_gem_cma_default_funcs = {
 	.free = drm_gem_cma_free_object,
 	.get_sg_table = drm_gem_cma_get_sg_table,
 	.vmap = drm_gem_cma_vmap,
 //	.mmap = drm_gem_cma_mmap,
-	.vm_ops = &drm_gem_cma_vm_ops,
 };
 
 static struct drm_gem_cma_object *
@@ -180,21 +173,17 @@ drm_gem_cma_dumb_create(struct drm_file *file_priv, struct drm_device *ddev,
 }
 
 int
-drm_gem_cma_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
-    int npages, int centeridx, vm_fault_t fault_type,
+drm_gem_cma_fault(struct drm_gem_object *gem_obj, struct uvm_faultinfo *ufi,
+    off_t offset, vaddr_t vaddr, vm_page_t *pps, int npages, int centeridx,
     vm_prot_t access_type, int flags)
 {
-	struct uvm_object *uobj = ufi->entry->object.uvm_obj;
-	struct drm_gem_object *gem_obj =
-	    container_of(uobj, struct drm_gem_object, uobj);
 	struct vm_map_entry *entry = ufi->entry;
 	struct drm_gem_cma_object *obj = to_drm_gem_cma_obj(gem_obj);
+	struct uvm_object *uobj = &obj->base.uobj;
 	paddr_t paddr;
 	int lcv, retval;
 	vm_prot_t mapprot;
-	off_t offset;
 
-	offset = entry->offset + (vaddr - entry->start);
 	offset -= drm_vma_node_offset_addr(&obj->base.vma_node);
 	mapprot = ufi->entry->protection;
 
