@@ -163,6 +163,7 @@ rkdrm_fb_create(struct drm_device *ddev, struct drm_file *file,
 	fb = malloc(sizeof(*fb), M_DRM, M_ZERO | M_WAITOK);
 	drm_helper_mode_fill_fb_struct(ddev, &fb->base, cmd);
 	fb->base.format = drm_format_info(DRM_FORMAT_ARGB8888);
+	fb->base.obj[0] = gem_obj;
 	fb->obj = to_drm_gem_cma_obj(gem_obj);
 
 	error = drm_framebuffer_init(ddev, &fb->base, &rkdrm_framebuffer_funcs);
@@ -516,6 +517,7 @@ rkdrm_fb_probe(struct drm_fb_helper *helper, struct drm_fb_helper_surface_size *
 
 	drm_helper_mode_fill_fb_struct(ddev, fb, &mode_cmd);
 	fb->format = drm_format_info(DRM_FORMAT_ARGB8888);
+	fb->obj[0] = &sfb->obj->base;
 	error = drm_framebuffer_init(ddev, fb, &rkdrm_framebuffer_funcs);
 	if (error != 0) {
 		DRM_ERROR("failed to initialize framebuffer\n");
