@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_esp.c,v 1.189 2021/12/11 16:33:47 bluhm Exp $ */
+/*	$OpenBSD: ip_esp.c,v 1.191 2021/12/20 17:09:18 tobhe Exp $ */
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr) and
@@ -347,7 +347,7 @@ esp_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 	struct mbuf *m = *mp, *m1, *mo;
 	struct cryptodesc *crde = NULL, *crda = NULL;
 	struct cryptop *crp = NULL;
-	int plen, alen, hlen, error, clen, roff;
+	int plen, alen, hlen, error, roff;
 	uint32_t btsx, esn;
 #ifdef ENCDEBUG
 	char buf[INET6_ADDRSTRLEN];
@@ -420,7 +420,7 @@ esp_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 
 	/* Update the counters */
 	tdb->tdb_cur_bytes += plen;
-	tdb->tdb_ibytes += plen;
+	tdbstat_add(tdb, tdb_ibytes, plen);
 	espstat_add(esps_ibytes, plen);
 
 	/* Hard expiration */
@@ -514,8 +514,6 @@ esp_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 		ipsecstat_inc(ipsec_noxform);
 		goto drop;
 	}
-
-	clen = crp->crp_olen;
 
 	/* Release the crypto descriptors */
 	crypto_freereq(crp);

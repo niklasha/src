@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_ipsp.h,v 1.230 2021/12/11 16:33:47 bluhm Exp $	*/
+/*	$OpenBSD: ip_ipsp.h,v 1.233 2021/12/20 15:59:10 mvs Exp $	*/
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr),
@@ -136,17 +136,6 @@ struct ipsecstat {
 	uint64_t	ipsec_exctdb;		/* TDBs with hardlimit excess */
 };
 
-struct tdb_data {
-	uint64_t	tdd_ipackets;		/* Input IPsec packets */
-	uint64_t	tdd_opackets;		/* Output IPsec packets */
-	uint64_t	tdd_ibytes;		/* Input bytes */
-	uint64_t	tdd_obytes;		/* Output bytes */
-	uint64_t	tdd_idrops;		/* Dropped on input */
-	uint64_t	tdd_odrops;		/* Dropped on output */
-	uint64_t	tdd_idecompbytes;	/* Input bytes, decompressed */
-	uint64_t	tdd_ouncompbytes;	/* Output bytes, uncompressed */
-};
-
 #ifdef _KERNEL
 
 #include <sys/timeout.h>
@@ -257,6 +246,10 @@ struct ipsec_acquire {
 	TAILQ_ENTRY(ipsec_acquire)	ipa_next;
 };
 
+/*
+ * Locks used to protect struct members in this file:
+ *	p	ipo_tdb_mtx		link policy to TDB global mutex
+ */
 struct ipsec_policy {
 	struct radix_node	ipo_nodes[2];	/* radix tree glue */
 	struct sockaddr_encap	ipo_addr;
@@ -274,7 +267,7 @@ struct ipsec_policy {
 						 * mode was used.
 						 */
 
-	u_int64_t		ipo_last_searched;	/* Timestamp of last lookup */
+	u_int64_t	ipo_last_searched;	/* [p] Timestamp of lookup */
 
 	u_int8_t		ipo_flags;	/* See IPSP_POLICY_* definitions */
 	u_int8_t		ipo_type;	/* USE/ACQUIRE/... */
@@ -283,7 +276,7 @@ struct ipsec_policy {
 
 	int                     ipo_ref_count;
 
-	struct tdb		*ipo_tdb;		/* Cached entry */
+	struct tdb		*ipo_tdb;	/* [p] Cached TDB entry */
 
 	struct ipsec_ids	*ipo_ids;
 
@@ -313,8 +306,9 @@ struct ipsec_policy {
  * Locks used to protect struct members in this file:
  *	I	immutable after creation
  *	N	net lock
- *	s	tdb_sadb_mtx
  *	m	tdb_mtx
+ *	p	ipo_tdb_mtx		link policy to TDB global mutex
+ *	s	tdb_sadb_mtx		SA database global mutex
  */
 struct tdb {				/* tunnel descriptor block */
 	/*
@@ -330,6 +324,7 @@ struct tdb {				/* tunnel descriptor block */
 	struct tdb	*tdb_snext;	/* [s] src/sproto table */
 	struct tdb	*tdb_inext;
 	struct tdb	*tdb_onext;
+	SIMPLEQ_ENTRY(tdb) tdb_walk;	/* [N] temp list for tdb walker */
 
 	struct refcnt	tdb_refcnt;
 	struct mutex	tdb_mtx;
@@ -395,7 +390,8 @@ struct tdb {				/* tunnel descriptor block */
 	u_int64_t	tdb_last_used;	/* When was this SA last used */
 	u_int64_t	tdb_last_marked;/* Last SKIPCRYPTO status change */
 
-	struct tdb_data	tdb_data;	/* stats about this TDB */
+	struct cpumem   *tdb_counters;  /* stats about this TDB */
+
 	u_int64_t	tdb_cryptoid;	/* Crypto session ID */
 
 	u_int32_t	tdb_spi;	/* [I] SPI */
@@ -438,18 +434,40 @@ struct tdb {				/* tunnel descriptor block */
 	struct sockaddr_encap   tdb_filter; /* What traffic is acceptable */
 	struct sockaddr_encap   tdb_filtermask; /* And the mask */
 
-	TAILQ_HEAD(tdb_policy_head, ipsec_policy)	tdb_policy_head;
+	TAILQ_HEAD(tdb_policy_head, ipsec_policy) tdb_policy_head; /* [p] */
 	TAILQ_ENTRY(tdb)	tdb_sync_entry;
 };
-#define tdb_ipackets		tdb_data.tdd_ipackets
-#define tdb_opackets		tdb_data.tdd_opackets
-#define tdb_ibytes		tdb_data.tdd_ibytes
-#define tdb_obytes		tdb_data.tdd_obytes
-#define tdb_idrops		tdb_data.tdd_idrops
-#define tdb_odrops		tdb_data.tdd_odrops
-#define tdb_idecompbytes	tdb_data.tdd_idecompbytes
-#define tdb_ouncompbytes	tdb_data.tdd_ouncompbytes
 
+enum tdb_counters {
+	tdb_ipackets,           /* Input IPsec packets */
+	tdb_opackets,           /* Output IPsec packets */
+	tdb_ibytes,             /* Input bytes */
+	tdb_obytes,             /* Output bytes */
+	tdb_idrops,             /* Dropped on input */
+	tdb_odrops,             /* Dropped on output */
+	tdb_idecompbytes,       /* Input bytes, decompressed */
+	tdb_ouncompbytes,       /* Output bytes, uncompressed */
+	tdb_ncounters
+};
+
+static inline void
+tdbstat_inc(struct tdb *tdb, enum tdb_counters c)
+{
+	counters_inc(tdb->tdb_counters, c);
+}
+
+static inline void
+tdbstat_add(struct tdb *tdb, enum tdb_counters c, uint64_t v)
+{
+	counters_add(tdb->tdb_counters, c, v);
+}
+
+static inline void
+tdbstat_pkt(struct tdb *tdb, enum tdb_counters pc, enum tdb_counters bc,
+    uint64_t bytes)
+{
+	counters_pkt(tdb->tdb_counters, pc, bc, bytes);
+}
 
 struct tdb_ident {
 	u_int32_t spi;
@@ -546,6 +564,7 @@ extern char ipsec_def_comp[];
 extern TAILQ_HEAD(ipsec_policy_head, ipsec_policy) ipsec_policy_head;
 
 extern struct mutex tdb_sadb_mtx;
+extern struct mutex ipo_tdb_mtx;
 
 struct cryptop;
 
@@ -577,7 +596,6 @@ struct	tdb *gettdbbysrcdst_dir(u_int, u_int32_t, union sockaddr_union *,
 void	puttdb(struct tdb *);
 void	puttdb_locked(struct tdb *);
 void	tdb_delete(struct tdb *);
-void	tdb_delete_locked(struct tdb *);
 struct	tdb *tdb_alloc(u_int);
 struct	tdb *tdb_ref(struct tdb *);
 void	tdb_unref(struct tdb *);

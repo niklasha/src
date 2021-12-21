@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.223 2021/12/12 17:31:18 schwarze Exp $
+# $OpenBSD: Makefile,v 1.231 2021/12/18 17:47:44 schwarze Exp $
 
 .include <bsd.own.mk>
 
@@ -206,6 +206,9 @@ MAN=	\
 	HMAC.3 \
 	MD5.3 \
 	NAME_CONSTRAINTS_new.3 \
+	OBJ_NAME_add.3 \
+	OBJ_add_sigid.3 \
+	OBJ_create.3 \
 	OBJ_nid2obj.3 \
 	OCSP_CRLID_new.3 \
 	OCSP_REQUEST_new.3 \
@@ -228,6 +231,7 @@ MAN=	\
 	PEM_bytes_read_bio.3 \
 	PEM_read.3 \
 	PEM_read_bio_PrivateKey.3 \
+	PEM_write_bio_ASN1_stream.3 \
 	PEM_write_bio_CMS_stream.3 \
 	PEM_write_bio_PKCS7_stream.3 \
 	PKCS12_SAFEBAG_new.3 \
@@ -278,8 +282,12 @@ MAN=	\
 	RSA_sign_ASN1_OCTET_STRING.3 \
 	RSA_size.3 \
 	SHA1.3 \
+	SMIME_crlf_copy.3 \
+	SMIME_read_ASN1.3 \
 	SMIME_read_CMS.3 \
 	SMIME_read_PKCS7.3 \
+	SMIME_text.3 \
+	SMIME_write_ASN1.3 \
 	SMIME_write_CMS.3 \
 	SMIME_write_PKCS7.3 \
 	STACK_OF.3 \
@@ -411,6 +419,7 @@ MAN=	\
 	evp.3 \
 	get_rfc3526_prime_8192.3 \
 	i2a_ASN1_STRING.3 \
+	i2d_ASN1_bio_stream.3 \
 	i2d_CMS_bio_stream.3 \
 	i2d_PKCS7_bio_stream.3 \
 	lh_new.3 \

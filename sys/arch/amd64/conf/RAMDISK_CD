@@ -1,4 +1,4 @@
-#	$OpenBSD: RAMDISK_CD,v 1.194 2021/11/07 16:06:31 patrick Exp $
+#	$OpenBSD: RAMDISK_CD,v 1.196 2021/12/20 14:54:37 hastings Exp $
 
 machine		amd64
 maxusers	4
@@ -51,6 +51,10 @@ bytgpio*	at acpi?
 sdhc*		at acpi?
 acpihve*	at acpi?
 chvgpio*        at acpi?
+com0		at acpi?
+com1		at acpi?
+com2		at acpi?
+com*		at acpi?
 glkgpio*	at acpi?
 
 mpbios0		at bios0
@@ -129,6 +133,7 @@ ugl*		at uhub?		# Genesys Logic GL620USB-A host-to-host
 ural*		at uhub?		# Ralink RT2500
 rum*		at uhub?		# Ralink RT2501USB/RT2601USB
 run*		at uhub?		# Ralink RT2700U/RT2800U/RT3000U
+#mtw*		at uhub?		# MediaTek MT7601U
 zyd*		at uhub?		# Zydas ZD1211
 upgt*		at uhub?		# Conexant/Intersil PrismGT SoftMAC USB
 urtw*		at uhub?		# Realtek 8187

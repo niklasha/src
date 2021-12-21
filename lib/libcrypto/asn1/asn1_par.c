@@ -1,4 +1,4 @@
-/* $OpenBSD: asn1_par.c,v 1.28 2020/01/09 11:27:21 inoguchi Exp $ */
+/* $OpenBSD: asn1_par.c,v 1.30 2021/12/14 17:35:21 jsing Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -232,16 +232,12 @@ asn1_parse2(BIO *bp, const unsigned char **pp, long length, int offset,
 						goto end;
 				}
 			} else if (tag == V_ASN1_BOOLEAN) {
-				int ii;
-
-				opp = op;
-				ii = d2i_ASN1_BOOLEAN(NULL, &opp, len + hl);
-				if (ii < 0) {
+				if (len != 1) {
 					if (BIO_write(bp, "Bad boolean\n",
 					    12) <= 0)
 						goto end;
 				}
-				BIO_printf(bp, ":%d", ii);
+				BIO_printf(bp, ":%u", p[0]);
 			} else if (tag == V_ASN1_BMPSTRING) {
 				/* do the BMP thang */
 			} else if (tag == V_ASN1_OCTET_STRING) {
@@ -383,26 +379,4 @@ end:
 	ASN1_ENUMERATED_free(ae);
 	*pp = p;
 	return (ret);
-}
-
-const char *
-ASN1_tag2str(int tag)
-{
-	static const char * const tag2str[] = {
-		"EOC", "BOOLEAN", "INTEGER", "BIT STRING", "OCTET STRING", /* 0-4 */
-		"NULL", "OBJECT", "OBJECT DESCRIPTOR", "EXTERNAL", "REAL", /* 5-9 */
-		"ENUMERATED", "<ASN1 11>", "UTF8STRING", "<ASN1 13>", 	    /* 10-13 */
-		"<ASN1 14>", "<ASN1 15>", "SEQUENCE", "SET", 		    /* 15-17 */
-		"NUMERICSTRING", "PRINTABLESTRING", "T61STRING",	    /* 18-20 */
-		"VIDEOTEXSTRING", "IA5STRING", "UTCTIME", "GENERALIZEDTIME", /* 21-24 */
-		"GRAPHICSTRING", "VISIBLESTRING", "GENERALSTRING",	    /* 25-27 */
-		"UNIVERSALSTRING", "<ASN1 29>", "BMPSTRING"		    /* 28-30 */
-	};
-
-	if ((tag == V_ASN1_NEG_INTEGER) || (tag == V_ASN1_NEG_ENUMERATED))
-		tag &= ~0x100;
-
-	if (tag < 0 || tag > 30)
-		return "(unknown)";
-	return tag2str[tag];
 }
