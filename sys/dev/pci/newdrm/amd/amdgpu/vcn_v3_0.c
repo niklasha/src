@@ -1868,7 +1868,7 @@ static int vcn_v3_0_dec_msg(struct amdgpu_cs_parser *p, uint64_t addr)
 	addr &= AMDGPU_GMC_HOLE_MASK;
 	r = amdgpu_cs_find_mapping(p, addr, &bo, &map);
 	if (r) {
-		DRM_ERROR("Can't find BO for addr 0x%08Lx\n", addr);
+		DRM_ERROR("Can't find BO for addr 0x%08llx\n", addr);
 		return r;
 	}
 
