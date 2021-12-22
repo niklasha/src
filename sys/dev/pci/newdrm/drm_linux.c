@@ -2159,7 +2159,7 @@ struct dma_fence *
 dma_fence_chain_walk(struct dma_fence *fence)
 {
 	struct dma_fence_chain *chain = to_dma_fence_chain(fence), *prev_chain;
-	struct dma_fence *next, *prev, *new_prev, *tmp;
+	struct dma_fence *prev, *new_prev, *tmp;
 
 	if (chain == NULL) {
 		dma_fence_put(fence);
