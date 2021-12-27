@@ -1,4 +1,4 @@
-/*	$OpenBSD: x509_addr.c,v 1.20 2021/12/18 16:58:20 tb Exp $ */
+/*	$OpenBSD: x509_addr.c,v 1.28 2021/12/25 23:35:25 tb Exp $ */
 /*
  * Contributed to the OpenSSL Project by the American Registry for
  * Internet Numbers ("ARIN").
@@ -60,6 +60,7 @@
  * Implementation of RFC 3779 section 2.2.
  */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -196,7 +197,6 @@ static const ASN1_TEMPLATE IPAddrBlocks_item_tt = {
 	.item = &IPAddressFamily_it,
 };
 
-/* XXX: maybe special? */
 static const ASN1_ITEM IPAddrBlocks_it = {
 	.itype = ASN1_ITYPE_PRIMITIVE,
 	.utype = -1,
@@ -508,10 +508,8 @@ i2r_IPAddrBlocks(const X509V3_EXT_METHOD *method, void *ext, BIO *out,
 			break;
 		case IPAddressChoice_addressesOrRanges:
 			BIO_puts(out, ":\n");
-			if (!i2r_IPAddressOrRanges(out,
-			    indent + 2,
-			    f->ipAddressChoice->
-			    u.addressesOrRanges, afi))
+			if (!i2r_IPAddressOrRanges(out, indent + 2,
+			    f->ipAddressChoice->u.addressesOrRanges, afi))
 				return 0;
 			break;
 		}
@@ -834,12 +832,10 @@ make_prefix_or_range(IPAddrBlocks *addr, const unsigned afi,
 		return NULL;
 	switch (afi) {
 	case IANA_AFI_IPV4:
-		(void)sk_IPAddressOrRange_set_cmp_func(aors,
-		    v4IPAddressOrRange_cmp);
+		sk_IPAddressOrRange_set_cmp_func(aors, v4IPAddressOrRange_cmp);
 		break;
 	case IANA_AFI_IPV6:
-		(void)sk_IPAddressOrRange_set_cmp_func(aors,
-		    v6IPAddressOrRange_cmp);
+		sk_IPAddressOrRange_set_cmp_func(aors, v6IPAddressOrRange_cmp);
 		break;
 	}
 	f->ipAddressChoice->type = IPAddressChoice_addressesOrRanges;
@@ -1144,6 +1140,7 @@ int
 X509v3_addr_canonize(IPAddrBlocks *addr)
 {
 	int i;
+
 	for (i = 0; i < sk_IPAddressFamily_num(addr); i++) {
 		IPAddressFamily *f = sk_IPAddressFamily_value(addr, i);
 		if (f->ipAddressChoice->type ==
@@ -1152,10 +1149,11 @@ X509v3_addr_canonize(IPAddrBlocks *addr)
 		    X509v3_addr_get_afi(f)))
 			return 0;
 	}
+
 	(void)sk_IPAddressFamily_set_cmp_func(addr, IPAddressFamily_cmp);
 	sk_IPAddressFamily_sort(addr);
-	OPENSSL_assert(X509v3_addr_is_canonical(addr));
-	return 1;
+
+	return X509v3_addr_is_canonical(addr);
 }
 
 /*
@@ -1181,6 +1179,7 @@ v2i_IPAddrBlocks(const struct v3_ext_method *method, struct v3_ext_ctx *ctx,
 		unsigned char min[ADDR_RAW_BUF_LEN], max[ADDR_RAW_BUF_LEN];
 		unsigned afi, *safi = NULL, safi_;
 		const char *addr_chars = NULL;
+		const char *errstr;
 		int prefixlen, i1, i2, delim, length;
 
 		if (!name_cmp(val->name, "IPv4")) {
@@ -1215,14 +1214,44 @@ v2i_IPAddrBlocks(const struct v3_ext_method *method, struct v3_ext_ctx *ctx,
 		 * the other input values.
 		 */
 		if (safi != NULL) {
-			*safi = strtoul(val->value, &t, 0);
-			t += strspn(t, " \t");
-			if (*safi > 0xFF || *t++ != ':') {
+			unsigned long parsed_safi;
+			int saved_errno = errno;
+
+			errno = 0;
+			parsed_safi = strtoul(val->value, &t, 0);
+
+			/* Value must be present, then a tab, space or colon. */
+			if (val->value[0] == '\0' ||
+			    (*t != '\t' && *t != ' ' && *t != ':')) {
 				X509V3error(X509V3_R_INVALID_SAFI);
 				X509V3_conf_err(val);
 				goto err;
 			}
+			/* Range and overflow check. */
+			if ((errno == ERANGE && parsed_safi == ULONG_MAX) ||
+			    parsed_safi > 0xFF) {
+				X509V3error(X509V3_R_INVALID_SAFI);
+				X509V3_conf_err(val);
+				goto err;
+			}
+			errno = saved_errno;
+
+			*safi = parsed_safi;
+
+			/* Check possible whitespace is followed by a colon. */
 			t += strspn(t, " \t");
+			if (*t != ':') {
+				X509V3error(X509V3_R_INVALID_SAFI);
+				X509V3_conf_err(val);
+				goto err;
+			}
+
+			/* Skip over colon. */
+			t++;
+
+			/* Then over any trailing whitespace. */
+			t += strspn(t, " \t");
+
 			s = strdup(t);
 		} else {
 			s = strdup(val->value);
@@ -1260,8 +1289,11 @@ v2i_IPAddrBlocks(const struct v3_ext_method *method, struct v3_ext_ctx *ctx,
 
 		switch (delim) {
 		case '/':
-			prefixlen = (int)strtoul(s + i2, &t, 10);
-			if (t == s + i2 || *t != '\0') {
+			/* length contains the size of the address in bytes. */
+			if (length != 4 && length != 16)
+				goto err;
+			prefixlen = strtonum(s + i2, 0, 8 * length, &errstr);
+			if (errstr != NULL) {
 				X509V3error(X509V3_R_EXTENSION_VALUE_ERROR);
 				X509V3_conf_err(val);
 				goto err;
@@ -1329,33 +1361,40 @@ v2i_IPAddrBlocks(const struct v3_ext_method *method, struct v3_ext_ctx *ctx,
  * OpenSSL dispatch
  */
 const X509V3_EXT_METHOD v3_addr = {
-	NID_sbgp_ipAddrBlock,       /* nid */
-	0,                          /* flags */
-	&IPAddrBlocks_it,
-	0, 0, 0, 0,                 /* old functions, ignored */
-	0,                          /* i2s */
-	0,                          /* s2i */
-	0,                          /* i2v */
-	v2i_IPAddrBlocks,           /* v2i */
-	i2r_IPAddrBlocks,           /* i2r */
-	0,                          /* r2i */
-	NULL                        /* extension-specific data */
+	.ext_nid = NID_sbgp_ipAddrBlock,
+	.ext_flags = 0,
+	.it = &IPAddrBlocks_it,
+	.ext_new = NULL,
+	.ext_free = NULL,
+	.d2i = NULL,
+	.i2d = NULL,
+	.i2s = NULL,
+	.s2i = NULL,
+	.i2v = NULL,
+	.v2i = v2i_IPAddrBlocks,
+	.i2r = i2r_IPAddrBlocks,
+	.r2i = NULL,
+	.usr_data = NULL,
 };
 
 /*
- * Figure out whether extension sues inheritance.
+ * Figure out whether extension uses inheritance.
  */
 int
 X509v3_addr_inherits(IPAddrBlocks *addr)
 {
 	int i;
+
 	if (addr == NULL)
 		return 0;
+
 	for (i = 0; i < sk_IPAddressFamily_num(addr); i++) {
 		IPAddressFamily *f = sk_IPAddressFamily_value(addr, i);
+
 		if (f->ipAddressChoice->type == IPAddressChoice_inherit)
 			return 1;
 	}
+
 	return 0;
 }
 
@@ -1449,16 +1488,22 @@ X509v3_addr_subset(IPAddrBlocks *a, IPAddrBlocks *b)
  * X509_V_OK.
  */
 static int
-addr_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509)*chain,
+addr_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509) *chain,
     IPAddrBlocks *ext)
 {
 	IPAddrBlocks *child = NULL;
 	int i, j, ret = 1;
 	X509 *x;
 
-	OPENSSL_assert(chain != NULL && sk_X509_num(chain) > 0);
-	OPENSSL_assert(ctx != NULL || ext != NULL);
-	OPENSSL_assert(ctx == NULL || ctx->verify_cb != NULL);
+	/* We need a non-empty chain to test against. */
+	if (sk_X509_num(chain) <= 0)
+		goto err;
+	/* We need either a store ctx or an extension to work with. */
+	if (ctx == NULL && ext == NULL)
+		goto err;
+	/* If there is a store ctx, it needs a verify_cb. */
+	if (ctx != NULL && ctx->verify_cb == NULL)
+		goto err;
 
 	/*
 	 * Figure out where to start. If we don't have an extension to check,
@@ -1551,6 +1596,12 @@ addr_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509)*chain,
  done:
 	sk_IPAddressFamily_free(child);
 	return ret;
+
+ err:
+	if (ctx != NULL)
+		ctx->error = X509_V_ERR_UNSPECIFIED;
+
+	return 0;
 }
 
 #undef validation_err
@@ -1561,9 +1612,7 @@ addr_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509)*chain,
 int
 X509v3_addr_validate_path(X509_STORE_CTX *ctx)
 {
-	if (ctx->chain == NULL ||
-	    sk_X509_num(ctx->chain) == 0 ||
-	    ctx->verify_cb == NULL) {
+	if (sk_X509_num(ctx->chain) <= 0 || ctx->verify_cb == NULL) {
 		ctx->error = X509_V_ERR_UNSPECIFIED;
 		return 0;
 	}
@@ -1575,12 +1624,12 @@ X509v3_addr_validate_path(X509_STORE_CTX *ctx)
  * Test whether chain covers extension.
  */
 int
-X509v3_addr_validate_resource_set(STACK_OF(X509)*chain, IPAddrBlocks *ext,
+X509v3_addr_validate_resource_set(STACK_OF(X509) *chain, IPAddrBlocks *ext,
     int allow_inheritance)
 {
 	if (ext == NULL)
 		return 1;
-	if (chain == NULL || sk_X509_num(chain) == 0)
+	if (sk_X509_num(chain) <= 0)
 		return 0;
 	if (!allow_inheritance && X509v3_addr_inherits(ext))
 		return 0;

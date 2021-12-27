@@ -1,4 +1,4 @@
-/* $OpenBSD: a_string.c,v 1.1 2021/12/15 18:00:31 jsing Exp $ */
+/* $OpenBSD: a_string.c,v 1.4 2021/12/25 13:17:48 jsing Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -62,6 +62,53 @@
 #include <openssl/asn1.h>
 #include <openssl/buffer.h>
 #include <openssl/err.h>
+
+#include "asn1_locl.h"
+
+ASN1_STRING *
+ASN1_STRING_new(void)
+{
+	return (ASN1_STRING_type_new(V_ASN1_OCTET_STRING));
+}
+
+ASN1_STRING *
+ASN1_STRING_type_new(int type)
+{
+	ASN1_STRING *a;
+
+	if ((a = calloc(1, sizeof(ASN1_STRING))) == NULL) {
+		ASN1error(ERR_R_MALLOC_FAILURE);
+		return NULL;
+	}
+	a->type = type;
+
+	return a;
+}
+
+void
+ASN1_STRING_free(ASN1_STRING *a)
+{
+	if (a == NULL)
+		return;
+	if (a->data != NULL && !(a->flags & ASN1_STRING_FLAG_NDEF))
+		freezero(a->data, a->length);
+	free(a);
+}
+
+int
+ASN1_STRING_cmp(const ASN1_STRING *a, const ASN1_STRING *b)
+{
+	int cmp;
+
+	if (a == NULL || b == NULL)
+		return -1;
+	if ((cmp = (a->length - b->length)) != 0)
+		return cmp;
+	if ((cmp = memcmp(a->data, b->data, a->length)) != 0)
+		return cmp;
+
+	return (a->type - b->type);
+}
 
 int
 ASN1_STRING_copy(ASN1_STRING *dst, const ASN1_STRING *str)
@@ -128,51 +175,6 @@ ASN1_STRING_set0(ASN1_STRING *str, void *data, int len)
 	str->length = len;
 }
 
-ASN1_STRING *
-ASN1_STRING_new(void)
-{
-	return (ASN1_STRING_type_new(V_ASN1_OCTET_STRING));
-}
-
-ASN1_STRING *
-ASN1_STRING_type_new(int type)
-{
-	ASN1_STRING *a;
-
-	if ((a = calloc(1, sizeof(ASN1_STRING))) == NULL) {
-		ASN1error(ERR_R_MALLOC_FAILURE);
-		return NULL;
-	}
-	a->type = type;
-
-	return a;
-}
-
-void
-ASN1_STRING_free(ASN1_STRING *a)
-{
-	if (a == NULL)
-		return;
-	if (a->data != NULL && !(a->flags & ASN1_STRING_FLAG_NDEF))
-		freezero(a->data, a->length);
-	free(a);
-}
-
-int
-ASN1_STRING_cmp(const ASN1_STRING *a, const ASN1_STRING *b)
-{
-	int cmp;
-
-	if (a == NULL || b == NULL)
-		return -1;
-	if ((cmp = (a->length - b->length)) != 0)
-		return cmp;
-	if ((cmp = memcmp(a->data, b->data, a->length)) != 0)
-		return cmp;
-
-	return (a->type - b->type);
-}
-
 void
 asn1_add_error(const unsigned char *address, int offset)
 {
@@ -210,6 +212,63 @@ ASN1_STRING_get0_data(const ASN1_STRING *x)
 }
 
 int
+ASN1_STRING_print(BIO *bp, const ASN1_STRING *v)
+{
+	int i, n;
+	char buf[80];
+	const char *p;
+
+	if (v == NULL)
+		return (0);
+	n = 0;
+	p = (const char *)v->data;
+	for (i = 0; i < v->length; i++) {
+		if ((p[i] > '~') || ((p[i] < ' ') &&
+		    (p[i] != '\n') && (p[i] != '\r')))
+			buf[n] = '.';
+		else
+			buf[n] = p[i];
+		n++;
+		if (n >= 80) {
+			if (BIO_write(bp, buf, n) <= 0)
+				return (0);
+			n = 0;
+		}
+	}
+	if (n > 0)
+		if (BIO_write(bp, buf, n) <= 0)
+			return (0);
+	return (1);
+}
+
+/*
+ * Utility function: convert any string type to UTF8, returns number of bytes
+ * in output string or a negative error code
+ */
+int
+ASN1_STRING_to_UTF8(unsigned char **out, const ASN1_STRING *in)
+{
+	ASN1_STRING stmp, *str = &stmp;
+	int mbflag, ret;
+
+	if (!in)
+		return -1;
+
+	if ((mbflag = asn1_tag2charwidth(in->type)) == -1)
+		return -1;
+	mbflag |= MBSTRING_FLAG;
+
+	stmp.data = NULL;
+	stmp.length = 0;
+	ret = ASN1_mbstring_copy(&str, in->data, in->length, mbflag,
+	    B_ASN1_UTF8STRING);
+	if (ret < 0)
+		return ret;
+	*out = stmp.data;
+	return stmp.length;
+}
+
+int
 i2a_ASN1_STRING(BIO *bp, const ASN1_STRING *a, int type)
 {
 	int i, n = 0;
@@ -239,7 +298,7 @@ i2a_ASN1_STRING(BIO *bp, const ASN1_STRING *a, int type)
 	}
 	return (n);
 
-err:
+ err:
 	return (-1);
 }
 
@@ -325,9 +384,9 @@ a2i_ASN1_STRING(BIO *bp, ASN1_STRING *bs, char *buf, int size)
 	bs->data = s;
 	return (1);
 
-err_sl:
+ err_sl:
 	ASN1error(ASN1_R_SHORT_LINE);
-err:
+ err:
 	free(s);
 	return (ret);
 }

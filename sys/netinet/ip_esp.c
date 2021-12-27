@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_esp.c,v 1.191 2021/12/20 17:09:18 tobhe Exp $ */
+/*	$OpenBSD: ip_esp.c,v 1.193 2021/12/23 22:35:11 bluhm Exp $ */
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr) and
@@ -502,13 +502,11 @@ esp_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 			crde->crd_len = plen;
 	}
 
-	KERNEL_LOCK();
 	while ((error = crypto_invoke(crp)) == EAGAIN) {
 		/* Reset the session ID */
 		if (tdb->tdb_cryptoid != 0)
 			tdb->tdb_cryptoid = crp->crp_sid;
 	}
-	KERNEL_UNLOCK();
 	if (error) {
 		DPRINTF("crypto error %d", error);
 		ipsecstat_inc(ipsec_noxform);
@@ -692,7 +690,7 @@ esp_output(struct mbuf *m, struct tdb *tdb, int skip, int protoff)
 {
 	const struct enc_xform *espx = tdb->tdb_encalgxform;
 	const struct auth_hash *esph = tdb->tdb_authalgxform;
-	int ilen, olen, hlen, rlen, padding, blks, alen, roff, error;
+	int ilen, hlen, rlen, padding, blks, alen, roff, error;
 	uint64_t replay64;
 	uint32_t replay;
 	struct mbuf *mi, *mo = (struct mbuf *) NULL;
@@ -948,21 +946,16 @@ esp_output(struct mbuf *m, struct tdb *tdb, int skip, int protoff)
 			crda->crd_len = m->m_pkthdr.len - (skip + alen);
 	}
 
-	KERNEL_LOCK();
 	while ((error = crypto_invoke(crp)) == EAGAIN) {
 		/* Reset the session ID */
 		if (tdb->tdb_cryptoid != 0)
 			tdb->tdb_cryptoid = crp->crp_sid;
 	}
-	KERNEL_UNLOCK();
 	if (error) {
 		DPRINTF("crypto error %d", error);
 		ipsecstat_inc(ipsec_noxform);
 		goto drop;
 	}
-
-	ilen = crp->crp_ilen;
-	olen = crp->crp_olen;
 
 	/* Release the crypto descriptors */
 	crypto_freereq(crp);

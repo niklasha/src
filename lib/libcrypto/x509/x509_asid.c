@@ -1,4 +1,4 @@
-/*	$OpenBSD: x509_asid.c,v 1.20 2021/12/18 16:58:20 tb Exp $ */
+/*	$OpenBSD: x509_asid.c,v 1.30 2021/12/25 15:46:05 tb Exp $ */
 /*
  * Contributed to the OpenSSL Project by the American Registry for
  * Internet Numbers ("ARIN").
@@ -60,7 +60,6 @@
  * Implementation of RFC 3779 section 3.2.
  */
 
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -361,7 +360,7 @@ ASIdOrRange_cmp(const ASIdOrRange *const *a_, const ASIdOrRange *const *b_)
 {
 	const ASIdOrRange *a = *a_, *b = *b_;
 
-    /* XXX: these asserts need to be replaced */
+	/* XXX: these asserts need to be replaced */
 	OPENSSL_assert((a->type == ASIdOrRange_id && a->u.id != NULL) ||
 	    (a->type == ASIdOrRange_range && a->u.range != NULL &&
 	     a->u.range->min != NULL && a->u.range->max != NULL));
@@ -474,8 +473,6 @@ X509v3_asid_add_id_or_range(ASIdentifiers *asid, int which, ASN1_INTEGER *min,
 static int
 extract_min_max(ASIdOrRange *aor, ASN1_INTEGER **min, ASN1_INTEGER **max)
 {
-	OPENSSL_assert(aor != NULL);
-
 	switch (aor->type) {
 	case ASIdOrRange_id:
 		*min = aor->u.id;
@@ -651,7 +648,8 @@ ASIdentifierChoice_canonize(ASIdentifierChoice *choice)
 		/*
 		 * Make sure we're properly sorted (paranoia).
 		 */
-		OPENSSL_assert(ASN1_INTEGER_cmp(a_min, b_min) <= 0);
+		if (ASN1_INTEGER_cmp(a_min, b_min) > 0)
+			goto done;
 
 		/*
 		 * Punt inverted ranges.
@@ -738,7 +736,8 @@ ASIdentifierChoice_canonize(ASIdentifierChoice *choice)
 	}
 
 	/* Paranoia */
-	OPENSSL_assert(ASIdentifierChoice_is_canonical(choice));
+	if (!ASIdentifierChoice_is_canonical(choice))
+		goto done;
 
 	ret = 1;
 
@@ -879,17 +878,20 @@ v2i_ASIdentifiers(const struct v3_ext_method *method, struct v3_ext_ctx *ctx,
  * OpenSSL dispatch.
  */
 const X509V3_EXT_METHOD v3_asid = {
-	NID_sbgp_autonomousSysNum,  /* nid */
-	0,                          /* flags */
-	&ASIdentifiers_it,          /* template */
-	0, 0, 0, 0,                 /* old functions, ignored */
-	0,                          /* i2s */
-	0,                          /* s2i */
-	0,                          /* i2v */
-	v2i_ASIdentifiers,          /* v2i */
-	i2r_ASIdentifiers,          /* i2r */
-	0,                          /* r2i */
-	NULL                        /* extension-specific data */
+	.ext_nid = NID_sbgp_autonomousSysNum,
+	.ext_flags = 0,
+	.it = &ASIdentifiers_it,
+	.ext_new = NULL,
+	.ext_free = NULL,
+	.d2i = NULL,
+	.i2d = NULL,
+	.i2s = NULL,
+	.s2i = NULL,
+	.i2v = NULL,
+	.v2i = v2i_ASIdentifiers,
+	.i2r = i2r_ASIdentifiers,
+	.r2i = NULL,
+	.usr_data = NULL,
 };
 
 /*
@@ -979,16 +981,22 @@ X509v3_asid_subset(ASIdentifiers *a, ASIdentifiers *b)
  * Core code for RFC 3779 3.3 path validation.
  */
 static int
-asid_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509)*chain,
+asid_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509) *chain,
     ASIdentifiers *ext)
 {
 	ASIdOrRanges *child_as = NULL, *child_rdi = NULL;
 	int i, ret = 1, inherit_as = 0, inherit_rdi = 0;
 	X509 *x;
 
-	OPENSSL_assert(chain != NULL && sk_X509_num(chain) > 0);
-	OPENSSL_assert(ctx != NULL || ext != NULL);
-	OPENSSL_assert(ctx == NULL || ctx->verify_cb != NULL);
+	/* We need a non-empty chain to test against. */
+	if (sk_X509_num(chain) <= 0)
+		goto err;
+	/* We need either a store ctx or an extension to work with. */
+	if (ctx == NULL && ext == NULL)
+		goto err;
+	/* If there is a store ctx, it needs a verify_cb. */
+	if (ctx != NULL && ctx->verify_cb == NULL)
+		goto err;
 
 	/*
 	 * Figure out where to start.  If we don't have an extension to
@@ -1033,7 +1041,6 @@ asid_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509)*chain,
 	 */
 	for (i++; i < sk_X509_num(chain); i++) {
 		x = sk_X509_value(chain, i);
-		OPENSSL_assert(x != NULL);
 
 		if (x->rfc3779_asid == NULL) {
 			if (child_as != NULL || child_rdi != NULL)
@@ -1080,7 +1087,9 @@ asid_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509)*chain,
 	/*
 	 * Trust anchor can't inherit.
 	 */
-	OPENSSL_assert(x != NULL);
+
+	if (x == NULL)
+		goto err;
 
 	if (x->rfc3779_asid != NULL) {
 		if (x->rfc3779_asid->asnum != NULL &&
@@ -1093,6 +1102,12 @@ asid_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509)*chain,
 
  done:
 	return ret;
+
+ err:
+	if (ctx != NULL)
+		ctx->error = X509_V_ERR_UNSPECIFIED;
+
+	return 0;
 }
 
 #undef validation_err
@@ -1103,9 +1118,7 @@ asid_validate_path_internal(X509_STORE_CTX *ctx, STACK_OF(X509)*chain,
 int
 X509v3_asid_validate_path(X509_STORE_CTX *ctx)
 {
-	if (ctx->chain == NULL ||
-	    sk_X509_num(ctx->chain) == 0 ||
-	    ctx->verify_cb == NULL) {
+	if (sk_X509_num(ctx->chain) <= 0 || ctx->verify_cb == NULL) {
 		ctx->error = X509_V_ERR_UNSPECIFIED;
 		return 0;
 	}
@@ -1117,12 +1130,12 @@ X509v3_asid_validate_path(X509_STORE_CTX *ctx)
  * Test whether chain covers extension.
  */
 int
-X509v3_asid_validate_resource_set(STACK_OF(X509)*chain, ASIdentifiers *ext,
+X509v3_asid_validate_resource_set(STACK_OF(X509) *chain, ASIdentifiers *ext,
     int allow_inheritance)
 {
 	if (ext == NULL)
 		return 1;
-	if (chain == NULL || sk_X509_num(chain) == 0)
+	if (sk_X509_num(chain) <= 0)
 		return 0;
 	if (!allow_inheritance && X509v3_asid_inherits(ext))
 		return 0;
