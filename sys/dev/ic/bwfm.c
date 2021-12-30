@@ -1,4 +1,4 @@
-/* $OpenBSD: bwfm.c,v 1.93 2021/12/26 20:50:17 patrick Exp $ */
+/* $OpenBSD: bwfm.c,v 1.97 2021/12/27 14:31:15 patrick Exp $ */
 /*
  * Copyright (c) 2010-2016 Broadcom Corporation
  * Copyright (c) 2016,2017 Patrick Wildt <patrick@blueri.se>
@@ -70,7 +70,7 @@ void	 bwfm_update_nodes(struct bwfm_softc *);
 int	 bwfm_ioctl(struct ifnet *, u_long, caddr_t);
 int	 bwfm_media_change(struct ifnet *);
 
-void	 bwfm_process_clm_blob(struct bwfm_softc *);
+void	 bwfm_process_blob(struct bwfm_softc *, char *, u_char **, size_t *);
 
 int	 bwfm_chip_attach(struct bwfm_softc *);
 void	 bwfm_chip_detach(struct bwfm_softc *);
@@ -264,7 +264,9 @@ bwfm_preinit(struct bwfm_softc *sc)
 
 	printf("%s: address %s\n", DEVNAME(sc), ether_sprintf(ic->ic_myaddr));
 
-	bwfm_process_clm_blob(sc);
+	bwfm_process_blob(sc, "clmload", &sc->sc_clm, &sc->sc_clmsize);
+	bwfm_process_blob(sc, "txcapload", &sc->sc_txcap, &sc->sc_txcapsize);
+	bwfm_process_blob(sc, "calload", &sc->sc_cal, &sc->sc_calsize);
 
 	if (bwfm_fwvar_var_get_int(sc, "nmode", &nmode))
 		nmode = 0;
@@ -1287,6 +1289,7 @@ bwfm_chip_cr4_set_passive(struct bwfm_softc *sc)
 {
 	struct bwfm_core *core;
 	uint32_t val;
+	int i = 0;
 
 	core = bwfm_chip_get_core(sc, BWFM_AGENT_CORE_ARM_CR4);
 	val = sc->sc_buscore_ops->bc_read(sc,
@@ -1296,10 +1299,11 @@ bwfm_chip_cr4_set_passive(struct bwfm_softc *sc)
 	    BWFM_AGENT_IOCTL_ARMCR4_CPUHALT,
 	    BWFM_AGENT_IOCTL_ARMCR4_CPUHALT);
 
-	core = bwfm_chip_get_core(sc, BWFM_AGENT_CORE_80211);
-	sc->sc_chip.ch_core_reset(sc, core, BWFM_AGENT_D11_IOCTL_PHYRESET |
-	    BWFM_AGENT_D11_IOCTL_PHYCLOCKEN, BWFM_AGENT_D11_IOCTL_PHYCLOCKEN,
-	    BWFM_AGENT_D11_IOCTL_PHYCLOCKEN);
+	while ((core = bwfm_chip_get_core_idx(sc, BWFM_AGENT_CORE_80211, i++)))
+		sc->sc_chip.ch_core_disable(sc, core,
+		    BWFM_AGENT_D11_IOCTL_PHYRESET |
+		    BWFM_AGENT_D11_IOCTL_PHYCLOCKEN,
+		    BWFM_AGENT_D11_IOCTL_PHYCLOCKEN);
 }
 
 int
@@ -1526,7 +1530,7 @@ bwfm_chip_sysmem_ramsize(struct bwfm_softc *sc, struct bwfm_core *core)
 void
 bwfm_chip_tcm_ramsize(struct bwfm_softc *sc, struct bwfm_core *core)
 {
-	uint32_t cap, nab, nbb, totb, bxinfo, ramsize = 0;
+	uint32_t cap, nab, nbb, totb, bxinfo, blksize, ramsize = 0;
 	int i;
 
 	cap = sc->sc_buscore_ops->bc_read(sc, core->co_base + BWFM_ARMCR4_CAP);
@@ -1539,8 +1543,12 @@ bwfm_chip_tcm_ramsize(struct bwfm_softc *sc, struct bwfm_core *core)
 		    core->co_base + BWFM_ARMCR4_BANKIDX, i);
 		bxinfo = sc->sc_buscore_ops->bc_read(sc,
 		    core->co_base + BWFM_ARMCR4_BANKINFO);
+		if (bxinfo & BWFM_ARMCR4_BANKINFO_BLK_1K_MASK)
+			blksize = 1024;
+		else
+			blksize = 8192;
 		ramsize += ((bxinfo & BWFM_ARMCR4_BANKINFO_BSZ_MASK) + 1) *
-		    BWFM_ARMCR4_BANKINFO_BSZ_MULT;
+		    blksize;
 	}
 
 	sc->sc_chip.ch_ramsize = ramsize;
@@ -2966,16 +2974,17 @@ bwfm_nvram_convert(int node, u_char **bufp, size_t *sizep, size_t *newlenp)
 }
 
 void
-bwfm_process_clm_blob(struct bwfm_softc *sc)
+bwfm_process_blob(struct bwfm_softc *sc, char *var, u_char **blob,
+    size_t *blobsize)
 {
 	struct bwfm_dload_data *data;
 	size_t off, remain, len;
 
-	if (sc->sc_clm == NULL || sc->sc_clmsize == 0)
+	if (*blob == NULL || *blobsize == 0)
 		return;
 
 	off = 0;
-	remain = sc->sc_clmsize;
+	remain = *blobsize;
 	data = malloc(sizeof(*data) + BWFM_DLOAD_MAX_LEN, M_TEMP, M_WAITOK);
 
 	while (remain) {
@@ -2984,16 +2993,17 @@ bwfm_process_clm_blob(struct bwfm_softc *sc)
 		data->flag = htole16(BWFM_DLOAD_FLAG_HANDLER_VER_1);
 		if (off == 0)
 			data->flag |= htole16(BWFM_DLOAD_FLAG_BEGIN);
-		if (remain < BWFM_DLOAD_MAX_LEN)
+		if (remain <= BWFM_DLOAD_MAX_LEN)
 			data->flag |= htole16(BWFM_DLOAD_FLAG_END);
 		data->type = htole16(BWFM_DLOAD_TYPE_CLM);
 		data->len = htole32(len);
 		data->crc = 0;
-		memcpy(data->data, sc->sc_clm + off, len);
+		memcpy(data->data, *blob + off, len);
 
-		if (bwfm_fwvar_var_set_data(sc, "clmload", data,
+		if (bwfm_fwvar_var_set_data(sc, var, data,
 		    sizeof(*data) + len)) {
-			printf("%s: could not load CLM blob\n", DEVNAME(sc));
+			printf("%s: could not load blob (%s)\n", DEVNAME(sc),
+			    var);
 			goto out;
 		}
 
@@ -3003,9 +3013,9 @@ bwfm_process_clm_blob(struct bwfm_softc *sc)
 
 out:
 	free(data, M_TEMP, sizeof(*data) + BWFM_DLOAD_MAX_LEN);
-	free(sc->sc_clm, M_DEVBUF, sc->sc_clmsize);
-	sc->sc_clm = NULL;
-	sc->sc_clmsize = 0;
+	free(*blob, M_DEVBUF, *blobsize);
+	*blob = NULL;
+	*blobsize = 0;
 }
 
 #if defined(__HAVE_FDT)
@@ -3112,6 +3122,17 @@ bwfm_loadfirmware(struct bwfm_softc *sc, const char *chip, const char *bus,
 	if (sc->sc_clmsize == 0) {
 		snprintf(name, sizeof(name), "brcmfmac%s%s.clm_blob", chip, bus);
 		loadfirmware(name, &sc->sc_clm, &sc->sc_clmsize);
+	}
+
+	if (sysname != NULL) {
+		r = snprintf(name, sizeof(name), "brcmfmac%s%s.%s.txcap_blob",
+		    chip, bus, sysname);
+		if (r > 0 && r < sizeof(name))
+			loadfirmware(name, &sc->sc_txcap, &sc->sc_txcapsize);
+	}
+	if (sc->sc_txcapsize == 0) {
+		snprintf(name, sizeof(name), "brcmfmac%s%s.txcap_blob", chip, bus);
+		loadfirmware(name, &sc->sc_txcap, &sc->sc_txcapsize);
 	}
 
 	return 0;

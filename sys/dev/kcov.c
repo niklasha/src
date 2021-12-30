@@ -1,4 +1,4 @@
-/*	$OpenBSD: kcov.c,v 1.41 2021/12/21 06:08:57 anton Exp $	*/
+/*	$OpenBSD: kcov.c,v 1.44 2021/12/29 07:15:13 anton Exp $	*/
 
 /*
  * Copyright (c) 2018 Anton Lindqvist <anton@openbsd.org>
@@ -25,6 +25,11 @@
 #include <sys/pool.h>
 #include <sys/stdint.h>
 #include <sys/queue.h>
+
+/* kcov_vnode() */
+#include <sys/conf.h>
+#include <sys/vnode.h>
+#include <sys/specdev.h>
 
 #include <uvm/uvm_extern.h>
 
@@ -53,7 +58,7 @@
 struct kcov_dev {
 	int		 kd_state;	/* [M] */
 	int		 kd_mode;	/* [M] */
-	int		 kd_unit;	/* [I] device minor */
+	int		 kd_unit;	/* [I] D_CLONE unique device minor */
 	int		 kd_intr;	/* [M] currently used in interrupt */
 	uintptr_t	*kd_buf;	/* [a] traced coverage */
 	size_t		 kd_nmemb;	/* [I] */
@@ -290,21 +295,13 @@ kcovopen(dev_t dev, int flag, int mode, struct proc *p)
 {
 	struct kcov_dev *kd;
 
-	mtx_enter(&kcov_mtx);
-
-	if (kd_lookup(minor(dev)) != NULL) {
-		mtx_leave(&kcov_mtx);
-		return (EBUSY);
-	}
-
-	if (kcov_cold)
-		kcov_cold = 0;
-
-	mtx_leave(&kcov_mtx);
 	kd = malloc(sizeof(*kd), M_SUBPROC, M_WAITOK | M_ZERO);
 	kd->kd_unit = minor(dev);
 	mtx_enter(&kcov_mtx);
+	KASSERT(kd_lookup(kd->kd_unit) == NULL);
 	TAILQ_INSERT_TAIL(&kd_list, kd, kd_entry);
+	if (kcov_cold)
+		kcov_cold = 0;
 	mtx_leave(&kcov_mtx);
 	return (0);
 }
@@ -319,7 +316,7 @@ kcovclose(dev_t dev, int flag, int mode, struct proc *p)
 	kd = kd_lookup(minor(dev));
 	if (kd == NULL) {
 		mtx_leave(&kcov_mtx);
-		return (EINVAL);
+		return (ENXIO);
 	}
 
 	if (kd->kd_state == KCOV_STATE_TRACE && kd->kd_kr == NULL) {
@@ -455,6 +452,16 @@ kcov_exit(struct proc *p)
 	}
 
 	mtx_leave(&kcov_mtx);
+}
+
+/*
+ * Returns non-zero if the given vnode refers to a kcov device.
+ */
+int
+kcov_vnode(struct vnode *vp)
+{
+	return (vp->v_type == VCHR &&
+	    cdevsw[major(vp->v_rdev)].d_open == kcovopen);
 }
 
 struct kcov_dev *
