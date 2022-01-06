@@ -1,4 +1,4 @@
-/* $OpenBSD: dh_lib.c,v 1.33 2021/11/23 09:53:45 tb Exp $ */
+/* $OpenBSD: dh_lib.c,v 1.35 2022/01/05 20:36:29 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -307,6 +307,36 @@ DH_set0_key(DH *dh, BIGNUM *pub_key, BIGNUM *priv_key)
 	return 1;
 }
 
+const BIGNUM *
+DH_get0_p(const DH *dh)
+{
+	return dh->p;
+}
+
+const BIGNUM *
+DH_get0_q(const DH *dh)
+{
+	return dh->q;
+}
+
+const BIGNUM *
+DH_get0_g(const DH *dh)
+{
+	return dh->g;
+}
+
+const BIGNUM *
+DH_get0_priv_key(const DH *dh)
+{
+	return dh->priv_key;
+}
+
+const BIGNUM *
+DH_get0_pub_key(const DH *dh)
+{
+	return dh->pub_key;
+}
+
 void
 DH_clear_flags(DH *dh, int flags)
 {
@@ -323,6 +353,12 @@ void
 DH_set_flags(DH *dh, int flags)
 {
 	dh->flags |= flags;
+}
+
+long
+DH_get_length(const DH *dh)
+{
+	return dh->length;
 }
 
 int

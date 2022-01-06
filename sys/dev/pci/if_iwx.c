@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_iwx.c,v 1.128 2021/12/03 14:32:08 stsp Exp $	*/
+/*	$OpenBSD: if_iwx.c,v 1.132 2022/01/05 17:06:20 stsp Exp $	*/
 
 /*
  * Copyright (c) 2014, 2016 genua gmbh <info@genua.de>
@@ -322,7 +322,7 @@ int	iwx_ampdu_tx_start(struct ieee80211com *, struct ieee80211_node *,
 	    uint8_t);
 void	iwx_rx_ba_session_expired(void *);
 void	iwx_rx_bar_frame_release(struct iwx_softc *, struct iwx_rx_packet *,
-	    struct iwx_rx_data *, struct mbuf_list *);
+	    struct mbuf_list *);
 void	iwx_reorder_timer_expired(void *);
 void	iwx_sta_rx_agg(struct iwx_softc *, struct ieee80211_node *, uint8_t,
 	    uint16_t, uint16_t, int, int);
@@ -2912,11 +2912,11 @@ iwx_rx_ba_session_expired(void *arg)
 
 void
 iwx_rx_bar_frame_release(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
-    struct iwx_rx_data *data, struct mbuf_list *ml)
+    struct mbuf_list *ml)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_node *ni = ic->ic_bss;
-	struct iwx_bar_frame_release *release = (void *)data;
+	struct iwx_bar_frame_release *release = (void *)pkt->data;
 	struct iwx_reorder_buffer *buf;
 	struct iwx_rxba_data *rxba;
 	unsigned int baid, nssn, sta_id, tid;
@@ -2931,7 +2931,7 @@ iwx_rx_bar_frame_release(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
 		return;
 
 	rxba = &sc->sc_rxba_data[baid];
-	if (rxba == NULL || rxba->baid == IWX_RX_REORDER_DATA_INVALID_BAID)
+	if (rxba->baid == IWX_RX_REORDER_DATA_INVALID_BAID)
 		return;
 
 	tid = le32toh(release->sta_tid) & IWX_BAR_FRAME_RELEASE_TID_MASK;
@@ -4251,7 +4251,8 @@ iwx_rx_reorder(struct iwx_softc *sc, struct mbuf *m, int chanidx,
 		return 0;
 
 	rxba = &sc->sc_rxba_data[baid];
-	if (rxba == NULL || tid != rxba->tid || rxba->sta_id != IWX_STATION_ID)
+	if (rxba->baid == IWX_RX_REORDER_DATA_INVALID_BAID ||
+	    tid != rxba->tid || rxba->sta_id != IWX_STATION_ID)
 		return 0;
 
 	if (rxba->timeout != 0)
@@ -4661,8 +4662,7 @@ iwx_clear_oactive(struct iwx_softc *sc, struct iwx_tx_ring *ring)
 }
 
 void
-iwx_rx_compressed_ba(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
-    struct iwx_rx_data *data)
+iwx_rx_compressed_ba(struct iwx_softc *sc, struct iwx_rx_packet *pkt)
 {
 	struct iwx_compressed_ba_notif *ba_res = (void *)pkt->data;
 	struct ieee80211com *ic = &sc->sc_ic;
@@ -8612,8 +8612,7 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
 		}
 
 		len = sizeof(pkt->len_n_flags) + iwx_rx_packet_len(pkt);
-		if (len < sizeof(pkt->hdr) ||
-		    len > (IWX_RBUF_SIZE - offset - minsz))
+		if (len < minsz || len > (IWX_RBUF_SIZE - offset))
 			break;
 
 		if (code == IWX_REPLY_RX_MPDU_CMD && ++nmpdu == 1) {
@@ -8663,7 +8662,7 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
 		}
 
 		case IWX_BAR_FRAME_RELEASE:
-			iwx_rx_bar_frame_release(sc, pkt, data, ml);
+			iwx_rx_bar_frame_release(sc, pkt, ml);
 			break;
 
 		case IWX_TX_CMD:
@@ -8671,7 +8670,7 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
 			break;
 
 		case IWX_BA_NOTIF:
-			iwx_rx_compressed_ba(sc, pkt, data);
+			iwx_rx_compressed_ba(sc, pkt);
 			break;
 
 		case IWX_MISSED_BEACONS_NOTIFICATION:
