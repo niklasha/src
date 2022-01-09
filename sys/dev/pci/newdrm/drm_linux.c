@@ -707,7 +707,7 @@ RB_GENERATE(linux_root, rb_node, __entry, panic_cmp);
 
 /*
  * This is a fairly minimal implementation of the Linux "idr" API.  It
- * probably isn't very efficient, and defenitely isn't RCU safe.  The
+ * probably isn't very efficient, and definitely isn't RCU safe.  The
  * pre-load buffer is global instead of per-cpu; we rely on the kernel
  * lock to make this work.  We do randomize our IDs in order to make
  * them harder to guess.
@@ -1174,7 +1174,7 @@ i2c_bit_add_bus(struct i2c_adapter *adap)
 
 /*
  * This is a minimal implementation of the Linux vga_get/vga_put
- * interface.  In all likelyhood, it will only work for inteldrm(4) as
+ * interface.  In all likelihood, it will only work for inteldrm(4) as
  * it assumes that if there is another active VGA device in the
  * system, it is sitting behind a PCI bridge.
  */

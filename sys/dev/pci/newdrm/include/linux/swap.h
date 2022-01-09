@@ -16,7 +16,7 @@
 #include <linux/sched/clock.h>
 
 /*
- * normaly module.h would be indirectly included via
+ * normally module.h would be indirectly included via
  * linux/swap.h
  * linux/memcontrol.h
  * linux/cgroup.h
