@@ -1,4 +1,4 @@
-/*	$OpenBSD: azalia.c,v 1.266 2021/10/30 03:24:59 jsg Exp $	*/
+/*	$OpenBSD: azalia.c,v 1.268 2022/01/11 00:37:23 jsg Exp $	*/
 /*	$NetBSD: azalia.c,v 1.20 2006/05/07 08:31:44 kent Exp $	*/
 
 /*-
@@ -482,6 +482,7 @@ azalia_configure_pci(azalia_t *az)
 	case PCI_PRODUCT_INTEL_BAYTRAIL_HDA:
 	case PCI_PRODUCT_INTEL_BSW_HDA:
 	case PCI_PRODUCT_INTEL_GLK_HDA:
+	case PCI_PRODUCT_INTEL_JSL_HDA:
 		reg = azalia_pci_read(az->pc, az->tag,
 		    INTEL_PCIE_NOSNOOP_REG);
 		reg &= INTEL_PCIE_NOSNOOP_MASK;
@@ -495,7 +496,8 @@ const struct pci_matchid azalia_pci_devices[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_200SERIES_U_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_300SERIES_U_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_400SERIES_CAVS },
-	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_500SERIES_LP_HDA }
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_500SERIES_LP_HDA },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_JSL_HDA },
 };
 
 int
@@ -1742,7 +1744,7 @@ azalia_codec_init(codec_t *this)
 	/* make sure built-in mic is connected to an adc */
 	if (this->mic != -1 && this->mic_adc == -1) {
 		if (azalia_codec_select_micadc(this)) {
-			DPRINTF(("%s: cound not select mic adc\n", __func__));
+			DPRINTF(("%s: could not select mic adc\n", __func__));
 		}
 	}
 
@@ -2218,7 +2220,7 @@ azalia_codec_select_spkrdac(codec_t *this)
 		if (i < w->nconnections) {
 			conn = i;
 		} else {
-			/* Couldn't get a unique DAC.  Try to get a diferent
+			/* Couldn't get a unique DAC.  Try to get a different
 			 * DAC than the first pin's DAC.
 			 */
 			if (this->spkr_dac == this->opins[0].conv) {

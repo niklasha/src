@@ -1,4 +1,4 @@
-/*	$OpenBSD: rfc3779.c,v 1.3 2022/01/05 07:50:40 tb Exp $ */
+/*	$OpenBSD: rfc3779.c,v 1.6 2022/01/07 22:46:05 tb Exp $ */
 /*
  * Copyright (c) 2021 Theo Buehler <tb@openbsd.org>
  *
@@ -471,7 +471,7 @@ struct build_addr_block_test_data {
 	int			 afi_len;
 };
 
-struct build_addr_block_test_data build_addr_block_tests[] = {
+const struct build_addr_block_test_data build_addr_block_tests[] = {
 	{
 		.description = "RFC 3779, Appendix B, example 1",
 		.addrs = {
@@ -786,15 +786,22 @@ addr_block_get_safi(const struct ip_addr_block *addr)
 
 static int
 addr_block_add_ipv4_addr(IPAddrBlocks *block, enum choice_type type,
-    union ipv4_choice *ipv4, unsigned int *safi)
+    const union ipv4_choice *ipv4, unsigned int *safi)
 {
+	unsigned char addr[RAW_ADDRESS_SIZE] = {0};
+	unsigned char min[RAW_ADDRESS_SIZE];
+	unsigned char max[RAW_ADDRESS_SIZE];
+
 	switch (type) {
 	case choice_prefix:
+		memcpy(addr, ipv4->prefix.addr, ipv4->prefix.addr_len);
 		return X509v3_addr_add_prefix(block, IANA_AFI_IPV4, safi,
-		    ipv4->prefix.addr, ipv4->prefix.prefix_len);
+		    addr, ipv4->prefix.prefix_len);
 	case choice_range:
+		memcpy(min, ipv4->range.min, sizeof(ipv4->range.min));
+		memcpy(max, ipv4->range.max, sizeof(ipv4->range.max));
 		return X509v3_addr_add_range(block, IANA_AFI_IPV4, safi,
-		    ipv4->range.min, ipv4->range.max);
+		    min, max);
 	case choice_inherit:
 		return X509v3_addr_add_inherit(block, IANA_AFI_IPV4, safi);
 	case choice_last:
@@ -805,15 +812,22 @@ addr_block_add_ipv4_addr(IPAddrBlocks *block, enum choice_type type,
 
 static int
 addr_block_add_ipv6_addr(IPAddrBlocks *block, enum choice_type type,
-    union ipv6_choice *ipv6, unsigned int *safi)
+    const union ipv6_choice *ipv6, unsigned int *safi)
 {
+	unsigned char addr[RAW_ADDRESS_SIZE] = {0};
+	unsigned char min[RAW_ADDRESS_SIZE];
+	unsigned char max[RAW_ADDRESS_SIZE];
+
 	switch (type) {
 	case choice_prefix:
+		memcpy(addr, ipv6->prefix.addr, ipv6->prefix.addr_len);
 		return X509v3_addr_add_prefix(block, IANA_AFI_IPV6, safi,
-		    ipv6->prefix.addr, ipv6->prefix.prefix_len);
+		    addr, ipv6->prefix.prefix_len);
 	case choice_range:
+		memcpy(min, ipv6->range.min, sizeof(ipv6->range.min));
+		memcpy(max, ipv6->range.max, sizeof(ipv6->range.max));
 		return X509v3_addr_add_range(block, IANA_AFI_IPV6, safi,
-		    ipv6->range.min, ipv6->range.max);
+		    min, max);
 	case choice_inherit:
 		return X509v3_addr_add_inherit(block, IANA_AFI_IPV6, safi);
 	case choice_last:
@@ -823,10 +837,10 @@ addr_block_add_ipv6_addr(IPAddrBlocks *block, enum choice_type type,
 }
 
 static int
-addr_block_add_addrs(IPAddrBlocks *block, struct ip_addr_block addrs[])
+addr_block_add_addrs(IPAddrBlocks *block, const struct ip_addr_block addrs[])
 {
-	struct ip_addr_block	*addr;
-	unsigned int *safi;
+	const struct ip_addr_block	*addr;
+	unsigned int			*safi;
 
 	for (addr = &addrs[0]; addr->type != choice_last; addr++) {
 		safi = addr_block_get_safi(addr);
@@ -851,7 +865,7 @@ addr_block_add_addrs(IPAddrBlocks *block, struct ip_addr_block addrs[])
 }
 
 static int
-build_addr_block_test(struct build_addr_block_test_data *test)
+build_addr_block_test(const struct build_addr_block_test_data *test)
 {
 	IPAddrBlocks	*addrs = NULL;
 	unsigned char	*out = NULL;
@@ -1724,7 +1738,7 @@ const struct ASIdentifiers_subset_test ASIdentifiers_subset_data[] = {
 };
 
 const size_t N_ASIDENTIFIERS_SUBSET_TESTS =
-    sizeof(ASIdentifiers_build_data) / sizeof(ASIdentifiers_build_data[0]);
+    sizeof(ASIdentifiers_subset_data) / sizeof(ASIdentifiers_subset_data[0]);
 
 static int
 asid_subset_test(const struct ASIdentifiers_subset_test *test)

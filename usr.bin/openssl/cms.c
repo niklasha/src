@@ -1,4 +1,4 @@
-/* $OpenBSD: cms.c,v 1.24 2022/01/05 13:41:12 inoguchi Exp $ */
+/* $OpenBSD: cms.c,v 1.28 2022/01/08 06:05:39 inoguchi Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project.
  */
@@ -209,6 +209,8 @@ cms_opt_cipher(int argc, char **argv, int *argsused)
 static int
 cms_opt_econtent_type(char *arg)
 {
+	ASN1_OBJECT_free(cms_config.econtent_type);
+
 	if ((cms_config.econtent_type = OBJ_txt2obj(arg, 0)) == NULL) {
 		BIO_printf(bio_err, "Invalid OID %s\n", arg);
 		return (1);
@@ -377,6 +379,8 @@ cms_opt_secretkey(char *arg)
 {
 	long ltmp;
 
+	free(cms_config.secret_key);
+
 	if ((cms_config.secret_key = string_to_hex(arg, &ltmp)) == NULL) {
 		BIO_printf(bio_err, "Invalid key %s\n", arg);
 		return (1);
@@ -389,6 +393,8 @@ static int
 cms_opt_secretkeyid(char *arg)
 {
 	long ltmp;
+
+	free(cms_config.secret_keyid);
 
 	if ((cms_config.secret_keyid = string_to_hex(arg, &ltmp)) == NULL) {
 		BIO_printf(bio_err, "Invalid id %s\n", arg);
@@ -503,7 +509,7 @@ static const struct option cms_options[] = {
 	},
 	{
 		.name = "des3",
-		.desc = "Encrypt with triple DES",
+		.desc = "Encrypt with triple DES (default)",
 		.type = OPTION_ARGV_FUNC,
 		.opt.argvfunc = cms_opt_cipher,
 	},
@@ -511,7 +517,7 @@ static const struct option cms_options[] = {
 #ifndef OPENSSL_NO_RC2
 	{
 		.name = "rc2-40",
-		.desc = "Encrypt with RC2-40 (default)",
+		.desc = "Encrypt with RC2-40",
 		.type = OPTION_ARGV_FUNC,
 		.opt.argvfunc = cms_opt_cipher,
 	},
@@ -1882,8 +1888,7 @@ receipt_request_print(BIO *out, CMS_ContentInfo *cms)
 			BIO_puts(out, "  Receipts To:\n");
 			gnames_stack_print(out, rto);
 		}
-		if (rr != NULL)
-			CMS_ReceiptRequest_free(rr);
+		CMS_ReceiptRequest_free(rr);
 	}
 }
 
@@ -1928,7 +1933,7 @@ static CMS_ReceiptRequest *
 make_receipt_request(STACK_OF(OPENSSL_STRING) *rr_to, int rr_allorfirst,
     STACK_OF(OPENSSL_STRING) *rr_from)
 {
-	STACK_OF(GENERAL_NAMES) *rct_to, *rct_from;
+	STACK_OF(GENERAL_NAMES) *rct_to = NULL, *rct_from = NULL;
 	CMS_ReceiptRequest *rr;
 
 	rct_to = make_names_stack(rr_to);
@@ -1949,6 +1954,8 @@ make_receipt_request(STACK_OF(OPENSSL_STRING) *rr_to, int rr_allorfirst,
 	return rr;
 
  err:
+	sk_GENERAL_NAMES_pop_free(rct_to, GENERAL_NAMES_free);
+	sk_GENERAL_NAMES_pop_free(rct_from, GENERAL_NAMES_free);
 	return NULL;
 }
 

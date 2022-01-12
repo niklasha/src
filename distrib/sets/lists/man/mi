@@ -1243,6 +1243,7 @@
 ./usr/share/man/man4/arm64/aplpinctrl.4
 ./usr/share/man/man4/arm64/aplpmgr.4
 ./usr/share/man/man4/arm64/aplpmu.4
+./usr/share/man/man4/arm64/aplsmc.4
 ./usr/share/man/man4/arm64/aplspi.4
 ./usr/share/man/man4/arm64/aplspmi.4
 ./usr/share/man/man4/arm64/apm.4
@@ -1567,6 +1568,7 @@
 ./usr/share/man/man4/keynote.4
 ./usr/share/man/man4/km.4
 ./usr/share/man/man4/ksmn.4
+./usr/share/man/man4/kstat.4
 ./usr/share/man/man4/ksyms.4
 ./usr/share/man/man4/kubsan.4
 ./usr/share/man/man4/kue.4

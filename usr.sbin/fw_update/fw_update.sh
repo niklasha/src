@@ -1,5 +1,5 @@
 #!/bin/ksh
-#	$OpenBSD: fw_update.sh,v 1.24 2022/01/05 16:32:46 afresh1 Exp $
+#	$OpenBSD: fw_update.sh,v 1.29 2022/01/11 03:25:52 afresh1 Exp $
 #
 # Copyright (c) 2021 Andrew Hewus Fresh <afresh1@openbsd.org>
 #
@@ -55,8 +55,7 @@ trap cleanup EXIT
 tmpdir() {
 	local _i=1 _dir
 
-	# If we're not in the installer,
-	# we have mktemp and a more hostile environment.
+	# The installer lacks mktemp(1), do it by hand
 	if [ -x /usr/bin/mktemp ]; then
 		_dir=$( mktemp -d "${1}-XXXXXXXXX" )
 	else
@@ -71,8 +70,7 @@ tmpdir() {
 fetch() {
 	local _src="${FWURL}/${1##*/}" _dst=$1 _user=_file _exit _error=''
 
-	# If we're not in the installer,
-	# we have su(1) and doas(1) is unlikely to be configured.
+	# The installer uses a limited doas(1) as a tiny su(1)
 	set -o monitor # make sure ftp gets its own process group
 	(
 	flags=-VM
@@ -117,21 +115,40 @@ fetch() {
 		echo "Cannot fetch $_src$_error" >&2
 		return 1
 	fi
+
+	return 0
+}
+
+fetch_cfile() {
+	if "$DOWNLOAD"; then
+		set +o noclobber # we want to get the latest CFILE
+		fetch "$CFILE" || return 1
+		set -o noclobber
+		! signify -qVep "$FWPUB_KEY" -x "$CFILE" -m "$CFILE" &&
+		    echo "Signature check of SHA256.sig failed" >&2 && return 1
+	elif [ ! -e "$CFILE" ]; then
+		echo "${0##*/}: $CFILE: No such file or directory" >&2
+		return 2
+	fi
+
+	return 0
 }
 
 verify() {
-	# On the installer we don't get sha256 -C, so fake it.
+	[ -e "$CFILE" ] || fetch_cfile || return 1
+	# The installer sha256 lacks -C, do it by hand
 	if ! fgrep -qx "SHA256 (${1##*/}) = $( /bin/sha256 -qb "$1" )" "$CFILE"; then
 		echo "Checksum test for ${1##*/} failed." >&2
 		return 1
 	fi
+
+	return 0
 }
 
 firmware_in_dmesg() {
 	local _d _m _line _dmesgtail _last='' _nl=$( echo )
 
-	# When we're not in the installer, the dmesg.boot can
-	# contain multiple boots, so only look in the last one
+	# The dmesg can contain multiple boots, only look in the last one
 	_dmesgtail="$( echo ; sed -n 'H;/^OpenBSD/h;${g;p;}' /var/run/dmesg.boot )"
 
 	grep -v '^[[:space:]]*#' "$FWPATTERNS" |
@@ -149,6 +166,7 @@ firmware_in_dmesg() {
 
 firmware_filename() {
 	local _f
+	[ -e "$CFILE" ] || fetch_cfile || return 1
 	_f="$( sed -n "s/.*(\($1-firmware-.*\.tgz\)).*/\1/p" "$CFILE" | sed '$!d' )"
 	! [ "$_f" ] && echo "Unable to find firmware for $1" >&2 && return 1
 	echo "$_f"
@@ -213,7 +231,6 @@ add_firmware () {
 		return 1
 	fi
 
-	# TODO: Should we mark these so real fw_update can -Drepair?
 	ed -s "${FWPKGTMP}/+CONTENTS" <<EOL
 /^@comment pkgpath/ -1a
 @option manual-installation
@@ -254,12 +271,11 @@ delete_firmware() {
 		esac
 	done < "${_pkgdir}/${_pkg}/+CONTENTS"
 
-	# We specifically rm -f here because not removing files/dirs
-	# is probably not worth failing over.
+	# Use rm -f, not removing files/dirs is probably not worth failing over
 	for _r in "${_remove[@]}" ; do
 		if [ -d "$_r" ]; then
-			# Try hard not to actually remove recursively
-			# without rmdir on the install media.
+			# The installer lacks rmdir,
+			# but we only want to remove empty directories.
 			set +o noglob
 			[ "$_r/*" = "$( echo "$_r"/* )" ] && rm -rf "$_r"
 			set -o noglob
@@ -270,30 +286,30 @@ delete_firmware() {
 }
 
 usage() {
-	echo "usage:  ${0##*/} [-d | -D] [-av] [-p path] [driver | file ...]"
+	echo "usage: ${0##*/} [-d | -F] [-av] [-p path] [driver | file ...]"
 	exit 2
 }
 
 ALL=false
-OPT_D=
-while getopts :adDnp:v name
+OPT_F=
+while getopts :adFnp:v name
 do
-       case "$name" in
-       a) ALL=true ;;
-       d) DELETE=true ;;
-       D) OPT_D=true ;;
-       n) DRYRUN=true ;;
-       p) LOCALSRC="$OPTARG" ;;
-       v) VERBOSE=true ;;
-       :)
-	   echo "${0##*/}: option requires an argument -- -$OPTARG" >&2
-	   usage 2
-	   ;;
-       ?)
-	   echo "${0##*/}: unknown option -- -$OPTARG" >&2
-	   usage 2
-	   ;;
-       esac
+	case "$name" in
+	a) ALL=true ;;
+	d) DELETE=true ;;
+	F) OPT_F=true ;;
+	n) DRYRUN=true ;;
+	p) LOCALSRC="$OPTARG" ;;
+	v) VERBOSE=true ;;
+	:)
+	    echo "${0##*/}: option requires an argument -- -$OPTARG" >&2
+	    usage 2
+	    ;;
+	?)
+	    echo "${0##*/}: unknown option -- -$OPTARG" >&2
+	    usage 2
+	    ;;
+	esac
 done
 shift $((OPTIND - 1))
 
@@ -310,9 +326,20 @@ if [ "$LOCALSRC" ]; then
 fi
 
 # "Download only" means local dir and don't install
-if [ "$OPT_D" ]; then
+if [ "$OPT_F" ]; then
 	INSTALL=false
 	LOCALSRC="${LOCALSRC:-.}"
+
+	# Always check for latest CFILE and so latest firmware
+	if [ -e "$LOCALSRC/$CFILE" ]; then
+		mv "$LOCALSRC/$CFILE" "$LOCALSRC/$CFILE-OLD"
+		if fetch_cfile; then
+			rm -f "$LOCALSRC/$CFILE-OLD"
+		else
+			mv "$LOCALSRC/$CFILE-OLD" "$LOCALSRC/$CFILE"
+			echo "Using existing $CFILE" >&2
+		fi
+	fi
 elif [ "$LOCALSRC" ]; then
 	DOWNLOAD=false
 fi
@@ -325,7 +352,7 @@ fi
 set -sA devices -- "$@"
 
 if "$DELETE"; then
-	[ "$OPT_D" ] && usage 22
+	[ "$OPT_F" ] && usage 22
 
 	set -A installed
 	if [ "${devices[*]:-}" ]; then
@@ -369,8 +396,8 @@ if "$DELETE"; then
 fi
 
 if [ ! "$LOCALSRC" ]; then
-    LOCALSRC="$( tmpdir "${DESTDIR}/tmp/${0##*/}" )"
-    REMOVE_LOCALSRC=true
+	LOCALSRC="$( tmpdir "${DESTDIR}/tmp/${0##*/}" )"
+	REMOVE_LOCALSRC=true
 fi
 
 CFILE="$LOCALSRC/$CFILE"
@@ -386,24 +413,13 @@ fi
 
 [ "${devices[*]:-}" ] || exit
 
-if "$DOWNLOAD"; then
-	set +o noclobber # we want to get the latest CFILE
-	fetch "$CFILE"
-	set -o noclobber
-	! signify -qVep "$FWPUB_KEY" -x "$CFILE" -m "$CFILE" &&
-	    echo "Signature check of SHA256.sig failed" >&2 && exit 1
-elif [ ! -e "$CFILE" ]; then
-	# TODO: We shouldn't need a CFILE if all arguments are files.
-	echo "${0##*/}: $CFILE: No such file or directory" >&2
-	exit 2
-fi
-
 added=''
 updated=''
 kept=''
 for f in "${devices[@]}"; do
 	d="$( firmware_devicename "$f" )"
 
+	verify_existing="$DOWNLOAD"
 	if [ "$f" = "$d" ]; then
 		f=$( firmware_filename "$d" || true )
 		[ "$f" ] || continue
@@ -411,6 +427,9 @@ for f in "${devices[@]}"; do
 	elif ! "$INSTALL" && ! grep -Fq "($f)" "$CFILE" ; then
 		echo "Cannot download local file $f" >&2
 		exit 2
+	else
+		# Don't verify files specified on the command-line
+		verify_existing=false
 	fi
 
 	set -A installed -- $( installed_firmware '' "$d-firmware-" '*' )
@@ -427,9 +446,14 @@ for f in "${devices[@]}"; do
 
 	if [ -e "$f" ]; then
 		if "$DOWNLOAD"; then
-			"$VERBOSE" && ! "$INSTALL" &&
-			    echo "Keep/Verify ${f##*/}"
-			"$DRYRUN"  || verify "$f" || continue
+			if "$verify_existing" && ! "$DRYRUN"; then
+				"$VERBOSE" && ! "$INSTALL" &&
+				    echo "Keep/Verify ${f##*/}"
+				verify "$f" || continue
+			else
+				"$VERBOSE" && ! "$INSTALL" &&
+				    echo "Keep ${f##*/}"
+			fi
 			"$INSTALL" || kept="$kept,$d"
 		# else assume it was verified when downloaded
 		fi
