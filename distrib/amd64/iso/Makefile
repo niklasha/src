@@ -1,7 +1,7 @@
 #	$OpenBSD: Makefile,v 1.46 2023/04/24 17:07:33 krw Exp $
 
 FS=		install${OSrev}.img
-FSSIZE=		1359872
+FSSIZE=		1439040
 CDROM=		install${OSrev}.iso
 
 MOUNT_POINT=	/mnt
