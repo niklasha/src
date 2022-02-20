@@ -1,6 +1,7 @@
 #	$OpenBSD: Makefile.inc,v 1.19 2020/05/17 17:04:28 deraadt Exp $
 
-KERNELS += GENERIC.MP bsd.mp GENERIC_APPLI.MP bsd.appli.mp
+KERNELS += GENERIC.MP bsd.mp GENERIC_APPLI.MP bsd.appli.mp \
+	   GENERIC_APPLI.VMM bsd.appli.vmm
 
 bootblocks:
 	cp -p ${DESTDIR}/usr/mdec/pxeboot ${RELEASEDIR}
