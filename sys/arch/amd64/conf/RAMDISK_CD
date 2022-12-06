@@ -144,6 +144,8 @@ otus*		at uhub?		# Atheros AR9001U
 athn*		at uhub?		# Atheros AR9002U
 bwfm*		at uhub?		# Broadcom FullMAC
 
+puc*		at pci?                 # PCI "universal" communication device
+
 pckbc0		at isa?			# PC keyboard controller
 pckbd*		at pckbc?		# PC keyboard
 wskbd*		at pckbd? mux 1
@@ -157,6 +159,7 @@ wsdisplay0	at efifb? console 1
 com0		at isa? port 0x3f8 irq 4	# standard PC serial ports
 com1		at isa? port 0x2f8 irq 3
 com2		at isa? port 0x3e8 irq 5
+com*		at puc?
 
 ahc*		at pci?			# Adaptec 2940 SCSI controllers
 jmb*		at pci?			# JMicron JMB36x controllers
