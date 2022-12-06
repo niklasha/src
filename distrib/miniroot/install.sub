@@ -2970,7 +2970,12 @@ finish_up() {
 	md_installboot $ROOTDISK
 
 	chmod og-rwx /mnt/bsd{,.appli.mp,.appli.vmm,.mp,.rd} 2>/dev/null
-	if [[ -f /mnt/bsd.appli.mp ]]; then
+	if [[ -f /mnt/bsd.appli.vmm ]] && [[ -n $(scan_dmesg '/^cpu0: .*[[:<:]]VMX[[:>:]]/p') ]]; then
+		_kernel=${_kernel}_APPLI.VMM
+		echo "Applitron vmm-capable machine; using bsd.appli.vmm instead of bsd."
+		mv /mnt/bsd /mnt/bsd.sp 2>/dev/null
+		ln /mnt/bsd.appli.vmm /mnt/bsd
+	elif [[ -f /mnt/bsd.appli.mp ]]; then
 		_kernel=${_kernel}_APPLI.MP
 		echo "Applitron machine; using bsd.appli.mp instead of bsd."
 		mv /mnt/bsd /mnt/bsd.sp 2>/dev/null
