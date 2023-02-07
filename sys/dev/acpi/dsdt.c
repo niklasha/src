@@ -553,7 +553,7 @@ aml_register_notify(struct aml_node *node, const char *pnpid,
 	extern int acpi_poll_enabled;
 
 	dnprintf(10, "aml_register_notify: %s %s %p\n",
-	    node->name, pnpid ? pnpid : "", proc);
+	    node ? node->name : "", pnpid ? pnpid : "", proc);
 
 	pdata = acpi_os_malloc(sizeof(struct aml_notify_data));
 	pdata->node = node;
@@ -1568,50 +1568,50 @@ aml_print_resource(union acpi_resource *crs, void *arg)
 
 	switch (typ) {
 	case LR_EXTIRQ:
-		printf("extirq\tflags:%.2x len:%.2x irq:%.4x\n",
+		dprintf("extirq\tflags:%.2x len:%.2x irq:%.4x\n",
 		    crs->lr_extirq.flags, crs->lr_extirq.irq_count,
 		    letoh32(crs->lr_extirq.irq[0]));
 		break;
 	case SR_IRQ:
-		printf("irq\t%.4x %.2x\n", letoh16(crs->sr_irq.irq_mask),
+		dprintf("irq\t%.4x %.2x\n", letoh16(crs->sr_irq.irq_mask),
 		    crs->sr_irq.irq_flags);
 		break;
 	case SR_DMA:
-		printf("dma\t%.2x %.2x\n", crs->sr_dma.channel,
+		dprintf("dma\t%.2x %.2x\n", crs->sr_dma.channel,
 		    crs->sr_dma.flags);
 		break;
 	case SR_IOPORT:
-		printf("ioport\tflags:%.2x _min:%.4x _max:%.4x _aln:%.2x _len:%.2x\n",
+		dprintf("ioport\tflags:%.2x _min:%.4x _max:%.4x _aln:%.2x _len:%.2x\n",
 		    crs->sr_ioport.flags, crs->sr_ioport._min,
 		    crs->sr_ioport._max, crs->sr_ioport._aln,
 		    crs->sr_ioport._len);
 		break;
 	case SR_STARTDEP:
-		printf("startdep\n");
+		dprintf("startdep\n");
 		break;
 	case SR_ENDDEP:
-		printf("enddep\n");
+		dprintf("enddep\n");
 		break;
 	case LR_WORD:
-		printf("word\ttype:%.2x flags:%.2x tflag:%.2x gra:%.4x min:%.4x max:%.4x tra:%.4x len:%.4x\n",
+		dprintf("word\ttype:%.2x flags:%.2x tflag:%.2x gra:%.4x min:%.4x max:%.4x tra:%.4x len:%.4x\n",
 			crs->lr_word.type, crs->lr_word.flags, crs->lr_word.tflags,
 			crs->lr_word._gra, crs->lr_word._min, crs->lr_word._max,
 			crs->lr_word._tra, crs->lr_word._len);
 		break;
 	case LR_DWORD:
-		printf("dword\ttype:%.2x flags:%.2x tflag:%.2x gra:%.8x min:%.8x max:%.8x tra:%.8x len:%.8x\n",
+		dprintf("dword\ttype:%.2x flags:%.2x tflag:%.2x gra:%.8x min:%.8x max:%.8x tra:%.8x len:%.8x\n",
 			crs->lr_dword.type, crs->lr_dword.flags, crs->lr_dword.tflags,
 			crs->lr_dword._gra, crs->lr_dword._min, crs->lr_dword._max,
 			crs->lr_dword._tra, crs->lr_dword._len);
 		break;
 	case LR_QWORD:
-		printf("dword\ttype:%.2x flags:%.2x tflag:%.2x gra:%.16llx min:%.16llx max:%.16llx tra:%.16llx len:%.16llx\n",
+		dprintf("dword\ttype:%.2x flags:%.2x tflag:%.2x gra:%.16llx min:%.16llx max:%.16llx tra:%.16llx len:%.16llx\n",
 			crs->lr_qword.type, crs->lr_qword.flags, crs->lr_qword.tflags,
 			crs->lr_qword._gra, crs->lr_qword._min, crs->lr_qword._max,
 			crs->lr_qword._tra, crs->lr_qword._len);
 		break;
 	default:
-		printf("unknown type: %x\n", typ);
+		dprintf("unknown type: %x\n", typ);
 		break;
 	}
 	return (0);
@@ -1815,8 +1815,10 @@ aml_findscope(struct aml_scope *scope, int type, int endscope)
 		switch (endscope) {
 		case AMLOP_RETURN:
 			scope->pos = scope->end;
+#if 0
 			if (scope->type == AMLOP_WHILE)
 				scope->pos = NULL;
+#endif
 			break;
 		case AMLOP_CONTINUE:
 			scope->pos = scope->end;
@@ -1866,6 +1868,8 @@ aml_showstack(struct aml_scope *scope)
 	struct aml_value *sp;
 	int idx;
 
+	if (acpi_debug < 10)
+		return;
 	dnprintf(10, "===== Stack %s:%s\n", aml_nodename(scope->node),
 	    aml_mnem(scope->type, 0));
 	for (idx=0; scope->args && idx<7; idx++) {
@@ -3519,7 +3523,8 @@ aml_eval(struct aml_scope *scope, struct aml_value *my_ret, int ret_type,
 		dnprintf(10,"\n--==Finished evaluating method: %s %c\n",
 		    aml_nodename(tmp->node), ret_type);
 #ifdef ACPI_DEBUG
-		aml_showvalue(my_ret);
+		if (acpi_debug >= 10)
+			aml_showvalue(my_ret);
 		aml_showstack(ms);
 #endif
 		aml_popscope(ms);
