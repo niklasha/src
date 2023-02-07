@@ -375,7 +375,8 @@ acpicpu_add_cstatepkg(struct aml_value *val, void *arg)
 	int state, method, flags;
 
 #if defined(ACPI_DEBUG) && !defined(SMALL_KERNEL)
-	aml_showvalue(val);
+	if (acpi_debug > 0)
+		aml_showvalue(val);
 #endif
 	if (val->type != AML_OBJTYPE_PACKAGE || val->length != 4)
 		return;
