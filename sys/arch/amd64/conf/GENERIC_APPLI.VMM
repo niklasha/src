@@ -3,3 +3,6 @@
 include "arch/amd64/conf/GENERIC_APPLI.MP"
 
 option	HZ=2000
+
+option	ACPI_DEBUG
+option	ACPI_MEMDEBUG
