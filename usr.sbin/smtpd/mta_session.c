@@ -1590,7 +1590,7 @@ mta_tls_init(struct mta_session *s)
 	}
 
 	if (io_connect_tls(s->io, tls, s->mxname) == -1) {
-		log_info("%016"PRIx64" mta closing reason=tls-connect-failed", s->id);
+		log_info("%016"PRIx64" mta closing reason=tls-connect-failed tls error: %s", s->id, io_error(s->io));
 		tls_free(tls);
 		s->flags |= MTA_FREE;
 	}
