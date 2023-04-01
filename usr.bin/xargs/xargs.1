@@ -118,18 +118,7 @@ in up to
 flag is specified) arguments to
 .Ar utility
 with the entire line of input.
-The resulting arguments, after replacement is done, will not be allowed to grow
-beyond 255 bytes; this is implemented by concatenating as much of the argument
-containing
-.Ar replstr
-as possible, to the constructed arguments to
-.Ar utility ,
-up to 255 bytes.
-The 255 byte limit does not apply to arguments to
-.Ar utility
-which do not contain
-.Ar replstr ,
-and furthermore, no replacement will be done on
+No replacement will be done on
 .Ar utility
 itself.
 Implies
