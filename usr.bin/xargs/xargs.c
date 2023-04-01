@@ -63,6 +63,7 @@ static char **av, **bxp, **ep, **endxp, **xp;
 static char *argp, *bbp, *ebp, *inpline, *p, *replstr;
 static const char *eofstr;
 static int count, insingle, indouble, oflag, pflag, tflag, Rflag, rval, zflag;
+static long arg_max;
 static int cnt, Iflag, jfound, Lflag, wasquoted, xflag, runeof = 1;
 static int curprocs, maxprocs;
 static size_t inpsize;
@@ -72,7 +73,6 @@ extern char **environ;
 int
 main(int argc, char *argv[])
 {
-	long arg_max;
 	int ch, Jflag, nargs, nflag, nline;
 	size_t linelen;
 	char *endptr;
@@ -455,7 +455,7 @@ prerun(int argc, char *argv[])
 	while (--argc) {
 		*tmp = *avj++;
 		if (repls && strstr(*tmp, replstr) != NULL) {
-			strnsubst(tmp++, replstr, inpline, (size_t)255);
+			strnsubst(tmp++, replstr, inpline, (size_t)arg_max);
 			if (repls > 0)
 				repls--;
 		} else {
