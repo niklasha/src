@@ -1,0 +1,42 @@
+.Dd May 22, 2023
+.Dt DCARPD 8
+.Os
+.Sh NAME
+.Nm dcarpd
+.Nd Daemon implementing DCARP protocol
+.Sh SYNOPSIS
+.Nm
+.Op Fl dv
+.Op Fl i Ar interface
+.Op Fl g Ar gateway_ip
+.Sh DESCRIPTION
+The
+.Nm
+daemon implements the DCARP protocol for dynamic IP address sharing.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl d
+Do not daemonize. If this option is specified,
+.Nm
+will run in the foreground.
+.It Fl v
+Increase verbosity. Can be specified multiple times.
+.It Fl i Ar interface
+Specify the network interface that the daemon should listen to and manage.
+.It Fl g Ar gateway_ip
+Specify the IP address to be used by peers as gateway when this host is the master.
+.El
+.Sh SEE ALSO
+.Xr carp 4 ,
+.Xr syslogd 8
+.Sh HISTORY
+The
+.Nm
+command first appeared in OpenBSD 7.4.
+.Sh AUTHORS
+.An -nosplit
+The
+.Nm
+program was written by
+.An Niklas Hallqvist .
