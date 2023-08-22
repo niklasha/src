@@ -36,7 +36,7 @@ ldap_delete(struct request *req)
 	struct namespace	*ns;
 	struct referrals	*refs;
 	struct cursor		*cursor;
-	struct ber_element	*entry, *elm, *a;
+	struct ber_element	*entry = NULL, *elm, *a;
 	int			 rc = LDAP_OTHER;
 
 	++stats.req_mod;
@@ -114,6 +114,8 @@ ldap_delete(struct request *req)
 		rc = LDAP_SUCCESS;
 
 done:
+	if (entry != NULL)
+		ober_free_elements(entry);
 	btree_cursor_close(cursor);
 	btval_reset(&key);
 	namespace_abort(ns);
@@ -239,7 +241,7 @@ ldap_modify(struct request *req)
 	char			*dn;
 	long long		 op;
 	char			*attr;
-	struct ber_element	*mods, *entry, *mod, *a, *set;
+	struct ber_element	*mods, *entry = NULL, *mod, *a, *set;
 	struct ber_element	*vals = NULL, *prev = NULL;
 	struct namespace	*ns;
 	struct attr_type	*at;
@@ -384,6 +386,8 @@ ldap_modify(struct request *req)
 		rc = LDAP_OTHER;
 
 done:
+	if (entry != NULL)
+		ober_free_elements(entry);
 	if (vals != NULL)
 		ober_free_elements(vals);
 	namespace_abort(ns);

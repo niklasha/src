@@ -244,6 +244,7 @@ ldap_compare(struct request *req)
 	struct referrals	*refs;
 	struct attr_type	*at;
 	char			*dn, *aname, *value, *s;
+	int			 rv;
 
 	if (ober_scanf_elements(req->op, "{s{ss", &dn, &aname, &value) != 0) {
 		log_debug("%s: protocol error", __func__);
@@ -265,20 +266,30 @@ ldap_compare(struct request *req)
 	if ((entry = namespace_get(ns, dn)) == NULL)
 		return ldap_respond(req, LDAP_NO_SUCH_OBJECT);
 
-	if ((attr = ldap_find_attribute(entry, at)) == NULL)
-		return ldap_respond(req, LDAP_NO_SUCH_ATTRIBUTE);
-
-	if ((attr = attr->be_next) == NULL)	/* skip attribute name */
-		return ldap_respond(req, LDAP_OTHER);
-
-	for (elm = attr->be_sub; elm != NULL; elm = elm->be_next) {
-		if (ober_get_string(elm, &s) != 0)
-			return ldap_respond(req, LDAP_OTHER);
-		if (strcasecmp(value, s) == 0)
-			return ldap_respond(req, LDAP_COMPARE_TRUE);
+	if ((attr = ldap_find_attribute(entry, at)) == NULL) {
+		rv = LDAP_NO_SUCH_ATTRIBUTE;
+		goto done;
+	}
+	if ((attr = attr->be_next) == NULL) {	/* skip attribute name */
+		rv = LDAP_OTHER;
+		goto done;
 	}
 
-	return ldap_respond(req, LDAP_COMPARE_FALSE);
+	for (elm = attr->be_sub; elm != NULL; elm = elm->be_next) {
+		if (ober_get_string(elm, &s) != 0) {
+			rv = LDAP_OTHER;
+			goto done;
+		}
+		if (strcasecmp(value, s) == 0) {
+			rv = LDAP_COMPARE_TRUE;
+			goto done;
+		}
+	}
+
+	rv = LDAP_COMPARE_FALSE;
+done:
+	ober_free_elements(entry);
+	return ldap_respond(req, rv);
 }
 
 int
