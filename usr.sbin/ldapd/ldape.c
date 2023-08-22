@@ -241,6 +241,7 @@ ldap_compare(struct request *req)
 	struct referrals	*refs;
 	struct attr_type	*at;
 	char			*dn, *aname, *value, *s;
+	int			 rv;
 
 	if (ober_scanf_elements(req->op, "{s{ss", &dn, &aname, &value) != 0) {
 		log_debug("%s: protocol error", __func__);
