@@ -392,8 +392,10 @@ namespace_del(struct namespace *ns, char *dn)
 	key.size = strlen(key.data);
 
 	rc = btree_txn_del(NULL, ns->data_txn, &key, &data);
-	if (rc == BT_SUCCESS && (root = namespace_db2ber(ns, &data)) != NULL)
+	if (rc == BT_SUCCESS && (root = namespace_db2ber(ns, &data)) != NULL) {
 		rc = unindex_entry(ns, &key, root);
+		ober_free_elements(root);
+	}
 
 	btval_reset(&data);
 	return rc;
