@@ -1,7 +1,7 @@
 #	$OpenBSD: Makefile,v 1.20 2019/05/01 20:53:34 deraadt Exp $
 
 CDROM=		install${OSrev}.iso
-MOUNT_POINT=	/mnt
+MOUNT_POINT?=	/mnt
 
 RELXDIR?=	/home/relx-${MACHINE}
 RELDIR?=	/home/rel-${MACHINE}

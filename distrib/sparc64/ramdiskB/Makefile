@@ -3,7 +3,7 @@
 FS=		floppyB${OSrev}.img
 FSSIZE=		2880
 FSDISKTYPE=	floppy
-MOUNT_POINT=	/mnt
+MOUNT_POINT?=	/mnt
 MTREE=		${UTILS}/mtree.conf
 RAMDISK=	RAMDISKU5
 

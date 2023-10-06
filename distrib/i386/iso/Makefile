@@ -5,7 +5,7 @@ FSSIZE=		921600
 FSDISKTYPE=	install360
 CDROM=		install${OSrev}.iso
 
-MOUNT_POINT=	/mnt
+MOUNT_POINT?=	/mnt
 
 RELXDIR?=	/home/relx-${MACHINE}
 RELDIR?=	/home/rel-${MACHINE}

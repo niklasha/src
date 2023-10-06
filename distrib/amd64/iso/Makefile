@@ -4,7 +4,7 @@ FS=		install${OSrev}.img
 FSSIZE=		1439040
 CDROM=		install${OSrev}.iso
 
-MOUNT_POINT=	/mnt
+MOUNT_POINT?=	/mnt
 
 RELXDIR?=	/home/relx-${MACHINE}
 RELDIR?=	/home/rel-${MACHINE}

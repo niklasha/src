@@ -3,7 +3,7 @@
 FS=		install${OSrev}.img
 FSSIZE=		832192
 
-MOUNT_POINT=	/mnt
+MOUNT_POINT?=	/mnt
 
 RELXDIR?=	/home/relx-${MACHINE}
 RELDIR?=	/home/rel-${MACHINE}

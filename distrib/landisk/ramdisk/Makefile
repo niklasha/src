@@ -3,7 +3,7 @@
 FS=		miniroot${OSrev}.img
 FSSIZE=		5120
 FSDISKTYPE=	miniroot2.5M
-MOUNT_POINT=	/mnt
+MOUNT_POINT?=	/mnt
 MTREE=		${UTILS}/mtree.conf
 RAMDISK=	RAMDISK
 
