@@ -26,6 +26,7 @@
  */
 
 #include <sys/types.h>
+#include <sys/param.h>
 #include <ufs/ffs/fs.h>
 
 #include <err.h>
@@ -39,87 +40,124 @@
 #include <util.h>
 
 #define SBCOUNT 64		/* XXX - Should be configurable */
+#define SBCHUNK (SBCOUNT * SBSIZE)
+#define SBCHUNKBLKS (SBCHUNK / DEV_BSIZE)
 
 /* Flags to control ourselves... */
 #define FLAG_VERBOSE		1
 #define FLAG_SMART		2
 #define FLAG_LABELS		4
 
+static int found_partition(struct fs *, int, int64_t, daddr_t, char *, time_t,
+    daddr_t *, int *);
+static void scanbuf(u_int8_t *, daddr_t *, daddr_t *);
+static int ufsscan(int, daddr_t, daddr_t);
 static void usage(void);
 
+static int flags = 0;
+
 static int
-ufsscan(int fd, daddr_t beg, daddr_t end, int flags)
+ufsscan(int fd, daddr_t beg, daddr_t end)
 {
-	static char lastmount[MAXMNTLEN];
-	static u_int8_t buf[SBSIZE * SBCOUNT];
-	struct fs *sb;
-	daddr_t blk, lastblk;
-	int n;
+	/* Allocate with an overlap, so we can scan over the SBCHUNK border */
+	static u_int8_t buf[SBCHUNK + SBSIZE - DEV_BSIZE];
+	daddr_t blk, lastblk = -1;
 
-	lastblk = -1;
-	memset(lastmount, 0, MAXMNTLEN);
-
-	for (blk = beg; blk <= ((end<0)?blk:end); blk += (SBCOUNT*SBSIZE/512)){
-		memset(buf, 0, SBSIZE * SBCOUNT);
-		if (lseek(fd, (off_t)blk * 512, SEEK_SET) == -1)
-		    err(1, "lseek");
-		if (read(fd, buf, SBSIZE * SBCOUNT) == -1)
+	for (blk = beg; blk <= (end < 0 ? blk : end); blk += SBCHUNKBLKS) {
+		memset(buf, 0, sizeof buf);
+		if (lseek(fd, (off_t)blk * DEV_BSIZE, SEEK_SET) == -1)
+			err(1, "lseek");
+		if (read(fd, buf, sizeof buf) == -1)
 			err(1, "read");
-
-		for (n = 0; n < (SBSIZE * SBCOUNT); n += 512){
-			sb = (struct fs*)(&buf[n]);
-			if (sb->fs_magic == FS_MAGIC) {
-				if (flags & FLAG_VERBOSE)
-					printf("block %lld id %x,%x size %d\n",
-					    (long long)(blk + (n/512)),
-					    sb->fs_id[0], sb->fs_id[1],
-					    sb->fs_ffs1_size);
-
-				if (((blk+(n/512)) - lastblk) == (SBSIZE/512)) {
-					if (flags & FLAG_LABELS ) {
-						printf("X: %lld %lld 4.2BSD %d %d %d # %s\n",
-						    ((off_t)sb->fs_ffs1_size *
-						    sb->fs_fsize / 512),
-						    (long long)(blk + (n/512) -
-						    (2*SBSIZE/512)),
-						    sb->fs_fsize, sb->fs_bsize,
-						    sb->fs_cpg, lastmount);
-					} else {
-						/* XXX 2038 */
-						time_t t = sb->fs_ffs1_time;
-
-						printf("ffs at %lld size %lld "
-						    "mount %s time %s",
-						    (long long)(blk+(n/512) -
-						    (2*SBSIZE/512)),
-						    (long long)(off_t)sb->fs_ffs1_size *
-						    sb->fs_fsize,
-						    lastmount, ctime(&t));
-					}
-
-					if (flags & FLAG_SMART) {
-						off_t size = (off_t)sb->fs_ffs1_size *
-						    sb->fs_fsize;
-
-						if ((n + size) < (SBSIZE * SBCOUNT))
-							n += size;
-						else {
-							blk += (size/512 -
-							    (SBCOUNT*SBCOUNT));
-							break;
-						}
-					}
-				}
-
-				/* Update last potential FS SBs seen */
-				lastblk = blk + (n/512);
-				memcpy(lastmount, sb->fs_fsmnt, MAXMNTLEN);
-			}
-		}
+		scanbuf(buf, &blk, &lastblk);
 	}
 	return(0);
 }
 
+static void
+scanbuf(u_int8_t *buf, daddr_t *chunk, daddr_t *lastblk)
+{       
+	static char lastmount[MAXMNTLEN];
+	struct fs *sb;
+	daddr_t sblock, sbdiff, blk = *chunk;
+	int n;
+	int64_t fs_size;
+	time_t time;
+	int version, bailout = 0;
+
+	for (n = 0; !bailout && n < SBCHUNKBLKS; n++, blk++) {
+       		sb = (struct fs *)(&buf[n * DEV_BSIZE]);
+		switch (sb->fs_magic) {
+		case FS_UFS1_MAGIC:
+			fs_size = sb->fs_ffs1_size;
+			sblock = SBLOCK_UFS1 / DEV_BSIZE;
+			time = sb->fs_ffs1_time;
+			version = 1;
+			break;
+		case FS_UFS2_MAGIC:
+			fs_size = sb->fs_size;
+			sblock = SBLOCK_UFS2 / DEV_BSIZE;
+			time = sb->fs_time;
+			version = 2;
+			break;
+		default:
+			continue;
+		}
+		/* Compute the offset between the main SB and the first alternate. */
+		sbdiff = fsbtodb(sb, cgsblock(sb, 0)) - sblock;
+		if (flags & FLAG_VERBOSE)
+			printf("block %lld version %d id %x,%x size %lld "
+			    "fsize %d\n",
+			    (long long)blk, version, sb->fs_id[0], sb->fs_id[1],
+			    (long long)fs_size, sb->fs_fsize);
+		/*
+		 * Use the distance between the main SB and the 1st alternate as
+		 * a hueristic for having found the start of a partition.
+		 */
+		if (*lastblk != -1 && blk - *lastblk == sbdiff)
+			bailout = found_partition(sb, version, fs_size,
+			    *lastblk - sblock, lastmount, time, chunk, &n);
+
+		/* Update last potential SB seen. */
+		*lastblk = blk;
+		memcpy(lastmount, sb->fs_fsmnt, MAXMNTLEN);
+	}
+}
+
+/*
+ * Report a potential partition, and optionally compute a block where
+ * to continue scanning.  Return 1 if this block will be outside the
+ * currently scanned buffer, 0 otherwise.
+ */
+static int
+found_partition(struct fs *sb, int version, int64_t fs_size, daddr_t offset,
+    char *lastmount, time_t time, daddr_t *chunk, int *n)
+{
+	if (flags & FLAG_LABELS ) {
+		printf("X: %lld %lld 4.2BSD %d %d %d # %s\n",
+		       (long long)fsbtodb(sb, fs_size),
+		       (long long)offset, sb->fs_fsize, sb->fs_bsize,
+		       sb->fs_cpg, lastmount);
+	} else {
+		printf("ffs%d at %lld size %lld mount %s time %s",
+		       version, (long long)offset,
+		       (long long)(fs_size * sb->fs_fsize),
+		       lastmount, ctime(&time));
+	}
+
+	if (flags & FLAG_SMART) {
+		daddr_t nextblk = offset + fsbtodb(sb, fs_size);
+		if (flags & FLAG_VERBOSE)
+			printf("skipping to %lld\n", (long long)nextblk);
+		if (nextblk - *chunk < SBCHUNKBLKS) {
+			*n = (int)(nextblk - *chunk - 1);
+		} else {
+			*chunk = nextblk - SBCHUNKBLKS;
+			return(1);
+		}
+	}
+	return(0);
+}
 
 static void
 usage(void)
@@ -135,7 +173,7 @@ usage(void)
 int
 main(int argc, char *argv[])
 {
-	int ch, fd, flags = 0;
+	int ch, fd;
 	daddr_t beg = 0, end = -1;
 	const char *errstr;
 
@@ -180,5 +218,5 @@ main(int argc, char *argv[])
 	if (pledge("stdio", NULL) == -1)
 		err(1, "pledge");
 
-	return (ufsscan(fd, beg, end, flags));
+	return (ufsscan(fd, beg, end));
 }
