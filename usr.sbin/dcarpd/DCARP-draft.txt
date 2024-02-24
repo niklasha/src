@@ -1,0 +1,251 @@
+Title: DCARP - Distributed Common Address Redundancy Protocol
+
+Abstract:
+This document specifies the Distributed Common Address Redundancy Protocol (DCARP), an extension to the Common Address Redundancy Protocol (CARP). DCARP enables dynamic sharing and management of an egress IP address among a group of hosts, typically used for high-availability clustering.
+
+1. Introduction
+
+This document introduces the Distributed Common Address Redundancy Protocol (DCARP), an extension of CARP that overcomes this limitation by allowing dynamic distribution and management of an egress IP address among a group of hosts. DCARP enhances the original protocol by introducing a mechanism for the automatic configuration of shared IP addresses and the associated network parameters among participating nodes in a CARP setup. This extension facilitates more dynamic and adaptive network configurations, particularly beneficial in environments where IP addresses or network parameters are assigned via DHCP or need to be changed frequently.
+
+DCARP operates on the principle of electing a single Master node among a cluster of nodes, similar to CARP. However, unlike CARP, DCARP allows the Master node to dynamically distribute the necessary IP configuration to Backup nodes. This distribution includes the egress IP address, netmask, and default gateway information. The protocol ensures consistent and synchronized network configurations across all nodes, thereby maintaining the integrity and availability of the shared IP address even in the event of Master node failover.
+
+The protocol is designed to be simple, with only one primary message type used for the distribution of IP configuration data. This simplicity ensures ease of implementation and minimizes the protocol's overhead, making DCARP an efficient solution for dynamic high-availability network setups.
+
+2. Terminology
+
+This document uses the following terms:
+
+    CARP (Common Address Redundancy Protocol): A protocol that allows multiple hosts on the same local network to share a set of IP addresses, enhancing reliability and availability.
+
+    DCARP (Distributed Common Address Redundancy Protocol): An extension of CARP that enables dynamic sharing and management of an egress IP address among a group of hosts.
+
+    Master Node: In the context of DCARP, the Master Node is the node currently responsible for managing and distributing the shared IP address and other network configuration details to the Backup Nodes.
+
+    Backup Node: A node in a DCARP setup that receives network configuration details (such as the shared IP address, netmask, and gateway information) from the Master Node and is ready to assume the Master role if needed.
+
+    DCARP Message: A structured data packet used by DCARP for communication between the Master and Backup Nodes, containing network configuration details.
+
+    HMAC (Hash-based Message Authentication Code): A specific type of message authentication code (MAC) involving a cryptographic hash function and a secret cryptographic key, used in DCARP for message validation.
+
+    Netmask: A network mask that divides the IP address into the network and host segments. In DCARP, it is part of the information distributed by the Master Node.
+
+    Gateway IP: The IP address of the gateway to which traffic should be sent. In DCARP, this is included in the configuration information distributed by the Master Node.
+
+    Election Process: While DCARP does not handle the election process itself, this term refers to the mechanism used by CARP to elect a Master Node from among a group of nodes.
+
+    Shared IP Address: An IP address that is managed by the DCARP protocol and shared among a group of nodes for high availability.
+
+    Link State: The current operational state of a network interface, such as "up" or "down." DCARP nodes monitor link state changes to manage the transition between Master and Backup roles.
+
+3. Protocol Overview
+
+The Distributed Common Address Redundancy Protocol (DCARP) is designed to extend the capabilities of the Common Address Redundancy Protocol (CARP) by introducing dynamic address configuration among a group of network hosts. DCARP maintains the fundamental principles of CARP, such as electing a Master node and several Backup nodes, but adds the functionality of dynamically distributing network configuration information from the Master to the Backup nodes.
+
+3.1 Operational Model
+
+In a DCARP setup, the participating nodes are configured in a similar manner to a standard CARP configuration. Each node is assigned a unique host identifier and a common virtual host identifier. The election of the Master node is based on the host's priority, similar to CARP. The node with the highest priority (lowest numerical value) becomes the Master, while the others act as Backups.
+
+Once a Master node is elected, it assumes responsibility for the shared IP address. Unlike CARP, where each node must be pre-configured with the shared IP, DCARP allows the Master node to dynamically distribute the shared IP address, along with associated network configuration details like the netmask and default gateway, to the Backup nodes.
+
+3.2 DCARP Message
+
+The primary method of communication in DCARP is the DCARP message, which is used by the Master node to distribute network configuration information to Backup nodes. This message contains the following information:
+
+    Message Type: Indicates the type of message. For DCARP, this is always set to a specific value representing an IP distribution message.
+        CARP IP: The shared IP address that Backup nodes must adopt.
+	    Netmask: The netmask associated with the shared IP address.
+	        Gateway IP: The default gateway that Backup nodes should use.
+
+The message is sent using multicast over the local network, ensuring that all Backup nodes receive the configuration information simultaneously.
+
+3.3 HMAC Authentication
+
+To ensure the integrity and authenticity of DCARP messages, each message includes an HMAC (Hash-based Message Authentication Code) signature. The HMAC is computed using a shared secret key, known to all participating nodes in the DCARP setup. This mechanism protects against tampering and spoofing of DCARP messages.
+
+3.4 Handling State Transitions
+
+When a Backup node receives a valid DCARP message, it configures its network interface with the provided IP configuration. If the current Master node fails or a higher-priority node becomes available, a new Master is elected. The new Master then sends out a DCARP message with the updated configuration, ensuring continuous availability of the shared IP address.
+
+3.5 Network Interface Changes
+
+DCARP nodes monitor their network interfaces for changes in state. If a node's interface goes down, it withdraws from the CARP group and triggers a new election process among the remaining nodes. This ensures that the shared IP address is always managed by an operational node.
+
+4. DCARP Message Format
+
+DCARP employs a structured message format for communication between the Master and Backup nodes. Each message is composed of several fields, each serving a specific purpose in the protocol's operation. The message format is designed to be both simple and comprehensive, ensuring efficient transmission of necessary data.
+
+4.1 Message Structure
+
+A DCARP message consists of the following fields:
+
+    Message Type (4 bytes): A field that identifies the type of the DCARP message. For DCARP IP distribution messages, this is set to a predefined value (e.g., 0x00000001).
+
+    CARP IP (4 bytes): The shared IP address in network byte order.
+
+    Netmask (4 bytes): The netmask associated with the shared IP address, in network byte order.
+
+    Gateway IP (4 bytes): The default gateway IP address in network byte order.
+
+    HMAC (32 bytes): The HMAC, computed using SHA-256, ensures the message's integrity and authenticity.
+
+The total length of a DCARP message is thus 48 bytes.
+
+diff
+
+ 0                   1                   2                   3
+  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                           Message Type                        |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                          CARP IP                               |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                          Netmask                              |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                         Gateway IP                            |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                                                               |
+  +                                                               +
+  |                                                               |
+  +                              HMAC                             +
+  |                                                               |
+  +                                                               +
+  |                                                               |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  
+
+4.2 Message Integrity and Authentication
+
+The HMAC field is a critical component of the DCARP message format. It is computed using the shared secret key known to all nodes in the DCARP setup. The HMAC covers the Message Type, CARP IP, Netmask, and Gateway IP fields. Upon receipt of a DCARP message, nodes must verify the HMAC before accepting the message contents. This verification process protects against unauthorized or tampered messages within the network.
+
+4.3 Multicast Transmission
+
+DCARP messages are transmitted using UDP multicast, ensuring efficient and simultaneous delivery to all Backup nodes. The multicast address and port used for DCARP communication are predetermined and should be configurable in the implementation to adapt to specific network environments.
+
+5. Operational Details
+
+DCARP extends the functionality of CARP by managing the distribution and synchronization of network configurations among nodes in a CARP setup. Unlike CARP, which handles the election of a Master node, DCARP's focus is on the dynamic configuration of network parameters among the Master and Backup nodes.
+
+5.1 Node Roles and Responsibilities
+
+DCARP operates on top of a standard CARP configuration, utilizing the existing CARP mechanisms for electing a Master node. The roles and responsibilities in a DCARP setup are as follows:
+
+5.1.1 Master Node
+
+    Configuration Distribution: Upon assuming the Master role, as determined by CARP, the Master node in a DCARP setup is responsible for broadcasting the current network configuration, including the shared IP address, netmask, and default gateway, to the Backup nodes.
+
+    Handling Network Changes: The Master node monitors for changes in network configuration and updates the Backup nodes by sending new DCARP messages reflecting these changes.
+
+5.1.2 Backup Nodes
+
+    Applying Configuration: Backup nodes apply the network configuration received from the Master node to their interfaces. This ensures all nodes in the CARP group have synchronized network settings.
+
+    DHCP Query Prevention: Backup nodes must have mechanisms to prevent DHCP queries from being sent on the CARP interface. This is crucial to maintain the integrity of the manually synchronized network configuration and avoid conflicts.
+
+    State Monitoring: Backup nodes continuously monitor the state of the Master node. In the event of Master node failure, as indicated by standard CARP procedures, Backup nodes defer to CARP for the election of a new Master.
+
+5.2 Message Handling
+
+    Message Validation: DCARP messages received by Backup nodes must undergo HMAC validation to ensure their authenticity and integrity.
+
+    Configuration Updates: Upon receiving a validated DCARP message, Backup nodes update their network configurations accordingly.
+
+5.3 Reliance on CARP for Master Election
+
+DCARP does not provide its own mechanism for the election of the Master node. Instead, it relies on the standard CARP protocol for this process. Once a Master is elected through CARP, DCARP takes over for the distribution of the network configuration.
+
+5.4 Security and Configuration Management
+
+    Securing DCARP Messages: The security of DCARP messages is maintained through HMAC, using a shared secret key.
+
+    Key Management: Secure management and distribution of the HMAC key among the nodes are vital for maintaining the integrity of the DCARP protocol.
+    
+6. Security Considerations
+
+The design and implementation of DCARP incorporate several considerations to maintain the security and integrity of the network configurations it manages. These considerations are pivotal, given the protocol's role in high-availability and redundancy scenarios.
+
+6.1 Authentication and Integrity
+
+    HMAC Usage: DCARP employs HMAC (Hash-based Message Authentication Code) to ensure the integrity and authenticity of the messages it distributes. This mechanism protects against unauthorized message modification and spoofing, which are critical in maintaining consistent and reliable network configurations.
+
+    Key Management: The security of DCARP is heavily reliant on the proper management of the HMAC keys. It is imperative that these keys are generated, stored, and transmitted securely. Compromise of the HMAC keys can lead to unauthorized network configuration changes.
+
+6.2 Network Security
+
+    Multicast Security: Given that DCARP uses multicast for message distribution, it is essential to consider the security implications of multicast traffic within the network. Network administrators should ensure that multicast traffic is appropriately segregated and monitored.
+
+    Denial of Service: Care should be taken to protect the DCARP service from Denial of Service (DoS) attacks. Implementations should include mechanisms to handle large volumes of incoming DCARP messages and to validate message authenticity quickly to mitigate potential DoS attacks.
+
+6.3 DHCP Interaction
+
+    Preventing DHCP Conflicts: Backup nodes in a DCARP setup must ensure that DHCP queries are not sent from the CARP interface. This is crucial to prevent conflicts between dynamically assigned addresses from a DHCP server and the static addresses managed by DCARP.
+
+6.4 Implementation and Configuration
+
+    Secure Defaults: Implementations of DCARP should adopt secure default settings, such as strong HMAC keys and restricted multicast scopes. Care should be taken to avoid common pitfalls in default configurations that could lead to security vulnerabilities.
+
+    Monitoring and Logging: Effective logging and monitoring mechanisms are important for identifying potential security breaches or operational anomalies. Administrators should regularly review DCARP logs and monitor network traffic for signs of unusual or unauthorized activity.
+
+6.5 Operational Security
+
+    Regular Updates and Patches: As with any network protocol implementation, regular updates and patches are crucial for maintaining security. Operators should apply updates to DCARP implementations as they become available to address any discovered vulnerabilities or bugs.
+
+    Network Policy Compliance: DCARP should be deployed in accordance with the s network security policies and guidelines. Administrators should ensure that the deployment of DCARP aligns with overall network security strategies and compliances.
+
+7. Implementation Considerations
+
+The successful deployment of DCARP relies on several key implementation considerations. These considerations ensure that the protocol functions effectively within diverse network environments and meets the high-availability requirements it is designed to address.
+
+7.1 Compatibility with CARP
+
+    Seamless Integration: DCARP should seamlessly integrate with existing CARP implementations. This involves ensuring that DCARP's operations do not interfere with the standard CARP election process and that both protocols can coexist on the same network infrastructure without conflicts.
+
+    Protocol Coexistence: In environments where both CARP and DCARP are deployed, careful configuration is necessary to ensure that DCARP's dynamic address management does not conflict with CARP's static address configuration mechanisms.
+
+7.2 Handling Network Dynamics
+
+    Responsiveness to Changes: DCARP implementations should be responsive to network changes, including interface state changes and network topology adjustments. This responsiveness is crucial for maintaining the high availability of services.
+
+    Robustness in Diverse Environments: The protocol should be robust enough to handle diverse network conditions, including varying levels of network traffic, different types of network infrastructure, and various deployment scales.
+
+7.3 Configurability and Customization
+
+    Flexible Configuration Options: Implementations of DCARP should offer a range of configuration options to accommodate different network requirements and policies. This includes settings for multicast addresses and ports, HMAC key configuration, and message frequency.
+
+    Adaptability: DCARP should be adaptable to specific network needs, allowing for customization in areas such as message intervals, timeout periods, and security parameters.
+
+7.4 Performance Considerations
+
+    Minimal Overhead: The design and implementation of DCARP should aim for minimal protocol overhead to avoid imposing significant additional load on the network.
+
+    Efficiency in Message Processing: Efficient processing of DCARP messages is crucial, particularly in high-traffic environments. Implementations should optimize message handling to maintain quick response times and low resource utilization.
+
+7.5 Software Quality and Reliability
+
+    High Reliability: Given its role in high-availability setups, DCARP implementations must be highly reliable. Rigorous testing and validation are essential to ensure that the protocol operates consistently under various scenarios and conditions.
+
+    Error Handling and Recovery: Robust error handling and recovery mechanisms are important to ensure that DCARP can gracefully recover from operational anomalies and maintain its high-availability guarantee.
+
+7.6 Interoperability
+
+    Interoperability with Different Systems: DCARP should be designed with interoperability in mind, ensuring that it can function effectively across different operating systems and network equipment.
+
+8. IANA Considerations
+
+    Request for allocation of multicast addresses and ports for DCARP.
+        Discussion of any other IANA requirements.
+
+9. Acknowledgments
+
+    Acknowledgments of contributions from individuals and organizations.
+
+10. References
+
+    References to related documents, standards, and RFCs.
+
+11. Authors' Addresses
+
+    niklas+dcarp@appli.se
+
+Appendix A: Example Implementations
+
+    Sample implementation details or pseudocode.

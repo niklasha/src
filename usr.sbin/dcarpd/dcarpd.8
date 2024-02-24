@@ -6,7 +6,7 @@
 .Nd Daemon implementing DCARP protocol
 .Sh SYNOPSIS
 .Nm
-.Op Fl dv
+.Op Fl dnv
 .Op Fl i Ar interface
 .Op Fl g Ar gateway_ip
 .Sh DESCRIPTION
@@ -20,6 +20,8 @@ The options are as follows:
 Do not daemonize. If this option is specified,
 .Nm
 will run in the foreground.
+.It Fl n
+Run in dry-run mode. In this mode, the daemon goes through all the motions but does not actually reconfigure network interfaces or routes. This is useful for testing.
 .It Fl v
 Increase verbosity. Can be specified multiple times.
 .It Fl i Ar interface
