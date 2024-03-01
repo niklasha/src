@@ -35,7 +35,7 @@ err()
 
 usage()
 {
-	echo "usage: ${0##*/} [-fkns] [-b base-directory] [-R version] [installurl | path]" 1>&2
+	echo "usage: ${0##*/} [-fkn] [-A | -s] [-b base-directory] [-R version] [installurl | path]" 1>&2
 	return 1
 }
 
@@ -74,6 +74,7 @@ rmel() {
 
 SNAP=false
 FILE=false
+BASELINE=false
 FORCE=false
 FORCE_VERSION=false
 KEEP=false
@@ -83,8 +84,9 @@ WHAT='release'
 VERSION=$(uname -r)
 NEXT_VERSION=$(echo ${VERSION} + 0.1 | bc)
 
-while getopts b:fknrR:s arg; do
+while getopts Ab:fknrR:s arg; do
 	case ${arg} in
+	A)	BASELINE=true;;
 	b)	SETSDIR=${OPTARG}/_sysupgrade;;
 	f)	FORCE=true;;
 	k)	KEEP=true;;
@@ -100,6 +102,17 @@ while getopts b:fknrR:s arg; do
 done
 
 (($(id -u) != 0)) && err "need root privileges"
+
+if $SNAP && $BASELINE; then
+	usage
+fi
+
+# XXX still needed?
+set -A _KERNV -- $(sysctl -n kern.version |
+	sed 's/^OpenBSD \([1-9][0-9]*\.[0-9]\)\([^ ]*\).*/\1 \2/;q')
+
+BL=$(($(echo ${_KERNV[0]} | tr -d .) - 37))
+NEXT_BL=$(($(echo $NEXT_VERSION | tr -d .) - 37))
 
 shift $(( OPTIND -1 ))
 
@@ -125,7 +138,18 @@ fi
 
 if $SNAP; then
 	WHAT='snapshot'
-	URL=${MIRROR}/snapshots/${ARCH}/
+elif $BASELINE; then
+	WHAT='baseline'
+fi
+
+if $SNAP || $BASELINE; then
+	if $SNAP; then
+		URL=${MIRROR}/snapshots/${ARCH}/
+	elif $FORCE; then
+		URL=${MIRROR}/bl$BL/${ARCH}/
+	else
+		URL=${MIRROR}/bl$NEXT_BL/${ARCH}/
+	fi
 else
 	URL=${MIRROR}/${NEXT_VERSION}/${ARCH}/
 	$FORCE_VERSION || ALT_URL=${MIRROR}/${VERSION}/${ARCH}/
@@ -160,19 +184,35 @@ if [[ -z $KEY ]]; then
 	exit 1
 fi
 
-# If required key is not in the system, get it from a signed bundle
-if ! [[ -r /etc/signify/$KEY ]]; then
-	HAVEKEY=$(cd /etc/signify && ls -1 openbsd-*-base.pub | \
-	    tail -2 | head -1 | cut -d- -f2)
-	BUNDLE=sigbundle-${HAVEKEY}.tgz
-	FWKEY=$(echo $KEY | sed -e 's/base/fw/')
-	echo "Adding missing keys from bundle $BUNDLE"
-	unpriv -f ${BUNDLE} ftp -N sysupgrade -Vmo $BUNDLE https://ftp.openbsd.org/pub/OpenBSD/signify/$BUNDLE
-	signify -Vzq -m - -x $BUNDLE | (cd /etc/signify && tar xfz - $KEY $FWKEY)
-	rm $BUNDLE
-fi
+if !$BASELINE; then
+	# If required key is not in the system, get it from a signed bundle
+	if ! [[ -r /etc/signify/$KEY ]]; then
+		HAVEKEY=$(cd /etc/signify && ls -1 openbsd-*-base.pub | \
+		    tail -2 | head -1 | cut -d- -f2)
+		BUNDLE=sigbundle-${HAVEKEY}.tgz
+		FWKEY=$(echo $KEY | sed -e 's/base/fw/')
+		echo "Adding missing keys from bundle $BUNDLE"
+		unpriv -f ${BUNDLE} ftp -N sysupgrade -Vmo $BUNDLE https://ftp.openbsd.org/pub/OpenBSD/signify/$BUNDLE
+		signify -Vzq -m - -x $BUNDLE | (cd /etc/signify && tar xfz - $KEY $FWKEY)
+		rm $BUNDLE
+	fi
 
-unpriv -f SHA256 signify -Ve -x SHA256.sig -m SHA256
+	unpriv -f SHA256 signify -Ve -x SHA256.sig -m SHA256
+else
+	_KEY=baseline-$BL-base.pub
+	_NEXTKEY=baseline-$NEXT_BL-base.pub
+
+	read _LINE <SHA256.sig
+	case ${_LINE} in
+	*\ ${_KEY})	SIGNIFY_KEY=/etc/signify/${_KEY} ;;
+	*\ ${_NEXTKEY})	SIGNIFY_KEY=/etc/signify/${_NEXTKEY} ;;
+	*)		err "invalid signing key" ;;
+	esac
+
+	[[ -f ${SIGNIFY_KEY} ]] || err "cannot find ${SIGNIFY_KEY}"
+
+	unpriv -f SHA256 signify -Ve -p "${SIGNIFY_KEY}" -x SHA256.sig -m SHA256
+fi
 rm SHA256.sig
 
 if cmp -s /var/db/installed.SHA256 SHA256 && ! $FORCE; then
