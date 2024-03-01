@@ -49,7 +49,6 @@
 ./etc/amd/master.sample
 ./etc/authpf
 ./etc/daily
-./etc/disktab
 ./etc/examples
 ./etc/examples/acme-client.conf
 ./etc/examples/bgpd.conf
