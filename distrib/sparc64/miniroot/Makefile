@@ -4,7 +4,7 @@ FS=		miniroot${OSrev}.img
 FSSIZE=		6400
 FSDISKTYPE=	fakeramdisk
 CDROM=		cd${OSrev}.iso
-MOUNT_POINT=	/mnt
+MOUNT_POINT?=	/mnt
 MTREE=		${UTILS}/mtree.conf
 RAMDISK=	RAMDISK
 

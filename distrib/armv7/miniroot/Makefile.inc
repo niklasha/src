@@ -2,7 +2,7 @@
 
 FS=		miniroot-${BOARD}-${OSrev}.img
 FSSIZE=		71424	# ffs+msdos, actually
-MOUNT_POINT=	/mnt
+MOUNT_POINT?=	/mnt
 
 MKUBOOT?=	mkuboot
 

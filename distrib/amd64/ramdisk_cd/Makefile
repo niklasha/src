@@ -5,7 +5,7 @@ FSSIZE=		11392
 EFICDBOOT=	eficdboot
 EFICDBOOTSIZE=	350K
 CDROM=		cd${OSrev}.iso
-MOUNT_POINT=	/mnt
+MOUNT_POINT?=	/mnt
 MTREE=		${UTILS}/mtree.conf
 RAMDISK=	RAMDISK_CD
 
