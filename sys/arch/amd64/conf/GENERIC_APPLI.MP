@@ -11,6 +11,8 @@ option	USB_DEBUG
 option	EHCI_DEBUG
 option	WDCDEBUG
 option	XNF_DEBUG
+option	CONFIG_DRM_AMDGPU_CIK
+option	AMDGPU_CIK
 
 cpu*		at mainbus?
 com2		at isa? port 0x3e8 irq 4
