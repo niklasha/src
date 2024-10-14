@@ -1,4 +1,4 @@
-/*	$OpenBSD: unfdpass.c,v 1.23 2023/03/08 04:43:06 guenther Exp $	*/
+/*	$OpenBSD: unfdpass.c,v 1.24 2023/03/08 04:43:06 guenther Exp $	*/
 /*	$NetBSD: unfdpass.c,v 1.3 1998/06/24 23:51:30 thorpej Exp $	*/
 
 /*-
