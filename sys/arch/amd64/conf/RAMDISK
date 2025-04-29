@@ -93,7 +93,7 @@ wd*		at pciide? flags 0x0000
 
 #fxp*		at pci?			# EtherExpress 10/100B ethernet
 #rl*		at pci?			# Realtek 81[23]9 ethernet
-re*		at pci?			# Realtek 8169/8169S/8110S
+#re*		at pci?			# Realtek 8169/8169S/8110S
 em*		at pci?			# Intel Pro/1000 ethernet
 bge*		at pci?			# Broadcom BCM570x (aka Tigon3)
 
@@ -104,7 +104,7 @@ bge*		at pci?			# Broadcom BCM570x (aka Tigon3)
 #nsphyter*	at mii?			# NS and compatible PHYs
 rlphy*		at mii?			# Realtek 8139 internal PHYs
 brgphy*		at mii?			# Broadcom Gigabit PHYs
-rgephy*		at mii?			# Realtek 8169S/8110S PHY
+#rgephy*		at mii?			# Realtek 8169S/8110S PHY
 #ciphy*		at mii?			# Cicada CS8201 10/100/1000 copper PHY
 ukphy*		at mii?			# "unknown" PHYs
 
