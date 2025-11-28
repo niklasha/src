@@ -1,4 +1,4 @@
-/*	$OpenBSD: nd6.c,v 1.303 2025/09/16 09:19:43 florian Exp $	*/
+/*	$OpenBSD: nd6.c,v 1.303.2.1 2025/11/28 18:27:27 bluhm Exp $	*/
 /*	$KAME: nd6.c,v 1.280 2002/06/08 19:52:07 itojun Exp $	*/
 
 /*
@@ -828,6 +828,9 @@ nd6_rtrequest(struct ifnet *ifp, int req, struct rtentry *rt)
 
 				ln_end = TAILQ_LAST(&nd6_list, llinfo_nd6_head);
 				if (ln_end == ln)
+					break;
+				/* cannot move the iterator, try next time */
+				if (ln_end->ln_rt == NULL)
 					break;
 
 				/* Move this entry to the head */
