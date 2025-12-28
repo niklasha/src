@@ -178,13 +178,13 @@ fi
 
 # The key extracted from SHA256.sig must precisely match a pattern
 KEY=$(head -1 < SHA256.sig | cut -d' ' -f5 | \
-	egrep '^openbsd-[[:digit:]]{2,3}-base.pub$' || true)
+	egrep '^(openbsd|baseline)-[[:digit:]]{2,3}-base.pub$' || true)
 if [[ -z $KEY ]]; then
 	echo "Invalid SHA256.sig file"
 	exit 1
 fi
 
-if !$BASELINE; then
+if ! $BASELINE; then
 	# If required key is not in the system, get it from a signed bundle
 	if ! [[ -r /etc/signify/$KEY ]]; then
 		HAVEKEY=$(cd /etc/signify && ls -1 openbsd-*-base.pub | \
