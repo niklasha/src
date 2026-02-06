@@ -41,6 +41,30 @@
 !! THANK YOU!                        Sebastian Pipping -- Berlin, 2024-03-09 !!
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+        Security fixes:
+           #1131  CVE-2026-24515 -- Function XML_ExternalEntityParserCreate
+                    failed to copy the encoding handler data passed to
+                    XML_SetUnknownEncodingHandler from the parent to the new
+                    subparser. This can cause a NULL dereference (CWE-476) from
+                    external entities that declare use of an unknown encoding.
+                    The expected impact is denial of service. It takes use of
+                    both functions XML_ExternalEntityParserCreate and
+                    XML_SetUnknownEncodingHandler for an application to be
+                    vulnerable.
+           #1075  CVE-2026-25210 -- Add missing check for integer overflow
+                    related to buffer size determination in function doContent
+
+        Bug fixes:
+           #1073  lib: Fix missing undoing of group size expansion in doProlog
+                    failure cases
+           #1104  WASI: Fix format specifiers for 32bit WASI SDK
+
+        Other changes:
+           #1105  lib: Fix strict aliasing
+           #1106  lib: Leverage feature "flexible array member" of C99
+           #1051  lib: Swap (size_t)(-1) for C99 equivalent SIZE_MAX
+     #1102 #1103  WASI: Stop using getpid
+
 Release 2.7.3 Wed September 24 2025
         Security fixes:
      #1046 #1048  Fix alignment of internal allocations for some non-amd64
