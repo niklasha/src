@@ -1,4 +1,4 @@
-/*	$OpenBSD: main.c,v 1.36 2024/11/05 16:14:39 sobrado Exp $	*/
+/*	$OpenBSD: main.c,v 1.36.2.1 2026/02/27 20:31:13 bluhm Exp $	*/
 /*	$NetBSD: main.c,v 1.7 1997/05/13 06:15:57 mikel Exp $	*/
 
 /*
@@ -108,7 +108,7 @@ main(int argc, char **argv)
 	char *rc;
 	extern const char version[];
 
-	if (pledge("stdio rpath wpath cpath getpw tmppath fattr tty flock proc exec",
+	if (pledge("stdio rpath wpath cpath getpw fattr tty flock proc exec",
 	    NULL) == -1)
 		err(1, "pledge");
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtpc.c,v 1.21 2024/05/13 06:48:26 jsg Exp $	*/
+/*	$OpenBSD: smtpc.c,v 1.21.4.1 2026/02/27 20:31:13 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2018 Eric Faurot <eric@openbsd.org>
@@ -245,7 +245,9 @@ main(int argc, char **argv)
 	} else
 		tls_config_verify(tls_config);
 
-	if (pledge("stdio inet dns tmppath", NULL) == -1)
+	if (unveil("/tmp", "rwc") == -1)
+		fatal("unveil /tmp");
+	if (pledge("stdio inet dns rpath wpath cpath", NULL) == -1)
 		fatal("pledge");
 
 	if (!noaction)
