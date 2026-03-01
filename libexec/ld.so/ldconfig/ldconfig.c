@@ -1,4 +1,4 @@
-/*	$OpenBSD: ldconfig.c,v 1.39 2021/10/24 21:24:20 deraadt Exp $	*/
+/*	$OpenBSD: ldconfig.c,v 1.39.14.1 2026/03/01 22:08:35 bluhm Exp $	*/
 
 /*
  * Copyright (c) 1993,1995 Paul Kranenburg
@@ -94,7 +94,7 @@ main(int argc, char *argv[])
 	int i, c;
 	int rval = 0;
 
-	if (pledge("stdio rpath wpath cpath tmppath fattr", NULL) == -1)
+	if (pledge("stdio rpath wpath cpath fattr", NULL) == -1)
 		err(1, "pledge");
 
 	while ((c = getopt(argc, argv, "DmPrRsSUv")) != -1) {
