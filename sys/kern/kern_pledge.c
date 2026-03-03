@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_pledge.c,v 1.333.2.1 2026/02/27 20:38:14 bluhm Exp $	*/
+/*	$OpenBSD: kern_pledge.c,v 1.333.2.2 2026/03/03 14:58:53 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2015 Nicholas Marriott <nicm@openbsd.org>
@@ -82,7 +82,6 @@
 uint64_t pledgereq_flags(const char *req);
 int	 parsepledges(struct proc *p, const char *kname,
 	    const char *promises, u_int64_t *fp);
-int	 canonpath(const char *input, char *buf, size_t bufsize);
 void	 unveil_destroy(struct process *ps);
 
 /*
@@ -296,7 +295,7 @@ const uint64_t pledge_syscalls[SYS_MAXSYSCALL] = {
 	[SYS_fstatat] = PLEDGE_RPATH | PLEDGE_WPATH,
 	[SYS_faccessat] = PLEDGE_RPATH | PLEDGE_WPATH,
 	[SYS_readlinkat] = PLEDGE_RPATH | PLEDGE_WPATH,
-	[SYS_lstat] = PLEDGE_RPATH | PLEDGE_WPATH | PLEDGE_TMPPATH,
+	[SYS_lstat] = PLEDGE_RPATH | PLEDGE_WPATH,
 	[SYS_truncate] = PLEDGE_WPATH,
 	[SYS_rename] = PLEDGE_RPATH | PLEDGE_CPATH,
 	[SYS_rmdir] = PLEDGE_CPATH,
@@ -305,7 +304,7 @@ const uint64_t pledge_syscalls[SYS_MAXSYSCALL] = {
 	[SYS_linkat] = PLEDGE_CPATH,
 	[SYS_symlink] = PLEDGE_CPATH,
 	[SYS_symlinkat] = PLEDGE_CPATH,
-	[SYS_unlink] = PLEDGE_CPATH | PLEDGE_TMPPATH,
+	[SYS_unlink] = PLEDGE_CPATH,
 	[SYS_unlinkat] = PLEDGE_CPATH,
 	[SYS_mkdir] = PLEDGE_CPATH,
 	[SYS_mkdirat] = PLEDGE_CPATH,
@@ -395,7 +394,6 @@ static const struct {
 	{ "settime",		PLEDGE_SETTIME },
 	{ "stdio",		PLEDGE_STDIO },
 	{ "tape",		PLEDGE_TAPE },
-	{ "tmppath",		PLEDGE_TMPPATH },
 	{ "tty",		PLEDGE_TTY },
 	{ "unix",		PLEDGE_UNIX },
 	{ "unveil",		PLEDGE_UNVEIL },
@@ -500,7 +498,7 @@ sys_pledge(struct proc *p, void *v, register_t *retval)
 		atomic_setbits_int(&pr->ps_flags, PS_PLEDGE);
 
 		if ((pr->ps_pledge & (PLEDGE_RPATH | PLEDGE_WPATH |
-		    PLEDGE_CPATH | PLEDGE_DPATH | PLEDGE_TMPPATH | PLEDGE_EXEC |
+		    PLEDGE_CPATH | PLEDGE_DPATH | PLEDGE_EXEC |
 		    PLEDGE_UNIX | PLEDGE_UNVEIL)) == 0)
 			unveil_cleanup = 1;
 	}
@@ -589,11 +587,9 @@ pledge_fail(struct proc *p, int error, uint64_t code)
  * without the right flags set
  */
 int
-pledge_namei(struct proc *p, struct nameidata *ni, char *origpath)
+pledge_namei(struct proc *p, struct nameidata *ni, char *path)
 {
-	char path[PATH_MAX];
 	uint64_t pledge;
-	int error;
 
 	if ((p->p_p->ps_flags & PS_PLEDGE) == 0 ||
 	    (p->p_p->ps_flags & PS_COREDUMP))
@@ -611,29 +607,6 @@ pledge_namei(struct proc *p, struct nameidata *ni, char *origpath)
 	/* Doing a permitted execve() */
 	if ((ni->ni_pledge & PLEDGE_EXEC) && (pledge & PLEDGE_EXEC))
 		return (0);
-
-	error = canonpath(origpath, path, sizeof(path));
-	if (error)
-		return (error);
-
-	/* Detect what looks like a mkstemp(3) family operation */
-	if ((pledge & PLEDGE_TMPPATH) &&
-	    (p->p_pledge_syscall == SYS_open) &&
-	    (ni->ni_pledge & PLEDGE_CPATH) &&
-	    strncmp(path, "/tmp/", sizeof("/tmp/") - 1) == 0) {
-		ni->ni_cnd.cn_flags |= BYPASSUNVEIL;
-		return (0);
-	}
-
-	/* Allow unlinking of a mkstemp(3) file...
-	 * Good opportunity for strict checks here.
-	 */
-	if ((pledge & PLEDGE_TMPPATH) &&
-	    (p->p_pledge_syscall == SYS_unlink) &&
-	    strncmp(path, "/tmp/", sizeof("/tmp/") - 1) == 0) {
-		ni->ni_cnd.cn_flags |= BYPASSUNVEIL;
-		return (0);
-	}
 
 	/* Whitelisted paths */
 	switch (p->p_pledge_syscall) {
@@ -705,6 +678,13 @@ pledge_namei(struct proc *p, struct nameidata *ni, char *origpath)
 		if ((ni->ni_pledge == PLEDGE_RPATH) &&
 		    strncmp(path, "/usr/share/zoneinfo/",
 		    sizeof("/usr/share/zoneinfo/") - 1) == 0)  {
+			const char *cp;
+
+			for (cp = path + sizeof("/usr/share/zoneinfo/") - 2;
+			    *cp; cp++)
+				if (cp[0] == '/' && cp[1] == '.' && cp[2] == '.' &&
+				    (cp[3] == '/' || cp[3] == '\0'))
+					goto nozoneinfo;
 			ni->ni_cnd.cn_flags |= BYPASSUNVEIL;
 			return (0);
 		}
@@ -713,7 +693,7 @@ pledge_namei(struct proc *p, struct nameidata *ni, char *origpath)
 			ni->ni_cnd.cn_flags |= BYPASSUNVEIL;
 			return (0);
 		}
-
+nozoneinfo:
 		break;
 	case SYS_stat:
 		/* XXX go library stats /etc/hosts, remove this soon */
@@ -1609,45 +1589,4 @@ pledge_protexec(struct proc *p, int prot)
 	if (!(p->p_pledge & PLEDGE_PROTEXEC) && (prot & PROT_EXEC))
 		return pledge_fail(p, EPERM, PLEDGE_PROTEXEC);
 	return 0;
-}
-
-int
-canonpath(const char *input, char *buf, size_t bufsize)
-{
-	const char *p;
-	char *q;
-
-	/* can't canon relative paths, don't bother */
-	if (input[0] != '/') {
-		if (strlcpy(buf, input, bufsize) >= bufsize)
-			return ENAMETOOLONG;
-		return 0;
-	}
-
-	p = input;
-	q = buf;
-	while (*p && (q - buf < bufsize)) {
-		if (p[0] == '/' && (p[1] == '/' || p[1] == '\0')) {
-			p += 1;
-
-		} else if (p[0] == '/' && p[1] == '.' &&
-		    (p[2] == '/' || p[2] == '\0')) {
-			p += 2;
-
-		} else if (p[0] == '/' && p[1] == '.' && p[2] == '.' &&
-		    (p[3] == '/' || p[3] == '\0')) {
-			p += 3;
-			if (q != buf)	/* "/../" at start of buf */
-				while (*--q != '/')
-					continue;
-
-		} else {
-			*q++ = *p++;
-		}
-	}
-	if ((*p == '\0') && (q - buf < bufsize)) {
-		*q = 0;
-		return 0;
-	} else
-		return ENAMETOOLONG;
 }
