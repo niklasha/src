@@ -1,4 +1,4 @@
-/*	$OpenBSD: ikev2.c,v 1.394 2025/07/31 19:02:43 pascal Exp $	*/
+/*	$OpenBSD: ikev2.c,v 1.394.2.1 2026/04/01 20:02:24 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -713,7 +713,7 @@ ikev2_recv(struct iked *env, struct iked_message *msg)
 	}
 
 	if (msg->msg_response) {
-		if (msg->msg_msgid > sa->sa_reqid) {
+		if (msg->msg_msgid + 1 != sa->sa_reqid) {
 			ikestat_inc(env, ikes_msg_rcvd_dropped);
 			return;
 		}
@@ -4452,6 +4452,9 @@ ikev2_init_create_child_sa(struct iked *env, struct iked_message *msg)
 	uint32_t			 spi32;
 	int				 pfs = 0, ret = -1;
 
+	if (!sa_stateok(sa, IKEV2_STATE_ESTABLISHED))
+		return -1;
+
 	if (!ikev2_msg_frompeer(msg) ||
 	    (sa->sa_stateflags & (IKED_REQ_CHILDSA|IKED_REQ_INF)) == 0)
 		return (0);
@@ -4916,6 +4919,9 @@ ikev2_resp_create_child_sa(struct iked *env, struct iked_message *msg)
 	int				 initiator, protoid, rekeying = 1;
 	int				 ret = -1;
 	int				 pfs = 0;
+
+	if (!sa_stateok(sa, IKEV2_STATE_ESTABLISHED))
+		return -1;
 
 	initiator = sa->sa_hdr.sh_initiator ? 1 : 0;
 
