@@ -1,4 +1,4 @@
-dnl	$OpenBSD: prep,v 1.7 2026/04/20 21:35:08 jca Exp $
+dnl	$OpenBSD: prep,v 1.8 2026/04/20 21:38:55 jca Exp $
 Please be aware that OpenBSD support for this platform is far from
 complete, however progress is being made.
 
@@ -45,3 +45,18 @@ QEMU with OpenSBI and U-Boot
 
 OpenBSD can be installed onto a disk by copying the miniroot for your
 board "miniroot{:--:}OSrev.img" image to an SD card.
+
+Orange Pi RV2, BananaPi F3 and Milk-V Jupiter
+
+Both the F3 and the Jupiter boards need a device tree newer that what is
+provided with stock u-boot. Such a device tree is automatically provided
+on the install media but should also be installed on the target system
+by fw_update(8), so make sure your board has network access during
+install.
+
+At least on the Milk-V Jupiter, the default U-Boot image on the SPI
+flash doesn't support booting from USB.  Writing a miniroot image to a
+uSD card is the easiest way to get a working installer (see above):
+
+	=> load mmc 0:1 ${kernel_addr_r} efi/boot/bootriscv64.efi
+	=> bootefi ${kernel_addr_r}
