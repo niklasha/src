@@ -1,4 +1,4 @@
-/*	$OpenBSD: spamd.c,v 1.164 2026/04/02 17:23:04 deraadt Exp $	*/
+/*	$OpenBSD: spamd.c,v 1.165 2026/04/21 14:44:29 millert Exp $	*/
 
 /*
  * Copyright (c) 2015 Henning Brauer <henning@openbsd.org>
@@ -471,11 +471,11 @@ int
 append_error_string(struct con *cp, size_t off, char *fmt, int af, void *ia)
 {
 	char sav = '\0';
-	static int lastcont = 0;
+	static size_t lastcont = 0;
 	char *c = cp->obuf + off;
 	char *s = fmt;
 	size_t len = cp->osize - off;
-	int i = 0;
+	size_t i = 0;
 
 	if (off == 0)
 		lastcont = 0;
@@ -490,21 +490,21 @@ append_error_string(struct con *cp, size_t off, char *fmt, int af, void *ia)
 	while (*s) {
 		/*
 		 * Make sure we at minimum, have room to add a
-		 * format code (4 bytes), and a v6 address(39 bytes)
-		 * and a byte saved in sav.
+		 * format code (4 bytes), a v6 address(39 bytes),
+		 * a byte saved in sav and the NUL terminator.
 		 */
-		if (i >= len - 46) {
+		if (len <= i + 46) {
 			c = grow_obuf(cp, off);
 			if (c == NULL)
 				return (-1);
-			len = cp->osize - (off + i);
+			len = cp->osize - off;
 		}
 
 		if (c[i-1] == '\n') {
 			if (lastcont != 0)
 				cp->obuf[lastcont] = '-';
-			snprintf(c + i, len, "%s ", nreply);
-			i += strlen(c);
+			snprintf(c + i, len - i, "%s ", nreply);
+			i += strlen(c + i);
 			lastcont = off + i - 1;
 		}
 
