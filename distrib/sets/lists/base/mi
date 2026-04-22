@@ -322,6 +322,8 @@
 ./etc/signify/baseline-41-pkg.pub
 ./etc/signify/baseline-42-base.pub
 ./etc/signify/baseline-42-pkg.pub
+./etc/signify/baseline-43-base.pub
+./etc/signify/baseline-43-pkg.pub
 ./etc/signify/openbsd-72-base.pub
 ./etc/signify/openbsd-72-fw.pub
 ./etc/signify/openbsd-72-pkg.pub
