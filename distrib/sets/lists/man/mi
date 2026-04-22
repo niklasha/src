@@ -2812,6 +2812,7 @@
 ./usr/share/man/man8/release.8
 ./usr/share/man/man8/renice.8
 ./usr/share/man/man8/repquota.8
+./usr/share/man/man8/resize_ffs.8
 ./usr/share/man/man8/resolvd.8
 ./usr/share/man/man8/restore.8
 ./usr/share/man/man8/revnetgroup.8
