@@ -3009,6 +3009,7 @@
 ./usr/sbin/relayctl
 ./usr/sbin/relayd
 ./usr/sbin/repquota
+./usr/sbin/resize_ffs
 ./usr/sbin/revnetgroup
 ./usr/sbin/ripctl
 ./usr/sbin/ripd

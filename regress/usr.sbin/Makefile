@@ -13,6 +13,7 @@ SUBDIR += ocspcheck
 SUBDIR += ospfd
 SUBDIR += ospf6d
 SUBDIR += relayd
+SUBDIR += resize_ffs
 SUBDIR += rpki-client
 SUBDIR += snmpd
 SUBDIR += syslogd
