@@ -1,0 +1,106 @@
+.\"	$OpenBSD$
+.\"
+.Dd $Mdocdate: April 22 2026 $
+.Dt RESIZE_FFS 8
+.Os
+.Sh NAME
+.Nm resize_ffs
+.Nd resize an FFS file system with journaled recovery support
+.Sh SYNOPSIS
+.Nm
+.Op Cm --offset Ar bytes
+.Op Cm --size Ar bytes
+.Op Cm --policy Ar truncate | shrink-move | push-forward
+.Op Cm --shrink-side Ar end | beginning
+.Op Cm --journal Ar path
+.Op Cm --moves Ar path
+.Op Cm --dry-run
+.Op Cm --recover
+.Op Cm --revert
+.Op Cm --resume
+.Op Cm --force
+.Op Cm --progress
+.Op Cm --check-invariants
+.Op Cm --verbose
+.Ar target
+.Sh DESCRIPTION
+The
+.Nm
+utility resizes an existing
+.Xr ffs 7
+file system stored in
+.Ar target .
+It can grow a file system, shrink it by relocating live data, and maintain a
+journal that supports replay, resume, and revert operations if the resize is
+interrupted.
+.Pp
+The following options are available:
+.Bl -tag -width "--check-invariants"
+.It Cm --offset Ar bytes
+Specify the offset of the file system inside
+.Ar target .
+The default is zero.
+.It Cm --size Ar bytes
+Resize the file system to
+.Ar bytes .
+If omitted, the size is inferred from the containing partition or file.
+.It Cm --policy Ar truncate | shrink-move | push-forward
+Select the resize policy.
+.Cm truncate
+is the default.
+.Cm shrink-move
+shrinks the file system and shifts it upward inside the containing image.
+.Cm push-forward
+is reserved for future use and is currently only accepted for non-shrinking
+operations.
+.It Cm --shrink-side Ar end | beginning
+Compatibility alias for selecting the shrink policy.
+.It Cm --journal Ar path
+Store journal state in
+.Ar path .
+The default is
+.Pa ./resize.journal .
+.It Cm --moves Ar path
+Load an explicit relocation plan from
+.Ar path
+instead of generating one automatically.
+.It Cm --dry-run
+Print the planned resize operation without modifying the target.
+.It Cm --recover
+Replay any unapplied journal records and stop.
+.It Cm --revert
+Undo reversible journaled changes in reverse order and reset the journal.
+.It Cm --resume
+Replay pending journal records and attempt to finish a partially completed
+resize.
+.It Cm --force
+Continue past certain planning failures that would otherwise abort the
+operation.
+.It Cm --progress
+Display progress while relocation or shift work is running.
+.It Cm --check-invariants
+Run additional on-disk consistency checks after each mutating phase.
+.It Cm --verbose
+Print additional progress and planning information.
+.El
+.Pp
+Before resizing a file system inside a disk partition, adjust the partition
+geometry first with
+.Xr disklabel 8 .
+The
+.Nm
+utility is intended for offline use on unmounted file systems.
+.Sh FILES
+.Bl -tag -width "./resize.journal"
+.It Pa ./resize.journal
+Default journal path.
+.El
+.Sh SEE ALSO
+.Xr fsck_ffs 8 ,
+.Xr growfs 8 ,
+.Xr newfs 8 ,
+.Xr tunefs 8
+.Sh CAVEATS
+Running
+.Nm
+against a mounted file system is not supported.
