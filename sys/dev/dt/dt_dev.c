@@ -22,6 +22,7 @@
 #include <sys/clockintr.h>
 #include <sys/device.h>
 #include <sys/exec_elf.h>
+#include <sys/timeout.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/ptrace.h>
@@ -88,7 +89,7 @@
 #define DT_FA_PROFILE	0
 #endif
 
-#define DT_EVTRING_SIZE	16	/* # of slots in per PCB event ring */
+#define DT_EVTRING_SIZE	256	/* # of slots in per PCB event ring */
 
 #define DPRINTF(x...) /* nothing */
 
@@ -136,6 +137,8 @@ struct dt_softc {
 
 	struct dt_cpubuf	 ds_cpu[MAXCPUS]; /* [I] Per-cpu event states */
 	unsigned int		 ds_lastcpu;	/* [r] last CPU ring read(2). */
+
+	struct timeout		 ds_drain;	/* [D] periodic ring drainer */
 };
 
 SLIST_HEAD(, dt_softc) dtdev_list;	/* [K] list of open /dev/dt nodes */
@@ -175,6 +178,7 @@ int	dt_ring_copy(struct dt_cpubuf *, struct uio *, size_t, size_t *);
 
 void	dt_wakeup(struct dt_softc *);
 void	dt_deferred_wakeup(void *);
+void	dt_drain_cb(void *);
 
 void
 dtattach(int count)
@@ -385,6 +389,8 @@ dtalloc(void)
 		return NULL;
 	}
 
+	timeout_set(&sc->ds_drain, dt_drain_cb, sc);
+
 	return sc;
 }
 
@@ -557,6 +563,7 @@ dt_ioctl_record_start(struct dt_softc *sc)
 	}
 	sc->ds_recording = 1;
 	dt_tracing++;
+	timeout_add_msec(&sc->ds_drain, 10);
 
  out:
 	rw_exit_write(&dt_lock);
@@ -578,6 +585,7 @@ dt_ioctl_record_stop(struct dt_softc *sc)
 
 	dt_tracing--;
 	sc->ds_recording = 0;
+	timeout_del_barrier(&sc->ds_drain);
 	TAILQ_FOREACH(dp, &sc->ds_pcbs, dp_snext) {
 		struct dt_probe *dtp = dp->dp_dtp;
 
@@ -875,8 +883,6 @@ dt_pcb_ring_consume(struct dt_pcb *dp, struct dt_evt *dtev)
 
 	atomic_inc_int(&dp->dp_sc->ds_evtcnt);
 	dc->dc_inevt = 0;
-
-	dt_wakeup(dp->dp_sc);
 }
 
 /*
@@ -945,6 +951,24 @@ dt_wakeup(struct dt_softc *sc)
 	 * interrupt to defer the wakeup.
 	 */
 	softintr_schedule(sc->ds_si);
+}
+
+/*
+ * Periodic ring drainer.  Runs at IPL_SOFTCLOCK from timeout(9).
+ * Wakes the reader iff at least one event is pending; re-arms while
+ * recording.  This replaces the per-probe softintr_schedule() that
+ * dt_pcb_ring_consume() used to call, which became a fatal storm at
+ * sustained probe rates above ~50 k/sec on SMP hosts.
+ */
+void
+dt_drain_cb(void *arg)
+{
+	struct dt_softc *sc = arg;
+
+	if (atomic_load_int(&sc->ds_evtcnt) > 0)
+		wakeup(sc);
+	if (sc->ds_recording)
+		timeout_add_msec(&sc->ds_drain, 10);
 }
 
 void
