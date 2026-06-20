@@ -69,8 +69,23 @@ enum x86_opcode_type {
 	OP_INS,
 	OP_MOV,
 	OP_MOVZX,
+	OP_MOVSX,
 	OP_OUT,
 	OP_OUTS,
+	OP_TEST,
+	OP_ADD,
+	OP_OR,
+	OP_AND,
+	OP_SUB,
+	OP_XOR,
+	OP_CMP,
+	OP_XCHG,
+	OP_BTS,
+	OP_BTR,
+	OP_BTC,
+	OP_BT,
+	OP_GROUP1,		/* 0x81/0x83: resolved to ALU op after ModRM */
+	OP_BT_GROUP,		/* 0x0F BA: resolved to BT* after ModRM */
 	OP_TWO_BYTE,		/* Opcode is two bytes, not one. */
 	OP_UNSUPPORTED,		/* Valid decode, but no current support. */
 };
@@ -122,6 +137,9 @@ struct x86_insn {
 	int			insn_reg;		/* Register */
 
 	uint8_t			insn_sib;		/* Scale-Index-Base */
+#define SIB_SCALE(x)		(((x) >> 6) & 0x3)
+#define SIB_INDEX(x)		(((x) >> 3) & 0x7)
+#define SIB_BASE(x)		(((x) >> 0) & 0x7)
 	uint8_t			insn_sib_valid;		/* SIB byte set? */
 
 	uint64_t		insn_disp;		/* Displacement */
@@ -133,5 +151,18 @@ struct x86_insn {
 
 int	insn_decode(struct vm_exit *, struct x86_insn *);
 int	insn_emulate(struct vm_exit *, struct x86_insn *);
+
+/* From x86_vm.c -- walks guest page tables to translate GVA to GPA. */
+int	translate_gva(struct vm_exit *, uint64_t, uint64_t *, int);
+
+/*
+ * Register a MMIO handler for a GPA range.  Used by LAPIC/IOAPIC and
+ * any other device that needs to trap MMIO accesses from the guest.
+ * Returns 0 on success, -1 if the per-VM handler table is full.
+ */
+int	mmio_register(uint64_t, uint64_t,
+	    int (*)(uint64_t, uint8_t, uint64_t *, void *),
+	    int (*)(uint64_t, uint8_t, uint64_t, void *),
+	    void *);
 
 #endif /* _MMIO_H_ */
