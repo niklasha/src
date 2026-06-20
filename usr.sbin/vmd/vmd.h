@@ -50,6 +50,10 @@
 #define MB(x)	(x * 1024UL * 1024UL)
 #define GB(x)	(x * 1024UL * 1024UL * 1024UL)
 
+/* Debug-only SMP trace; each including .c file must have "env" in scope. */
+#define DPRINTF_SMP(x...)						\
+	do { if (env->vmd_verbose >= 2) log_warnx(x); } while (0)
+
 #define VMD_USER		"_vmd"
 #define VMD_CONF		"/etc/vm.conf"
 #define SOCKET_NAME		"/var/run/vmd.sock"
@@ -150,11 +154,20 @@ enum imsg_type {
 	IMSG_DEVOP_HOSTMAC,
 	IMSG_DEVOP_MSG,
 	IMSG_DEVOP_VIONET_MSG,
+	/*
+	 * PROC_VMM -> VM child: operator force-stop (vmctl stop -f).  Added at
+	 * the END of the enum so no existing value shifts (the IMSG_VMDOP_*
+	 * values are on the vmctl<->vmd wire; a mid-enum insert would break an
+	 * un-rebuilt vmctl).  Internal PROC_VMM<->child only; vmctl never sends
+	 * it, so no vmctl rebuild is required.
+	 */
+	IMSG_VMDOP_VM_TERMINATE,
 };
 
 struct vmop_result {
 	int			 vmr_result;
 	uint32_t		 vmr_id;
+	uint32_t		 vmr_generation;
 	pid_t			 vmr_pid;
 	char			 vmr_ttyname[VM_TTYNAME_MAX];
 };
@@ -217,6 +230,7 @@ enum vm_disk_fmt {
 struct vmop_create_params {
 	/* vm identifying information */
 	uint32_t		 vmc_id;
+	uint32_t		 vmc_generation; /* per-launch instance gen */
 	char			 vmc_name[VMM_MAX_NAME_LEN];
 	struct vmop_owner	 vmc_owner;
 
@@ -309,6 +323,7 @@ struct vmd_vm {
 	uid_t			 vm_uid;
 	uint32_t		 vm_vmid;	/* vmd(8) identifier */
 	uint32_t		 vm_vmmid;	/* vmm(4) identifier */
+	uint32_t		 vm_generation;	/* per-launch instance gen */
 	uint32_t		 vm_peerid;
 
 	/* AMD SEV features */
@@ -341,12 +356,20 @@ struct vmd_vm {
 #define VM_STATE_DISABLED	0x02
 /* When set, VM is marked to be shut down */
 #define VM_STATE_SHUTDOWN	0x04
+/*
+ * When set, an operator stop is in flight; sticky, guest reboot cannot clear
+ * (PROC_VMM)
+ */
+#define VM_STATE_TERMINATE	0x08
 #define VM_STATE_PAUSED		0x10
 #define VM_STATE_WAITING	0x20
 
 	/* For rate-limiting */
 	struct timeval		 vm_start_tv;
 	int			 vm_start_limit;
+
+	/* Set during GET_INFO to deduplicate PROC_VMM + PARENT responses */
+	int			 vm_reported;
 
 	TAILQ_ENTRY(vmd_vm)	 vm_entry;
 };
@@ -403,6 +426,8 @@ struct vmd {
 	int			 vmd_noaction;
 
 	uint32_t		 vmd_nvm;
+	/* monotonic launch generation */
+	uint32_t		 vmd_gen;
 	struct vmlist		*vmd_vms;
 	struct name2idlist	*vmd_known;
 	uint32_t		 vmd_nswitches;
@@ -536,15 +561,6 @@ int	 intr_ack(struct vmd_vm *, uint32_t);
 int	 intr_pending(struct vmd_vm *, uint32_t);
 int	 intr_pending_nofire(struct vmd_vm *, uint32_t);
 void	 intr_unack(struct vmd_vm *, uint32_t, uint8_t);
-int	 vcpu_sipi_pending(uint32_t, uint32_t);
-int	 lapic_smp_init(uint32_t, uint32_t);
-int	 lapic_smp_timer_start(void);
-void	 lapic_smp_timer_stop(void);
-void	 lapic_smp_free(void);
-void	 lapic_smp_deliver_ipi(uint32_t, uint8_t);
-struct lapic *lapic_smp_get(uint32_t);
-uint32_t lapic_smp_ncpus(void);
-struct ioapic *lapic_smp_ioapic(void);
 void	 intr_toggle_el(struct vmd_vm *, int, int);
 void	 vcpu_assert_irq(uint32_t, uint32_t, int);
 void	 vcpu_deassert_irq(uint32_t, uint32_t, int);
@@ -562,6 +578,7 @@ void	 vcpu_halt(uint32_t);
 void	 vcpu_unhalt(uint32_t);
 void	 vcpu_signal_run(uint32_t);
 int 	 vcpu_intr(uint32_t, uint32_t, uint8_t);
+int	 vcpu_sipi_pending(uint32_t, uint32_t);
 void	 vm_main(int, int);
 void	 mutex_lock(pthread_mutex_t *);
 void	 mutex_unlock(pthread_mutex_t *);
@@ -574,6 +591,13 @@ int	 write_mem(paddr_t, const void *buf, size_t);
 int	 remap_guest_mem(struct vmd_vm *, int);
 __dead void vm_shutdown(unsigned int);
 
+/* lapic_smp.c */
+int	 lapic_smp_init(uint32_t, uint32_t);
+int	 lapic_smp_timer_start(void);
+void	 lapic_smp_timer_stop(void);
+void	 lapic_smp_free(void);
+void	 lapic_smp_deliver_ipi(uint32_t, uint8_t);
+
 /* config.c */
 int	 config_init(struct vmd *);
 void	 config_purge(struct vmd *, unsigned int);
@@ -581,7 +605,8 @@ int	 config_setconfig(struct vmd *);
 int	 config_getconfig(struct vmd *, struct imsg *);
 int	 config_setreset(struct vmd *, unsigned int);
 int	 config_setvm(struct privsep *, struct vmd_vm *, uint32_t, uid_t);
-int	 config_getvm(struct privsep *, struct imsg *);
+int	 config_getvm(struct privsep *, struct imsg *,
+	    struct vmop_create_params *);
 int	 config_getdisk(struct privsep *, struct imsg *);
 int	 config_getif(struct privsep *, struct imsg *);
 int	 config_getcdrom(struct privsep *, struct imsg *);
