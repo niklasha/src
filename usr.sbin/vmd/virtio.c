@@ -59,13 +59,6 @@ struct virtio_dev viornd;
 struct virtio_dev *vioscsi = NULL;
 struct virtio_dev vmmci;
 
-/*
- * Serializes synchronous PCI IO with a mutex. This will need to be
- * revisited when vmd supports SMP to allow more than one VCPU to
- * process synchronous PCI IO messages.
- */
-pthread_mutex_t vcpu_sync_mtx;
-
 /* Guards the in-process entropy device state. */
 static pthread_mutex_t viornd_mtx;
 
@@ -332,6 +325,11 @@ viornd_notifyq(struct virtio_dev *dev, uint16_t idx)
 	aidx = avail->idx & vq_info->mask;
 	uidx = used->idx & vq_info->mask;
 
+	/*
+	 * virtio device read barrier: observe avail->idx before reading
+	 * the ring slot/descriptor (SMP stale-read guard).
+	 */
+	__sync_synchronize();
 	dxx = avail->ring[aidx] & vq_info->mask;
 
 	sz = desc[dxx].len;
@@ -468,6 +466,23 @@ virtio_io_cfg(struct virtio_dev *dev, int dir, uint8_t reg, uint32_t data,
 				/* Reset device and virtqueues (if any). */
 				dev->driver_feature = 0;
 				dev->isr = 0;
+
+				/*
+				 * A reset must lower the interrupt line.
+				 * After reset the guest will not read the ISR
+				 * register, so without an explicit deassert
+				 * the level line would stay asserted if a
+				 * completion was in service, presenting as a
+				 * false interrupt source.  Mirror vionet's
+				 * reset deassert.  Only multi-process devices
+				 * (vioblk/vioscsi reach this shared path) own
+				 * an async KICK channel; in-process devices
+				 * (entropy, vmmci) keep async_fd == -1 and
+				 * raise no level line here, so scope the
+				 * deassert to them.
+				 */
+				if (dev->async_fd != -1)
+					virtio_deassert_irq(dev, 0);
 
 				pci_cfg->queue_select = 0;
 				virtio_update_qs(dev);
@@ -1042,9 +1057,6 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 
 	SLIST_INIT(&virtio_devs);
 
-	if (pthread_mutex_init(&vcpu_sync_mtx, NULL) != 0)
-		fatalx("%s: could not initialize sync io mutex", __func__);
-
 	ret = pthread_mutex_init(&viornd_mtx, NULL);
 	if (ret) {
 		errno = ret;
@@ -1581,6 +1593,7 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 
 		/* Set the channel fds to the child's before sending. */
 		dev->sync_fd = sync_fds[1];
+		pthread_mutex_init(&dev->sync_mtx, NULL);
 		dev->async_fd = async_fds[1];
 
 		/* 1. Send over our configured device. */
@@ -1866,7 +1879,7 @@ virtio_pci_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
 	struct viodev_msg msg;
 	int ret = 0;
 
-	mutex_lock(&vcpu_sync_mtx);
+	mutex_lock(&dev->sync_mtx);
 
 	memset(&msg, 0, sizeof(msg));
 	msg.reg = reg;
@@ -1927,13 +1940,17 @@ virtio_pci_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
 			    virtio_reg_name(msg.reg));
 			*data = msg.data;
 			/*
-			 * It's possible we're asked to {de,}assert after the
-			 * device performs a register read.
+			 * The synchronous reply carries DATA ONLY and never
+			 * mutates the device's IOAPIC line.  Every line op
+			 * (assert AND the ISR-read deassert) is emitted by the
+			 * device on its async KICK channel and applied by the
+			 * VM process event-loop thread (handle_dev_msg),
+			 * making that thread the sole, in-order mutator of the
+			 * line.  This removes an assert(async)/deassert(sync)
+			 * cross-thread reorder on the level line: a coalesced
+			 * completion can no longer be clobbered by a stale
+			 * deassert running on the vcpu thread.
 			 */
-			if (msg.state == INTR_STATE_ASSERT)
-				vcpu_assert_irq(dev->vmm_id, msg.vcpu, msg.irq);
-			else if (msg.state == INTR_STATE_DEASSERT)
-				vcpu_deassert_irq(dev->vmm_id, msg.vcpu, msg.irq);
 		} else {
 			log_warnx("%s: expected IO_READ, got %d", __func__,
 			    msg.type);
@@ -1944,7 +1961,7 @@ virtio_pci_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
 
 	ret = 0;
 out:
-	mutex_unlock(&vcpu_sync_mtx);
+	mutex_unlock(&dev->sync_mtx);
 	return (ret);
 }
 
