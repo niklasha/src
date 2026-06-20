@@ -134,4 +134,16 @@ struct x86_insn {
 int	insn_decode(struct vm_exit *, struct x86_insn *);
 int	insn_emulate(struct vm_exit *, struct x86_insn *);
 
+/*
+ * Register a MMIO handler for a GPA range.  Used by LAPIC/IOAPIC and
+ * any other device that needs to trap MMIO accesses from the guest.
+ * Returns 0 on success, -1 if the per-VM handler table is full.
+ */
+int	mmio_register(uint64_t base, uint64_t size,
+	    int (*read)(uint64_t off, uint8_t bytes, uint64_t *val,
+		void *cookie),
+	    int (*write)(uint64_t off, uint8_t bytes, uint64_t val,
+		void *cookie),
+	    void *cookie);
+
 #endif /* _MMIO_H_ */
