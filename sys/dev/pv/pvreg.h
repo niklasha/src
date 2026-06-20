@@ -38,7 +38,11 @@
 #define	KVM_FEATURE_STEAL_TIME			5
 #define	KVM_FEATURE_PV_EOI			6
 #define	KVM_FEATURE_PV_UNHALT			7
+#define	KVM_FEATURE_PV_IPI			11
 #define	KVM_FEATURE_CLOCKSOURCE_STABLE_BIT	24
+
+/* KVM hypercall numbers */
+#define	KVM_HC_SEND_IPI				10
 
 #define	KVM_MSR_EOI_EN				0x4b564d04
 #define KVM_PV_EOI_BIT				0
