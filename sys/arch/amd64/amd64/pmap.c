@@ -1161,6 +1161,19 @@ pmap_freepage(struct pmap *pmap, struct vm_page *ptp, int level,
 	TAILQ_INSERT_TAIL(pagelist, ptp, pageq);
 }
 
+/* count the valid entries framed by a page-table page */
+int
+pmap_ptp_popcnt(struct vm_page *ptp)
+{
+	pt_entry_t *body = (pt_entry_t *)PMAP_DIRECT_MAP(VM_PAGE_TO_PHYS(ptp));
+	int i, n = 0;
+
+	for (i = 0; i < PAGE_SIZE / (int)sizeof(pt_entry_t); i++)
+		if (pmap_valid_entry(body[i]))
+			n++;
+	return (n);
+}
+
 void
 pmap_free_ptp(struct pmap *pmap, struct vm_page *ptp, vaddr_t va,
     struct pg_to_free *pagelist)
@@ -1187,7 +1200,13 @@ pmap_free_ptp(struct pmap *pmap, struct vm_page *ptp, vaddr_t va,
 		    pmap_is_curpmap(curpcb->pcb_pmap));
 		if (level < PTP_LEVELS - 1) {
 			ptp = pmap_find_ptp(pmap, va, (paddr_t)-1, level + 1);
-			ptp->wire_count--;
+			/*
+			 * a wrong/recycled parent must not be driven below its
+			 * real child count
+			 */
+			if (ptp != NULL && (int)ptp->wire_count >
+			    1 + pmap_ptp_popcnt(ptp))
+				ptp->wire_count--;
 			if (ptp->wire_count > 1)
 				break;
 		}
@@ -1240,8 +1259,11 @@ pmap_get_ptp(struct pmap *pmap, vaddr_t va)
 		if (ptp == NULL)
 			return NULL;
 
+		/*
+		 * the allocator can hand back a still-populated recycled page
+		 */
 		atomic_clearbits_int(&ptp->pg_flags, PG_BUSY);
-		ptp->wire_count = 1;
+		ptp->wire_count = 1 + pmap_ptp_popcnt(ptp);
 		pmap->pm_ptphint[i - 2] = ptp;
 		pa = VM_PAGE_TO_PHYS(ptp);
 		pva[index] = (pd_entry_t) (pa | PG_u | PG_RW | PG_V | pg_crypt);
@@ -1445,6 +1467,7 @@ pmap_destroy(struct pmap *pmap)
 		while ((pg = RBT_ROOT(uvm_objtree,
 		    &pmap->pm_obj[i].memt)) != NULL) {
 			KASSERT((pg->pg_flags & PG_BUSY) == 0);
+
 
 			pg->wire_count = 0;
 			pmap->pm_stats.resident_count--;
@@ -2025,7 +2048,11 @@ pmap_page_remove(struct vm_page *pg)
 		pmap_sync_flags_pte(pg, opte);
 
 		/* update the PTP reference count.  free if last reference. */
-		if (pve->pv_ptp != NULL) {
+		/*
+		 * a stale pv entry leaves no PTE; nothing was unmapped to
+		 * account for
+		 */
+		if (pmap_valid_entry(opte) && pve->pv_ptp != NULL) {
 			pve->pv_ptp->wire_count--;
 			if (pve->pv_ptp->wire_count <= 1) {
 				pmap_free_ptp(pve->pv_pmap, pve->pv_ptp,
