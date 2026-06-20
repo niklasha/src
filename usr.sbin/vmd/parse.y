@@ -119,7 +119,7 @@ typedef struct {
 
 
 %token	INCLUDE ERROR
-%token	ADD AGENTX ALLOW BOOT CDROM CONTEXT DEVICE DISABLE DISK DOWN ENABLE
+%token	ADD AGENTX ALLOW BOOT CDROM CONTEXT CPUS DEVICE DISABLE DISK DOWN ENABLE
 %token	FORMAT GROUP
 %token	INET6 INSTANCE INTERFACE LLADDR LOCAL LOCKED MEMORY NET NIFS OWNER
 %token	PATH PREFIX RDOMAIN SIZE SOCKET SWITCH UP VM VMID STAGGERED START
@@ -515,6 +515,16 @@ vm_opts		: disable			{
 			vmc.vmc_nnics = (size_t)$2;
 			vmc.vmc_flags |= VMOP_CREATE_NETWORK;
 		}
+		| CPUS NUMBER			{
+			if ($2 < 1 || $2 > VMM_MAX_VCPUS_PER_VM) {
+				yyerror("invalid number of cpus: %lld "
+				    "(must be 1..%d)", $2,
+				    VMM_MAX_VCPUS_PER_VM);
+				YYERROR;
+			}
+			vmc.vmc_ncpus = (uint32_t)$2;
+			vmc.vmc_flags |= VMOP_CREATE_CPU;
+		}
 		| MEMORY NUMBER			{
 			ssize_t	 res;
 			if (vmc.vmc_memranges[0].vmr_size != 0) {
@@ -559,6 +569,7 @@ instance_l	: instance_flags optcommanl instance_l
 		;
 
 instance_flags	: BOOT		{ vmc.vmc_insflags |= VMOP_CREATE_KERNEL; }
+		| CPUS		{ vmc.vmc_insflags |= VMOP_CREATE_CPU; }
 		| MEMORY	{ vmc.vmc_insflags |= VMOP_CREATE_MEMORY; }
 		| INTERFACE	{ vmc.vmc_insflags |= VMOP_CREATE_NETWORK; }
 		| DISK		{ vmc.vmc_insflags |= VMOP_CREATE_DISK; }
@@ -827,6 +838,7 @@ lookup(char *s)
 		{ "boot",		BOOT },
 		{ "cdrom",		CDROM },
 		{ "context",		CONTEXT},
+		{ "cpus",		CPUS },
 		{ "delay",		DELAY },
 		{ "device",		DEVICE },
 		{ "disable",		DISABLE },

@@ -109,10 +109,11 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	int			 res = 0, cmd = IMSG_NONE, verbose;
 	struct vmd_vm		*vm = NULL;
 	struct vm_terminate_params vtp;
+	struct vmop_create_params vmc;
 	struct vmop_id		 vid;
 	struct vmop_result	 vmr;
 	struct vmop_addr_result  var;
-	uint32_t		 id = 0, vm_id, type;
+	uint32_t		 id = 0, vm_id, type, generation = 0;
 	pid_t			 pid, vm_pid = 0;
 	unsigned int		 mode, flags;
 
@@ -122,9 +123,34 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	/* Parent uses peer id to communicate vm id. */
 	vm_id = imsg_get_id(imsg);
 
+	/*
+	 * Capture this launch's generation up front.  The START_VM error
+	 * paths below (config_getvm() and vmm_start_vm() failures) tear
+	 * down the local vm object before the response is composed, and a
+	 * failure response carrying generation 0 would be dropped as stale
+	 * by the parent's gate, wedging the requesting vmctl and leaving a
+	 * phantom running entry in the parent's registry.  For
+	 * START_VM_REQUEST the vm does not exist in this process yet, so
+	 * parse the request payload here and hand it on to config_getvm()
+	 * below: an imsg payload can only be read once.
+	 */
 	switch (type) {
 	case IMSG_VMDOP_START_VM_REQUEST:
-		res = config_getvm(ps, imsg);
+		vmop_create_params_read(imsg, &vmc);
+		generation = vmc.vmc_generation;
+		break;
+	case IMSG_VMDOP_START_VM_CDROM:
+	case IMSG_VMDOP_START_VM_DISK:
+	case IMSG_VMDOP_START_VM_IF:
+	case IMSG_VMDOP_START_VM_END:
+		if ((vm = vm_getbyvmid(vm_id)) != NULL)
+			generation = vm->vm_generation;
+		break;
+	}
+
+	switch (type) {
+	case IMSG_VMDOP_START_VM_REQUEST:
+		res = config_getvm(ps, imsg, &vmc);
 		if (res == -1) {
 			res = errno;
 			cmd = IMSG_VMDOP_START_VM_RESPONSE;
@@ -172,7 +198,29 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		} else if ((vm = vm_getbyvmid(id)) != NULL) {
 			if (flags & VMOP_FORCE) {
 				vtp.vtp_vm_id = vm_vmid2id(vm->vm_vmid, vm);
-				vm->vm_state |= VM_STATE_SHUTDOWN;
+				vm->vm_state |= VM_STATE_SHUTDOWN |
+				    VM_STATE_TERMINATE;
+				/*
+				 * Tell the VM child to terminate itself BEFORE
+				 * we destroy the kernel VM object.  A
+				 * force-stop otherwise leaves the child to
+				 * discover the VM is gone only via a vcpu's
+				 * ENOENT from VMM_IOC_RUN; an idle SMP guest
+				 * whose vcpus are all halted (or one wedged
+				 * in-kernel during teardown) never gets there,
+				 * so vm_terminating is never set and the reaper
+				 * waits forever -- the VM hangs in "stopping"
+				 * (fsleep on the lapic timer thread, which is
+				 * itself never stopped because the reaper never
+				 * returns).  This imsg makes the child set
+				 * vm_terminating reliably: it broadcasts the
+				 * halted vcpus awake AND arms the bounded
+				 * suicide watchdog (_exit after
+				 * VM_TERMINATE_TIMEOUT_SEC) as a backstop for a
+				 * vcpu that cannot leave the kernel.
+				 */
+				(void)imsg_compose_event(&vm->vm_iev,
+				    IMSG_VMDOP_VM_TERMINATE, 0, 0, -1, NULL, 0);
 				(void)terminate_vm(&vtp);
 				res = 0;
 			} else if (!(vm->vm_state & VM_STATE_SHUTDOWN)) {
@@ -185,8 +233,16 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 				 * the triple fault instead of reboot and
 				 * avoid being stuck in the ACPI-less powerdown
 				 * ("press any key to reboot") of the VM.
+				 *
+				 * VM_STATE_TERMINATE records the operator
+				 * stop intent.  It is sticky: a racing
+				 * guest-initiated reboot (IMSG_VMDOP_VM_REBOOT)
+				 * clears VM_STATE_SHUTDOWN but must NOT clear
+				 * this, so the SIGCHLD reaper still suppresses
+				 * respawn and the VM is actually torn down.
 				 */
-				vm->vm_state |= VM_STATE_SHUTDOWN;
+				vm->vm_state |= VM_STATE_SHUTDOWN |
+				    VM_STATE_TERMINATE;
 				if (imsg_compose_event(&vm->vm_iev,
 				    IMSG_VMDOP_VM_REBOOT,
 				    0, 0, -1, NULL, 0) == -1)
@@ -203,12 +259,28 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 					log_debug("%s: no vm running anymore",
 					    __func__);
 					res = VMD_VM_STOP_INVALID;
+				} else {
+					/*
+					 * Child still alive (e.g. SHUTDOWN was
+					 * just cleared by a racing guest
+					 * reboot, or a prior stop already armed
+					 * it).  Re-arm the sticky terminate
+					 * intent so the reaper cannot respawn
+					 * it, and (re)issue the
+					 * reboot/triple-fault.
+					 */
+					vm->vm_state |= VM_STATE_SHUTDOWN |
+					    VM_STATE_TERMINATE;
+					if (imsg_compose_event(&vm->vm_iev,
+					    IMSG_VMDOP_VM_REBOOT,
+					    0, 0, -1, NULL, 0) == -1)
+						res = errno;
+					else
+						res = 0;
 				}
 			}
 		} else {
 			/* VM doesn't exist, cannot stop vm */
-			log_debug("%s: cannot stop vm that is not running",
-			    __func__);
 			res = VMD_VM_STOP_INVALID;
 		}
 		break;
@@ -309,6 +381,17 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		vmr.vmr_result = res;
 		vmr.vmr_id = id;
 		vmr.vmr_pid = vm_pid;
+		/*
+		 * Echo this launch's generation so the PARENT can reject a
+		 * START_VM_RESPONSE that is lagging behind a stop/start of the
+		 * same (sticky) vmid.  For START it was captured up front
+		 * (before any error teardown); otherwise source it from the
+		 * live struct.
+		 */
+		if (generation != 0)
+			vmr.vmr_generation = generation;
+		else if ((vm = vm_getbyvmid(id != 0 ? id : vm_id)) != NULL)
+			vmr.vmr_generation = vm->vm_generation;
 		if (proc_compose_imsg(ps, PROC_PARENT, cmd, vm_id, -1, &vmr,
 		    sizeof(vmr)) == -1)
 			return (-1);
@@ -351,13 +434,30 @@ vmm_sighdlr(int sig, short event, void *arg)
 					 */
 					continue;
 				}
+				if (vm->vm_pid != pid) {
+					log_warnx("%s: pid %d matched vm '%s' "
+					    "but vm->vm_pid=%d, PID reuse, "
+					    "skipping",
+					    __func__, pid,
+					    vm->vm_params.vmc_name,
+					    vm->vm_pid);
+					continue;
+				}
 
 				if (WIFEXITED(status))
 					ret = WEXITSTATUS(status);
 
-				/* Don't reboot on pending shutdown */
+				/*
+				 * Don't reboot on a pending operator stop.
+				 * VM_STATE_TERMINATE is the sticky stop intent
+				 * that a racing guest reboot cannot clear;
+				 * VM_STATE_SHUTDOWN is kept for the plain
+				 * (no-race) stop case.  Either suppresses the
+				 * EAGAIN->respawn so the VM is torn down.
+				 */
 				if (ret == EAGAIN &&
-				    (vm->vm_state & VM_STATE_SHUTDOWN))
+				    (vm->vm_state &
+				    (VM_STATE_SHUTDOWN | VM_STATE_TERMINATE)))
 					ret = 0;
 
 				/* XXX check this */
@@ -372,6 +472,13 @@ vmm_sighdlr(int sig, short event, void *arg)
 				memset(&vmr, 0, sizeof(vmr));
 				vmr.vmr_result = ret;
 				vmr.vmr_id = vm_id2vmid(vm->vm_vmmid, vm);
+				/*
+				 * Echo this instance's launch generation so the
+				 * PARENT can distinguish a lagging terminate
+				 * for an old instance from the live new
+				 * instance that reused the same (sticky) vmid.
+				 */
+				vmr.vmr_generation = vm->vm_generation;
 				if (proc_compose_imsg(ps, PROC_PARENT,
 				    IMSG_VMDOP_TERMINATE_VM_EVENT,
 				    vm->vm_peerid, -1, &vmr, sizeof(vmr)) == -1)
@@ -492,7 +599,17 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 			vm->vm_state |= VM_STATE_SHUTDOWN;
 			break;
 		case IMSG_VMDOP_VM_REBOOT:
-			vm->vm_state &= ~VM_STATE_SHUTDOWN;
+			/*
+			 * Guest asked to reboot.  Honour it by clearing the
+			 * SHUTDOWN marker ONLY if no operator stop is in
+			 * flight.  If VM_STATE_TERMINATE is set, an operator
+			 * 'vmctl stop' is racing this reboot; keep SHUTDOWN so
+			 * the SIGCHLD reaper suppresses respawn and the VM is
+			 * torn down instead of being silently re-launched and
+			 * later orphaned.
+			 */
+			if (!(vm->vm_state & VM_STATE_TERMINATE))
+				vm->vm_state &= ~VM_STATE_SHUTDOWN;
 			break;
 		case IMSG_VMDOP_PAUSE_VM_RESPONSE:
 		case IMSG_VMDOP_UNPAUSE_VM_RESPONSE:
