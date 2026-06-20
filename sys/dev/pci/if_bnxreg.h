@@ -4778,6 +4778,12 @@ struct bnx_softc {
 #define BNX_USING_MSI_FLAG 		0x20
 #define BNX_MFW_ENABLE_FLAG		0x40
 #define BNX_ACTIVE_FLAG			0x80
+#define BNX_KEEP_PHY_UP_FLAG		0x100	/* cf_flags 0x0001: on a port
+						 * with NC-SI mgmt firmware, run
+						 * bnx_init() at attachhook to
+						 * bring the shared-LOM BMC link
+						 * up without waiting for
+						 * netstart */
 
 	/* PHY specific flags. */
 	u_int32_t		bnx_phy_flags;
