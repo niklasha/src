@@ -534,14 +534,24 @@ handle_sync_io(int fd, short event, void *arg)
 		switch (msg.type) {
 		case VIODEV_MSG_IO_READ:
 			/* Read IO: make sure to send a reply */
+			deassert = 0;
 			msg.data = vioscsi_read(dev, &msg, &deassert);
 			msg.data_valid = 1;
-			if (deassert) {
-				/* Inline any interrupt deassertions. */
-				msg.state = INTR_STATE_DEASSERT;
-			}
 			imsg_compose_event(iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 			    sizeof(msg));
+			/*
+			 * Option A: emit the ISR-read interrupt deassert on the
+			 * SAME async channel the assert uses
+			 * (virtio_assert_irq), never piggybacked on this
+			 * synchronous reply.  This makes the VM-process
+			 * event-loop thread the sole, in-order mutator of the
+			 * device's IOAPIC line, eliminating the
+			 * assert(async)/deassert(sync) cross-thread reorder
+			 * that could clobber a coalesced level completion
+			 * (CE-C).
+			 */
+			if (deassert)
+				virtio_deassert_irq(dev, 0);
 			break;
 		case VIODEV_MSG_IO_WRITE:
 			/* Write IO: no reply needed, but maybe an irq assert */
@@ -2215,6 +2225,9 @@ vioscsi_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 			goto out;
 		}
 
+		/* virtio device read barrier: observe avail->idx before
+		 * reading the ring slot/descriptor (SMP stale-read guard). */
+		__sync_synchronize();
 		acct.req_idx = acct.avail->ring[acct.idx] & vq_info->mask;
 		acct.req_desc = &(acct.desc[acct.req_idx]);
 

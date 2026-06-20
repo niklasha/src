@@ -343,6 +343,9 @@ vionet_rx(struct virtio_dev *dev, int fd)
 	used->flags |= VRING_USED_F_NO_NOTIFY;
 
 	while (idx != avail->idx) {
+		/* virtio device read barrier: observe avail->idx before
+		 * reading the ring slot/descriptor (SMP stale-read guard). */
+		__sync_synchronize();
 		hdr_idx = avail->ring[idx & vq_info->mask];
 		desc = &table[hdr_idx & vq_info->mask];
 		if (!DESC_WRITABLE(desc)) {
@@ -691,6 +694,9 @@ vionet_tx(struct virtio_dev *dev)
 	used = (struct vring_used *)(vr + vq_info->vq_usedoffset);
 
 	while (idx != avail->idx) {
+		/* virtio device read barrier: observe avail->idx before
+		 * reading the ring slot/descriptor (SMP stale-read guard). */
+		__sync_synchronize();
 		hdr_idx = avail->ring[idx & vq_info->mask];
 		desc = &table[hdr_idx & vq_info->mask];
 		if (DESC_WRITABLE(desc)) {
@@ -958,12 +964,26 @@ handle_sync_io(int fd, short event, void *arg)
 		switch (msg.type) {
 		case VIODEV_MSG_IO_READ:
 			/* Read IO: make sure to send a reply */
+			deassert = 0;
 			msg.data = vionet_read(dev, &msg, &deassert);
 			msg.data_valid = 1;
-			if (deassert)
-				msg.state = INTR_STATE_DEASSERT;
 			imsg_compose_event2(iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 			    sizeof(msg), ev_base_main);
+			/*
+			 * Option A: emit the ISR-read interrupt deassert on the
+			 * SAME async channel the assert uses
+			 * (vionet_assert_pic_irq), never piggybacked on this
+			 * synchronous reply.  This makes the VM-process
+			 * event-loop thread the sole, in-order mutator of the
+			 * device's IOAPIC line, eliminating the
+			 * assert(async)/deassert(sync) cross-thread reorder
+			 * that could clobber a coalesced level completion
+			 * (CE-C).  vionet_deassert_pic_irq() must run on the
+			 * main thread, which is exactly where handle_sync_io()
+			 * executes.
+			 */
+			if (deassert)
+				vionet_deassert_pic_irq(dev);
 			break;
 		case VIODEV_MSG_IO_WRITE:
 			/* Write IO: no reply needed */
@@ -1535,6 +1555,27 @@ vionet_assert_pic_irq(struct virtio_dev *dev)
 {
 	struct viodev_msg	msg;
 	int			ret;
+
+	/*
+	 * Re-validate under lock at the point the ASSERT is actually
+	 * composed.  A worker thread decides to raise (sets dev->isr |= 1,
+	 * then sends VIRTIO_RAISE_IRQ to pipe_main) only AFTER dropping
+	 * `lock`, so a device reset -- which clears dev->isr and bumps
+	 * reset_generation under `lock` -- can land in between.  Gating on
+	 * dev->isr != 0 here makes the level line track the true
+	 * interrupt-pending state: it drops a stale raise whose isr bit a
+	 * reset (or the guest's ISR read) has already cleared, closing the
+	 * P_no_stuck_line reset TOCTOU, while never dropping a live raise
+	 * (isr writes by workers and the guest ISR-read clear are all
+	 * serialized by `lock`, so isr != 0 here iff an interrupt is
+	 * genuinely pending).
+	 */
+	pthread_rwlock_rdlock(&lock);
+	if (dev->isr == 0) {
+		pthread_rwlock_unlock(&lock);
+		return;
+	}
+	pthread_rwlock_unlock(&lock);
 
 	memset(&msg, 0, sizeof(msg));
 	msg.irq = dev->irq;

@@ -17,6 +17,7 @@
  */
 
 #include <sys/types.h>
+#include <pthread.h>
 
 #include <dev/pv/virtioreg.h>
 #include <dev/pci/virtio_pcireg.h>
@@ -366,6 +367,7 @@ struct virtio_dev {
 	struct imsgev async_iev;		/* async imsg event [r] */
 	struct imsgev sync_iev;			/* sync imsg event [r] */
 
+	pthread_mutex_t sync_mtx;		/* serializes sync_iev */
 	int sync_fd;				/* fd for synchronous channel */
 	int async_fd;				/* fd for async channel */
 

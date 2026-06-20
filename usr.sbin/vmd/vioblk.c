@@ -282,6 +282,18 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	used = (struct vring_used *)(vr + vq_info->vq_usedoffset);
 
 	while (idx != avail->idx) {
+		/*
+		 * virtio device read barrier: we have observed the driver's
+		 * updated avail->idx; ensure the avail-ring slot and the
+		 * descriptor it published BEFORE that index are visible to us
+		 * before we read them.  Without this, on an SMP host the vioblk
+		 * worker thread can observe the new avail->idx (published by a
+		 * guest vcpu on another core) yet read a STALE avail->ring[]/
+		 * descriptor, process the wrong request, and the guest's real
+		 * I/O never completes -- a probabilistic hang that the
+		 * incidental syscall barriers from verbose logging masked.
+		 */
+		__sync_synchronize();
 		/* Retrieve Command descriptor. */
 		cmd_desc_idx = avail->ring[idx & vq_info->mask];
 		desc = &table[cmd_desc_idx];
@@ -503,14 +515,24 @@ handle_sync_io(int fd, short event, void *arg)
 		switch (msg.type) {
 		case VIODEV_MSG_IO_READ:
 			/* Read IO: make sure to send a reply */
+			deassert = 0;
 			msg.data = vioblk_read(dev, &msg, &deassert);
 			msg.data_valid = 1;
-			if (deassert) {
-				/* Inline any interrupt deassertions. */
-				msg.state = INTR_STATE_DEASSERT;
-			}
 			imsg_compose_event(iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 			    sizeof(msg));
+			/*
+			 * Option A: emit the ISR-read interrupt deassert on the
+			 * SAME async channel the assert uses
+			 * (virtio_assert_irq), never piggybacked on this
+			 * synchronous reply.  This makes the VM-process
+			 * event-loop thread the sole, in-order mutator of the
+			 * device's IOAPIC line, eliminating the
+			 * assert(async)/deassert(sync) cross-thread reorder
+			 * that could clobber a coalesced level completion
+			 * (CE-C).
+			 */
+			if (deassert)
+				virtio_deassert_irq(dev, 0);
 			break;
 		case VIODEV_MSG_IO_WRITE:
 			/* Write IO: no reply needed, but maybe an irq assert */
