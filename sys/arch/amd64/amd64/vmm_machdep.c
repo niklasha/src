@@ -2108,7 +2108,8 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	    IA32_VMX_CR8_LOAD_EXITING |
 	    IA32_VMX_CR8_STORE_EXITING |
 	    IA32_VMX_MONITOR_EXITING |
-	    IA32_VMX_USE_TPR_SHADOW;
+	    IA32_VMX_USE_TPR_SHADOW |
+	    IA32_VMX_USE_TSC_OFFSETTING;
 	want0 = 0;
 
 	want1 |= IA32_VMX_ACTIVATE_SECONDARY_CONTROLS;
@@ -2130,6 +2131,13 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 
 	if (vmwrite(VMCS_PROCBASED_CTLS, procbased)) {
 		DPRINTF("%s: error setting procbased controls\n", __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/* TSC offset: guest sees host TSC + 0 (no adjustment). */
+	if (vmwrite(VMCS_TSC_OFFSET, 0)) {
+		DPRINTF("%s: error setting TSC offset\n", __func__);
 		ret = EINVAL;
 		goto exit;
 	}
@@ -3408,6 +3416,15 @@ vm_run(struct vm_run_params *vrp)
 		vrp->vrp_exit_reason = (vcpu_rv == 0) ? VM_EXIT_NONE
 		    : vcpu->vc_gueststate.vg_exit_reason;
 		vrp->vrp_irqready = vcpu->vc_irqready;
+		/*
+		 * Reflect the injection result back to vmd: the inject path
+		 * clears vc_inject.vie_type to VCPU_INJECT_NONE iff it actually
+		 * vectored the interrupt into the guest this run; otherwise it
+		 * stays VCPU_INJECT_INTR (guest was not interruptible).  vmd
+		 * uses this to undo a speculative LAPIC ack (gated ack) so an
+		 * un-injected vector is not orphaned in ISR.
+		 */
+		vrp->vrp_inject.vie_type = vcpu->vc_inject.vie_type;
 		vcpu->vc_state = VCPU_STATE_STOPPED;
 		ret = copyout(&vcpu->vc_exit, vrp->vrp_exit,
 		    sizeof(struct vm_exit));
@@ -3698,6 +3715,14 @@ vcpu_run_vmx(struct vcpu *vcpu, struct vm_run_params *vrp)
 		}
 		break;
 	case VMX_EXIT_EPT_VIOLATION:
+	case VMX_EXIT_VMCALL:
+		/*
+		 * Write the userland-updated GPRs back to the guest.  For
+		 * MMIO emulation this carries the emulated result + advanced
+		 * RIP; for a PV-IPI VMCALL it carries the delivered-IPI count
+		 * vmd placed in RAX.  RIP was already advanced (and read into
+		 * vc_exit.vrs) at exit time, so writing it back is idempotent.
+		 */
 		ret = vcpu_writeregs_vmx(vcpu, VM_RWREGS_GPRS, 0,
 		    &vcpu->vc_exit.vrs);
 		if (ret) {
@@ -4136,9 +4161,8 @@ svm_handle_hlt(struct vcpu *vcpu)
 	vcpu->vc_gueststate.vg_rip += 1;
 
 	if (!svm_get_iflag(vcpu, rflags)) {
-		DPRINTF("%s: guest halted with interrupts disabled\n",
-		    __func__);
-		return (EIO);
+		/* SMP: AP parks via cli;hlt after SeaBIOS check-in. */
+		return (EAGAIN);
 	}
 
 	return (EAGAIN);
@@ -4183,9 +4207,9 @@ vmx_handle_hlt(struct vcpu *vcpu)
 	}
 
 	if (!(rflags & PSL_I)) {
-		DPRINTF("%s: guest halted with interrupts disabled\n",
-		    __func__);
-		return (EIO);
+		/* SMP: AP parks via cli;hlt after SeaBIOS check-in. */
+		vcpu->vc_gueststate.vg_rip += insn_length;
+		return (EAGAIN);
 	}
 
 	vcpu->vc_gueststate.vg_rip += insn_length;
@@ -4683,6 +4707,14 @@ vmx_handle_exit(struct vcpu *vcpu)
 	case VMX_EXIT_EPT_VIOLATION:
 		ret = vmx_handle_np_fault(vcpu);
 		break;
+	/*
+	 * No VMX_EXIT_APIC_ACCESS case: virtualize-APIC-accesses is not
+	 * enabled (secondary procbased want1 = ENABLE_EPT only, want0 =
+	 * ~want1) and VMCS_APIC_ACCESS_ADDRESS is never programmed, so
+	 * exit reason 44 can never fire.  Guest LAPIC MMIO (0xFEE00xxx)
+	 * is unbacked in EPT and arrives as a normal EPT violation, which
+	 * vmd handles via VEE_FAULT_MMIO_ASSIST.
+	 */
 	case VMX_EXIT_CPUID:
 		ret = vmm_handle_cpuid(vcpu);
 		update_rip = 1;
@@ -4748,6 +4780,18 @@ vmx_handle_exit(struct vcpu *vcpu)
 		if (guest_cpl == 0 &&
 		    vcpu->vc_gueststate.vg_rax == HVCALL_FORCED_ABORT)
 			return (EINVAL);
+		if (guest_cpl == 0 &&
+		    vcpu->vc_gueststate.vg_rax == KVM_HC_SEND_IPI) {
+			/* Advance past VMCALL (3 bytes) and pass to vmd. */
+			uint64_t insn_len;
+			if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_len) == 0)
+				vcpu->vc_gueststate.vg_rip += insn_len;
+			else
+				vcpu->vc_gueststate.vg_rip += 3;
+			update_rip = 1;
+			ret = EAGAIN;
+			break;
+		}
 		DPRINTF("VMX_EXIT_VMCALL at cpl=%d\n", guest_cpl);
 		ret = vmm_inject_ud(vcpu);
 		update_rip = 0;
@@ -5856,6 +5900,14 @@ vmx_handle_rdmsr(struct vcpu *vcpu)
 		*rax = (vcpu->vc_shadow_pat & 0xFFFFFFFFULL);
 		*rdx = (vcpu->vc_shadow_pat >> 32);
 		break;
+	case MSR_APICBASE: {
+		uint64_t apicbase = 0xfee00000ULL | APICBASE_GLOBAL_ENABLE;
+		if (vcpu->vc_id == 0)
+			apicbase |= APICBASE_BSP;
+		*rax = apicbase & 0xFFFFFFFFULL;
+		*rdx = apicbase >> 32;
+		break;
+	}
 	default:
 		/* Unsupported MSRs causes #GP exception, don't advance %rip */
 		DPRINTF("%s: unsupported rdmsr (msr=0x%llx), injecting #GP\n",
@@ -6061,6 +6113,15 @@ vmx_handle_wrmsr(struct vcpu *vcpu)
 		}
 		vcpu->vc_shadow_pat = val;
 		break;
+	case MSR_APICBASE:
+		/*
+		 * Silently ignore writes to APICBASE.  The guest may try
+		 * to re-relocate or toggle the xAPIC/x2APIC enable bits;
+		 * for now we present a fixed xAPIC at 0xfee00000 and
+		 * accept (but discard) writes so guests like the OpenBSD
+		 * lapic init path don't take a #GP.
+		 */
+		break;
 	case MSR_MISC_ENABLE:
 		vmx_handle_misc_enable_msr(vcpu);
 		break;
@@ -6135,6 +6196,9 @@ svm_handle_msr(struct vcpu *vcpu)
 			}
 			vcpu->vc_shadow_pat = val;
 			break;
+		case MSR_APICBASE:
+			/* Silently ignore APICBASE writes; see vmx path. */
+			break;
 		case MSR_EFER:
 			vmcb->v_efer = *rax | EFER_SVME;
 			break;
@@ -6167,6 +6231,15 @@ svm_handle_msr(struct vcpu *vcpu)
 			*rax = (vcpu->vc_shadow_pat & 0xFFFFFFFFULL);
 			*rdx = (vcpu->vc_shadow_pat >> 32);
 			break;
+		case MSR_APICBASE: {
+			uint64_t apicbase =
+			    0xfee00000ULL | APICBASE_GLOBAL_ENABLE;
+			if (vcpu->vc_id == 0)
+				apicbase |= APICBASE_BSP;
+			*rax = apicbase & 0xFFFFFFFFULL;
+			*rdx = apicbase >> 32;
+			break;
+		}
 		case MSR_DE_CFG:
 			/* LFENCE serializing bit is set by host */
 			*rax = DE_CFG_SERIALIZE_LFENCE;
@@ -6366,7 +6439,13 @@ vmm_handle_cpuid(struct vcpu *vcpu)
 		break;
 	case 0x01:	/* Version, brand, feature info */
 		*rax = cpu_id;
-		/* mask off host's APIC ID, reset to vcpu id */
+		/*
+		 * Mask off host's APIC ID and set EBX[31:24] to the vcpu id
+		 * (this vcpu's initial APIC id).  EBX[23:16] (max logical
+		 * processors per package) is left zero: it is reserved
+		 * unless HTT (EDX[28]) is set, which we do not advertise.
+		 * SMP discovery is via the MADT / MP table, not this field.
+		 */
 		*rbx = cpu_ebxfeature & 0x0000FFFF;
 		*rbx |= (vcpu->vc_id & 0xFF) << 24;
 		*rcx = (cpu_ecxfeature | CPUIDECX_HV) & VMM_CPUIDECX_MASK;
@@ -6378,6 +6457,12 @@ vmm_handle_cpuid(struct vcpu *vcpu)
 			*rcx &= ~CPUIDECX_OSXSAVE;
 
 		*rdx = curcpu()->ci_feature_flags & VMM_CPUIDEDX_MASK;
+		/*
+		 * Expose APIC bit when guest is SMP, so
+		 * cpu_boot_secondary sends SIPI after INIT.
+		 */
+		if (vcpu->vc_parent->vm_vcpu_ct > 1)
+			*rdx |= CPUID_APIC;
 		break;
 	case 0x02:	/* Cache and TLB information */
 		*rax = eax;
@@ -6516,11 +6601,10 @@ vmm_handle_cpuid(struct vcpu *vcpu)
 		*rdx = *((uint32_t *)&vmm_hv_signature[8]);
 		break;
 	case 0x40000001:	/* KVM hypervisor features */
+		*rax = (1 << KVM_FEATURE_PV_IPI);
 		if (tsc_frequency > 0)
-			*rax = (1 << KVM_FEATURE_CLOCKSOURCE2) |
+			*rax |= (1 << KVM_FEATURE_CLOCKSOURCE2) |
 			    (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT);
-		else
-			*rax = 0;
 		*rbx = 0;
 		*rcx = 0;
 		*rdx = 0;
@@ -6532,7 +6616,8 @@ vmm_handle_cpuid(struct vcpu *vcpu)
 		*rdx = *((uint32_t *)&kvm_hv_signature[8]);
 		break;
 	case 0x40000101:	/* KVM hypervisor features */
-		*rax = 1 << KVM_FEATURE_NOP_IO_DELAY;
+		*rax = (1 << KVM_FEATURE_NOP_IO_DELAY) |
+		    (1 << KVM_FEATURE_PV_IPI);
 		if (tsc_frequency > 0)
 			*rax |= (1 << KVM_FEATURE_CLOCKSOURCE2) |
 			    (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT);
