@@ -503,8 +503,23 @@ vm_intr_pending(struct vm_intr_params *vip)
 		goto out;
 	}
 
-	vcpu->vc_intr = vip->vip_intr;
+	WRITE_ONCE(vcpu->vc_intr, vip->vip_intr);
 #ifdef MULTIPROCESSOR
+	/*
+	 * Lost-interrupt fix: vc_intr is published here lock-free (the run
+	 * loop holds vc_lock for the whole guest run, so blocking on it would
+	 * serialize IRQ delivery behind guest execution).  This store and the
+	 * vc_curcpu load below form a store-buffer (Dekker) pattern against
+	 * the run loop, which publishes vc_curcpu (in vm_run) and then reads
+	 * vc_intr.  On x86-TSO the store-then-load can be observed reordered,
+	 * so without a full barrier we could read vc_curcpu==NULL (skip the
+	 * kick) while the run loop reads a stale vc_intr==0 (never arms the
+	 * interrupt window) -> the pending IRQ is stranded and the vcpu HLTs
+	 * forever.  membar_producer/consumer are compiler-only no-ops on
+	 * amd64; the StoreLoad hazard requires membar_sync (mfence) on BOTH
+	 * sides (matching barrier in vm_run after WRITE_ONCE(vc_curcpu)).
+	 */
+	membar_sync();
 	ci = READ_ONCE(vcpu->vc_curcpu);
 	if (ci != NULL)
 		x86_send_ipi(ci, X86_IPI_NOP);
@@ -3403,6 +3418,13 @@ vm_run(struct vm_run_params *vrp)
 	vcpu->vc_inject.vie_errorcode = vrp->vrp_inject.vie_errorcode;
 
 	WRITE_ONCE(vcpu->vc_curcpu, curcpu());
+	/*
+	 * Pair with the membar_sync() in vm_intr_pending(): publish vc_curcpu
+	 * before vcpu_run_{vmx,svm}() reads vc_intr to arm interrupt-window
+	 * exiting.  This full barrier closes the store-buffer race so a vcpu
+	 * becoming current cannot miss a just-pended vc_intr.
+	 */
+	membar_sync();
 	/* Run the VCPU specified in vrp */
 	if (vcpu->vc_virt_mode == VMM_MODE_EPT) {
 		vcpu_rv = vcpu_run_vmx(vcpu, vrp);
@@ -3699,9 +3721,9 @@ vcpu_run_vmx(struct vcpu *vcpu, struct vm_run_params *vrp)
 	 * exit data structure.
 	 */
 	if (vrp->vrp_intr_pending)
-		vcpu->vc_intr = 1;
+		WRITE_ONCE(vcpu->vc_intr, 1);
 	else
-		vcpu->vc_intr = 0;
+		WRITE_ONCE(vcpu->vc_intr, 0);
 
 	switch (vcpu->vc_gueststate.vg_exit_reason) {
 	case VMX_EXIT_IO:
@@ -3755,22 +3777,37 @@ vcpu_run_vmx(struct vcpu *vcpu, struct vm_run_params *vrp)
 
 			vcpu->vc_inject.vie_type = VCPU_INJECT_NONE;
 		}
-	} else if (!vcpu->vc_intr) {
-		/*
-		 * Disable window exiting
-		 */
-		if (vmread(VMCS_PROCBASED_CTLS, &procbased)) {
-			printf("%s: can't read procbased ctls on exit\n",
-			    __func__);
-			return (EINVAL);
-		} else {
-			procbased &= ~IA32_VMX_INTERRUPT_WINDOW_EXITING;
-			if (vmwrite(VMCS_PROCBASED_CTLS, procbased)) {
-				printf("%s: can't write procbased ctls "
-				    "on exit\n", __func__);
-				return (EINVAL);
-			}
-		}
+	}
+
+	/*
+	 * Manage interrupt-window exiting.  If an interrupt is pending
+	 * (vc_intr) but the guest was not interruptible at its last exit
+	 * (vc_irqready == 0), arm interrupt-window exiting so we force a
+	 * VMEXIT the instant the guest re-enables interrupts (IF 0->1), at
+	 * which point vmd retries injection.  Without this, a guest spinning
+	 * with interrupts disabled -- e.g. smp_call_function's csd_lock_wait
+	 * during text_poke's cross-CPU sync -- never exits on its own, so a
+	 * pending cross-CPU IPI (delivered to the LAPIC IRR via the PV-IPI
+	 * VMCALL or a directed LAPIC IPI) is stranded forever and the CPU
+	 * waiting for the IPI response soft-locks.  When nothing is pending,
+	 * clear the (otherwise wasteful) window-exiting control.
+	 *
+	 * Previously this was only handled on the exit side (the
+	 * "if not ready but interrupts pending" block below), which is
+	 * unreachable for a guest that takes no exits of its own while
+	 * spinning with IF=0.  Arming on entry closes that gap.
+	 */
+	if (vmread(VMCS_PROCBASED_CTLS, &procbased)) {
+		printf("%s: can't read procbased ctls on entry\n", __func__);
+		return (EINVAL);
+	}
+	if (READ_ONCE(vcpu->vc_intr) && !vcpu->vc_irqready)
+		procbased |= IA32_VMX_INTERRUPT_WINDOW_EXITING;
+	else if (!READ_ONCE(vcpu->vc_intr))
+		procbased &= ~IA32_VMX_INTERRUPT_WINDOW_EXITING;
+	if (vmwrite(VMCS_PROCBASED_CTLS, procbased)) {
+		printf("%s: can't write procbased ctls on entry\n", __func__);
+		return (EINVAL);
 	}
 
 	msr_store = (struct vmx_msr_store *)vcpu->vc_vmx_msr_exit_load_va;
@@ -4023,7 +4060,8 @@ vcpu_run_vmx(struct vcpu *vcpu, struct vm_run_params *vrp)
 			 * If not ready for interrupts, but interrupts pending,
 			 * enable interrupt window exiting.
 			 */
-			if (vcpu->vc_irqready == 0 && vcpu->vc_intr) {
+			if (vcpu->vc_irqready == 0 &&
+			    READ_ONCE(vcpu->vc_intr)) {
 				if (vmread(VMCS_PROCBASED_CTLS, &procbased)) {
 					printf("%s: can't read procbased ctls "
 					    "on intwin exit\n", __func__);
@@ -4047,7 +4085,7 @@ vcpu_run_vmx(struct vcpu *vcpu, struct vm_run_params *vrp)
 			if (ret || vcpu_must_stop(vcpu))
 				break;
 
-			if (vcpu->vc_intr && vcpu->vc_irqready) {
+			if (READ_ONCE(vcpu->vc_intr) && vcpu->vc_irqready) {
 				ret = EAGAIN;
 				break;
 			}
@@ -6738,9 +6776,9 @@ vcpu_run_svm(struct vcpu *vcpu, struct vm_run_params *vrp)
 	struct vmcb *vmcb = (struct vmcb *)vcpu->vc_control_va;
 
 	if (vrp->vrp_intr_pending)
-		vcpu->vc_intr = 1;
+		WRITE_ONCE(vcpu->vc_intr, 1);
 	else
-		vcpu->vc_intr = 0;
+		WRITE_ONCE(vcpu->vc_intr, 0);
 
 	/*
 	 * If we are returning from userspace (vmd) because we exited
@@ -6949,7 +6987,8 @@ vcpu_run_svm(struct vcpu *vcpu, struct vm_run_params *vrp)
 			 * If not ready for interrupts, but interrupts pending,
 			 * enable interrupt window exiting.
 			 */
-			if (vcpu->vc_irqready == 0 && vcpu->vc_intr) {
+			if (vcpu->vc_irqready == 0 &&
+			    READ_ONCE(vcpu->vc_intr)) {
 				vmcb->v_intercept1 |= SVM_INTERCEPT_VINTR;
 				vmcb->v_irq = 1;
 				vmcb->v_intr_misc = SVM_INTR_MISC_V_IGN_TPR;
@@ -6965,7 +7004,7 @@ vcpu_run_svm(struct vcpu *vcpu, struct vm_run_params *vrp)
 			if (ret || vcpu_must_stop(vcpu))
 				break;
 
-			if (vcpu->vc_intr && vcpu->vc_irqready) {
+			if (READ_ONCE(vcpu->vc_intr) && vcpu->vc_irqready) {
 				ret = EAGAIN;
 				break;
 			}
