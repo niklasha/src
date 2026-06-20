@@ -69,8 +69,23 @@ enum x86_opcode_type {
 	OP_INS,
 	OP_MOV,
 	OP_MOVZX,
+	OP_MOVSX,
 	OP_OUT,
 	OP_OUTS,
+	OP_TEST,
+	OP_ADD,
+	OP_OR,
+	OP_AND,
+	OP_SUB,
+	OP_XOR,
+	OP_CMP,
+	OP_XCHG,
+	OP_BTS,
+	OP_BTR,
+	OP_BTC,
+	OP_BT,
+	OP_GROUP1,		/* 0x81/0x83: resolved to ALU op after ModRM */
+	OP_BT_GROUP,		/* 0x0F BA: resolved to BT* after ModRM */
 	OP_TWO_BYTE,		/* Opcode is two bytes, not one. */
 	OP_UNSUPPORTED,		/* Valid decode, but no current support. */
 };
@@ -122,6 +137,9 @@ struct x86_insn {
 	int			insn_reg;		/* Register */
 
 	uint8_t			insn_sib;		/* Scale-Index-Base */
+#define SIB_SCALE(x)		(((x) >> 6) & 0x3)
+#define SIB_INDEX(x)		(((x) >> 3) & 0x7)
+#define SIB_BASE(x)		(((x) >> 0) & 0x7)
 	uint8_t			insn_sib_valid;		/* SIB byte set? */
 
 	uint64_t		insn_disp;		/* Displacement */

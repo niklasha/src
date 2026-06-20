@@ -703,16 +703,13 @@ vcpu_exit_eptviolation(struct vm_run_params *vrp)
 {
 	struct vm_exit *ve = vrp->vrp_exit;
 	int ret = 0;
-#if MMIO_NOTYET
 	struct x86_insn insn;
 	uint64_t va, pa;
 	size_t len = 15;		/* Max instruction length in x86. */
-#endif /* MMIO_NOTYET */
 	switch (ve->vee.vee_fault_type) {
 	case VEE_FAULT_HANDLED:
 		break;
 
-#if MMIO_NOTYET
 	case VEE_FAULT_MMIO_ASSIST:
 		/* Intel VMX might give us the length of the instruction. */
 		if (ve->vee.vee_insn_info & VEE_LEN_VALID)
@@ -728,34 +725,52 @@ vcpu_exit_eptviolation(struct vm_run_params *vrp)
 			    sizeof(ve->vee.vee_insn_bytes));
 			va = ve->vrs.vrs_gprs[VCPU_REGS_RIP];
 
-			/* XXX Only support instructions that fit on 1 page. */
-			if ((va & PAGE_MASK) + len > PAGE_SIZE) {
-				log_warnx("%s: instruction might cross page "
-				    "boundary", __func__);
-				ret = EINVAL;
-				break;
-			}
+			/*
+			 * In real/unpaged mode, RIP is an offset from
+			 * CS.base.  Form the linear address so
+			 * translate_gva (which returns pa=va when
+			 * CR0.PG is clear) produces the correct GPA.
+			 */
+			if (!(ve->vrs.vrs_crs[VCPU_REGS_CR0] & CR0_PG))
+				va += ve->vrs.vrs_sregs[VCPU_REGS_CS].vsi_base;
+
+			/* Clamp fetch length to current page. */
+			if ((va & PAGE_MASK) + len > PAGE_SIZE)
+				len = PAGE_SIZE - (va & PAGE_MASK);
 
 			ret = translate_gva(ve, va, &pa, PROT_EXEC);
 			if (ret != 0) {
 				log_warnx("%s: failed gva translation",
 				    __func__);
-				break;
+				goto mmio_done;
 			}
 
 			ret = read_mem(pa, ve->vee.vee_insn_bytes, len);
 			if (ret != 0) {
 				log_warnx("%s: failed to fetch instruction "
 				    "bytes from 0x%llx", __func__, pa);
-				break;
+				goto mmio_done;
 			}
 		}
 
 		ret = insn_decode(ve, &insn);
 		if (ret == 0)
 			ret = insn_emulate(ve, &insn);
+	mmio_done:
+		if (ret != 0) {
+			char hb[64];
+			int hi, hl = 0;
+			for (hi = 0; hi < 15 && hl < 60; hi++)
+				hl += snprintf(hb + hl, sizeof(hb) - hl,
+				    "%02x ", ve->vee.vee_insn_bytes[hi]);
+			log_warnx("%s: MMIO decode/emulate failed at "
+			    "rip=0x%llx bytes=[%s] -- triple fault",
+			    __func__,
+			    (unsigned long long)ve->vrs.vrs_gprs[VCPU_REGS_RIP],
+			    hb);
+			return (EAGAIN);
+		}
 		break;
-#endif /* MMIO_NOTYET */
 
 	case VEE_FAULT_PROTECT:
 		log_debug("EPT Violation: rip=0x%llx",
