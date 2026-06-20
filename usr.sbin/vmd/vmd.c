@@ -127,8 +127,8 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 				}
 
 				/* If not running, are our flags ok? */
-				if (vmc.vmc_flags &&
-				    vmc.vmc_flags != VMOP_CREATE_KERNEL) {
+				if (vmc.vmc_flags &
+				    ~(VMOP_CREATE_KERNEL | VMOP_CREATE_CPU)) {
 					cmd = IMSG_VMDOP_START_VM_RESPONSE;
 					break;
 				}
@@ -314,6 +314,23 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		vmop_result_read(imsg, &vmr);
 		if ((vm = vm_getbyvmid(vmr.vmr_id)) == NULL)
 			break;
+		/*
+		 * vm_vmid is sticky and reused across stop/start of the same
+		 * name+uid.  A lagging START_VM_RESPONSE for a PRIOR instance
+		 * can match the live new instance by vmid alone and either
+		 * tear it down (the vm_terminate paths below) or clobber its
+		 * vm_pid/vm_vmmid with the dead child's values, corrupting the
+		 * registry so a later correctly-generation'd terminate event
+		 * mismatches and orphans the live VM.  Reject a stale response
+		 * unless the launch generation also matches.  PROC_VMM stamps
+		 * vmr_generation on this response (see vmm.c).
+		 */
+		if (vm->vm_generation != vmr.vmr_generation) {
+			log_debug("%s: stale start response for vm %d "
+			    "(gen %u != current %u), ignoring", __func__,
+			    vmr.vmr_id, vmr.vmr_generation, vm->vm_generation);
+			break;
+		}
 		vm->vm_pid = vmr.vmr_pid;
 		vm->vm_vmmid = vmr.vmr_id;
 
@@ -358,8 +375,6 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		vmop_result_read(imsg, &vmr);
 
 		if (vmr.vmr_result) {
-			DPRINTF("%s: forwarding TERMINATE VM for vm id %d",
-			    __func__, vmr.vmr_id);
 			proc_forward_imsg(ps, imsg, PROC_CONTROL, -1);
 		} else {
 			if ((vm = vm_getbyvmid(vmr.vmr_id)) == NULL)
@@ -375,6 +390,19 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		if ((vm = vm_getbyvmid(vmr.vmr_id)) == NULL) {
 			log_debug("%s: vm %d is no longer available",
 			    __func__, vmr.vmr_id);
+			break;
+		}
+		/*
+		 * vm_vmid is sticky and reused across stop/start of the same
+		 * name+uid.  A lagging terminate event for a prior instance can
+		 * match the live new instance by vmid alone.  Reject it unless
+		 * the launch generation also matches, so a stale gen-N event
+		 * cannot remove gen-N+1 (the "disappearing VM"/orphan bug).
+		 */
+		if (vm->vm_generation != vmr.vmr_generation) {
+			log_debug("%s: stale terminate event for vm %d "
+			    "(gen %u != current %u), ignoring", __func__,
+			    vmr.vmr_id, vmr.vmr_generation, vm->vm_generation);
 			break;
 		}
 		if (vmr.vmr_result != EAGAIN ||
@@ -397,6 +425,7 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_VMDOP_GET_INFO_VM_DATA:
 		vmop_info_result_read(imsg, &vir);
 		if ((vm = vm_getbyvmid(vir.vir_id)) != NULL) {
+			vm->vm_reported = 1;
 			memset(vir.vir_ttyname, 0, sizeof(vir.vir_ttyname));
 			if (vm->vm_ttyname[0] != '\0')
 				strlcpy(vir.vir_ttyname, vm->vm_ttyname,
@@ -418,35 +447,46 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		break;
 	case IMSG_VMDOP_GET_INFO_VM_END_DATA:
 		/*
-		 * PROC_VMM has responded with the *running* VMs, now we
-		 * append the others. These use the special value 0 for their
-		 * kernel id to indicate that they are not running.
+		 * PROC_VMM has responded with the *running* VMs (marked via
+		 * vm_reported).  Emit every VM not already covered, including
+		 * config VMs that are stuck in a running/stopping state but
+		 * absent from PROC_VMM's TAILQ (e.g. after a failed stop).
 		 */
 		TAILQ_FOREACH(vm, env->vmd_vms, vm_entry) {
-			if (!(vm->vm_state & VM_STATE_RUNNING)) {
-				memset(&vir, 0, sizeof(vir));
-				vir.vir_id = vm->vm_vmid;
-				strlcpy(vir.vir_name, vm->vm_params.vmc_name,
-				    sizeof(vir.vir_name));
-				vir.vir_memory_size =
-				    vm->vm_params.vmc_memranges[0].vmr_size;
-				vir.vir_ncpus = vm->vm_params.vmc_ncpus;
-				/* get the configured user id for this vm */
-				vir.vir_uid = vm->vm_params.vmc_owner.uid;
-				vir.vir_gid = vm->vm_params.vmc_owner.gid;
-				log_debug("%s: vm: %d, vm_state: 0x%x",
-				    __func__, vm->vm_vmid, vm->vm_state);
-				vir.vir_state = vm->vm_state;
-				if (proc_compose_imsg(ps,
-				    peer_id == IMSG_AGENTX_PEERID ?
-				    PROC_AGENTX : PROC_CONTROL,
-				    IMSG_VMDOP_GET_INFO_VM_DATA, peer_id, -1,
-				    &vir, sizeof(vir)) == -1) {
-					log_debug("%s: GET_INFO_VM_END failed",
-					    __func__);
-					vm_terminate(vm, __func__);
-					return (-1);
-				}
+			if (vm->vm_reported) {
+				vm->vm_reported = 0;
+				continue;
+			}
+			memset(&vir, 0, sizeof(vir));
+			vir.vir_id = vm->vm_vmid;
+			strlcpy(vir.vir_name, vm->vm_params.vmc_name,
+			    sizeof(vir.vir_name));
+			vir.vir_memory_size =
+			    vm->vm_params.vmc_memranges[0].vmr_size;
+			vir.vir_ncpus = vm->vm_params.vmc_ncpus;
+			/* get the configured user id for this vm */
+			vir.vir_uid = vm->vm_params.vmc_owner.uid;
+			vir.vir_gid = vm->vm_params.vmc_owner.gid;
+			log_debug("%s: vm: %d, vm_state: 0x%x",
+			    __func__, vm->vm_vmid, vm->vm_state);
+			vir.vir_state = vm->vm_state;
+			/* For stuck-running VMs show their known PID/TTY */
+			if (vm->vm_state & VM_STATE_RUNNING) {
+				vir.vir_creator_pid = vm->vm_pid;
+				if (vm->vm_ttyname[0] != '\0')
+					strlcpy(vir.vir_ttyname,
+					    vm->vm_ttyname,
+					    sizeof(vir.vir_ttyname));
+			}
+			if (proc_compose_imsg(ps,
+			    peer_id == IMSG_AGENTX_PEERID ?
+			    PROC_AGENTX : PROC_CONTROL,
+			    IMSG_VMDOP_GET_INFO_VM_DATA, peer_id, -1,
+			    &vir, sizeof(vir)) == -1) {
+				log_debug("%s: GET_INFO_VM_END failed",
+				    __func__);
+				vm_terminate(vm, __func__);
+				return (-1);
 			}
 		}
 		proc_forward_imsg(ps, imsg,
@@ -1028,7 +1068,8 @@ vm_stop(struct vmd_vm *vm, int keeptty, const char *caller)
 	    __func__, ps->ps_title[privsep_process], caller,
 	    vm->vm_vmid, keeptty ? ", keeping tty open" : "");
 
-	vm->vm_state &= ~(VM_STATE_RUNNING | VM_STATE_SHUTDOWN);
+	vm->vm_state &= ~(VM_STATE_RUNNING | VM_STATE_SHUTDOWN |
+	    VM_STATE_TERMINATE);
 
 	if (vm->vm_iev.ibuf.fd != -1) {
 		event_del(&vm->vm_iev.ev);
