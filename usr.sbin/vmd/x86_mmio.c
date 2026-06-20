@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include <sys/types.h>
+#include <sys/mman.h>
 #include <machine/specialreg.h>
 
 #include "vmd.h"
@@ -27,6 +28,236 @@
 #define MMIO_DEBUG 0
 
 extern char* __progname;
+
+/*
+ * SMP/MMIO: dispatch table for userland MMIO emulation.
+ * Devices (LAPIC, IOAPIC, ...) register a GPA range and read/write callbacks
+ * via mmio_register().  emulate_mov uses the table to route accesses.
+ * Per-VM scope: each vm process has its own table.
+ */
+#define MMIO_MAX_HANDLERS	8
+
+struct mmio_handler {
+	uint64_t	 base;
+	uint64_t	 size;
+	int		(*read)(uint64_t off, uint8_t bytes, uint64_t *val,
+			    void *cookie);
+	int		(*write)(uint64_t off, uint8_t bytes, uint64_t val,
+			    void *cookie);
+	void		*cookie;
+};
+
+static struct mmio_handler	 mmio_handlers[MMIO_MAX_HANDLERS];
+static int			 mmio_n_handlers;
+
+/*
+ * Must be called before vcpu threads start; table is read
+ * lock-free from multiple vcpu threads after that.
+ */
+int
+mmio_register(uint64_t base, uint64_t size,
+    int (*read)(uint64_t, uint8_t, uint64_t *, void *),
+    int (*write)(uint64_t, uint8_t, uint64_t, void *),
+    void *cookie)
+{
+	if (mmio_n_handlers >= MMIO_MAX_HANDLERS)
+		return (-1);
+	mmio_handlers[mmio_n_handlers++] = (struct mmio_handler){
+		.base = base, .size = size,
+		.read = read, .write = write, .cookie = cookie,
+	};
+	return (0);
+}
+
+static struct mmio_handler *
+mmio_find(uint64_t gpa)
+{
+	int i;
+	struct mmio_handler *h;
+
+	for (i = 0; i < mmio_n_handlers; i++) {
+		h = &mmio_handlers[i];
+		if (gpa >= h->base && gpa < h->base + h->size)
+			return (h);
+	}
+	return (NULL);
+}
+
+/*
+ * Operand byte-size table for MOV variants we care about (MMIO targets).
+ * For unknown opcodes we fall back to 4 -- the common case for LAPIC
+ * register access from a 64-bit kernel.  Refined as needed.
+ */
+static uint8_t
+mov_operand_bytes(struct x86_insn *insn)
+{
+	uint8_t op;
+
+	if (insn->insn_opcode.op_bytes_len < 1)
+		return (4);
+	op = insn->insn_opcode.op_bytes[0];
+
+	/* MOV r/m8, r8 / MOV r8, r/m8 */
+	if (op == 0x88 || op == 0x8A || op == 0xA0 || op == 0xA2 ||
+	    op == 0xC6)
+		return (1);
+
+	/* For the 16/32/64-bit MOV variants, check REX.W and 0x66 prefix. */
+	if (insn->insn_prefix.pfx_rex & REX_W)
+		return (8);
+	if (insn->insn_prefix.pfx_group3 == LEG_3_OPSZ)
+		return (2);
+	return (4);
+}
+
+/*
+ * alu_operand_bytes
+ *
+ * Determine operand size for ALU instructions (ADD/OR/AND/SUB/XOR/CMP).
+ * 8-bit forms use odd-1 opcodes (0x00/0x02 vs 0x01/0x03), but all the
+ * MMIO-relevant ALU opcodes in our table are the 16/32/64-bit forms.
+ * Group 1 (0x81/0x83) is always 16/32/64-bit (the imm size differs but
+ * the r/m operand size follows the standard REX.W / 0x66 rules).
+ */
+static uint8_t
+alu_operand_bytes(struct x86_insn *insn)
+{
+	if (insn->insn_prefix.pfx_rex & REX_W)
+		return (8);
+	if (insn->insn_prefix.pfx_group3 == LEG_3_OPSZ)
+		return (2);
+	return (4);
+}
+
+static inline uint64_t
+mask_operand(uint64_t val, uint8_t bytes)
+{
+	switch (bytes) {
+	case 1: return (val & 0xffULL);
+	case 2: return (val & 0xffffULL);
+	case 4: return (val & 0xffffffffULL);
+	default: return (val);
+	}
+}
+
+static inline void
+write_gpr(uint64_t *gprs, int reg, uint64_t val, uint8_t bytes)
+{
+	switch (bytes) {
+	case 8:
+		gprs[reg] = val;
+		break;
+	case 4:
+		gprs[reg] = val & 0xffffffffULL;
+		break;
+	case 2:
+		gprs[reg] = (gprs[reg] & ~0xffffULL) | (val & 0xffffULL);
+		break;
+	case 1:
+		gprs[reg] = (gprs[reg] & ~0xffULL) | (val & 0xffULL);
+		break;
+	}
+}
+
+static inline uint64_t
+sign_extend8(uint64_t val)
+{
+	return ((uint64_t)(int64_t)(int8_t)(uint8_t)val);
+}
+
+static inline uint64_t
+sign_extend16(uint64_t val)
+{
+	return ((uint64_t)(int64_t)(int16_t)(uint16_t)val);
+}
+
+static inline uint64_t
+sign_extend32(uint64_t val)
+{
+	return ((uint64_t)(int64_t)(int32_t)(uint32_t)val);
+}
+
+static inline int
+parity_even(uint8_t val)
+{
+	val ^= val >> 4;
+	val ^= val >> 2;
+	val ^= val >> 1;
+	return (!(val & 1));
+}
+
+/* Operation descriptor for table-driven MMIO emulation. */
+#define MMIO_F_RFLAGS		0x01	/* update RFLAGS after compute */
+#define MMIO_F_WRITEBACK	0x02	/* write result to dst (reg or mem) */
+/* SUB/CMP-style borrow semantics for flags */
+#define MMIO_F_SUB		0x04
+#define MMIO_F_LOGIC		0x08	/* AND/OR/XOR: CF=OF=0, AF undef */
+/* swap: write old mem to reg, old reg to mem */
+#define MMIO_F_XCHG		0x10
+
+static uint64_t
+op_add(uint64_t a, uint64_t b)
+{
+	return (a + b);
+}
+
+static uint64_t
+op_sub(uint64_t a, uint64_t b)
+{
+	return (a - b);
+}
+
+static uint64_t
+op_or(uint64_t a, uint64_t b)
+{
+	return (a | b);
+}
+
+static uint64_t
+op_and(uint64_t a, uint64_t b)
+{
+	return (a & b);
+}
+
+static uint64_t
+op_xor(uint64_t a, uint64_t b)
+{
+	return (a ^ b);
+}
+
+static uint64_t
+op_mov(uint64_t a, uint64_t b)
+{
+	return (b);
+}
+
+struct mmio_op {
+	uint64_t	(*compute)(uint64_t, uint64_t);
+	int		 flags;
+};
+
+static const struct mmio_op *
+mmio_op_for(enum x86_opcode_type op)
+{
+	static const struct mmio_op ops[] = {
+		[OP_MOV]  = { op_mov, MMIO_F_WRITEBACK },
+		[OP_ADD]  = { op_add, MMIO_F_RFLAGS | MMIO_F_WRITEBACK },
+		[OP_OR]   = { op_or,
+		    MMIO_F_RFLAGS | MMIO_F_WRITEBACK | MMIO_F_LOGIC },
+		[OP_AND]  = { op_and,
+		    MMIO_F_RFLAGS | MMIO_F_WRITEBACK | MMIO_F_LOGIC },
+		[OP_SUB]  = { op_sub,
+		    MMIO_F_RFLAGS | MMIO_F_WRITEBACK | MMIO_F_SUB },
+		[OP_XOR]  = { op_xor,
+		    MMIO_F_RFLAGS | MMIO_F_WRITEBACK | MMIO_F_LOGIC },
+		[OP_CMP]  = { op_sub, MMIO_F_RFLAGS | MMIO_F_SUB },
+		[OP_TEST] = { op_and, MMIO_F_RFLAGS | MMIO_F_LOGIC },
+		[OP_XCHG] = { op_mov, MMIO_F_WRITEBACK | MMIO_F_XCHG },
+	};
+	if (op >= nitems(ops) || ops[op].compute == NULL)
+		return (NULL);
+	return (&ops[op]);
+}
 
 struct x86_decode_state {
 	uint8_t	s_bytes[15];
@@ -69,11 +300,38 @@ static enum decode_result next_value(struct x86_decode_state *, size_t,
     uint64_t *);
 static int is_valid_state(struct x86_decode_state *, const char *);
 
-static int emulate_mov(struct x86_insn *, struct vm_exit *);
+static void update_rflags_alu(uint64_t *, uint64_t, uint64_t, uint64_t,
+    uint8_t, int, int);
+static int emulate_generic(struct x86_insn *, struct vm_exit *);
 static int emulate_movzx(struct x86_insn *, struct vm_exit *);
+static int emulate_movsx(struct x86_insn *, struct vm_exit *);
+static int emulate_bt_group(struct x86_insn *, struct vm_exit *);
 
 /* Lookup table for 1-byte opcodes, in opcode alphabetical order. */
-const enum x86_opcode_type x86_1byte_opcode_tbl[255] = {
+const enum x86_opcode_type x86_1byte_opcode_tbl[256] = {
+	/* ALU: r/m, r  (MR encoding -- write to memory) */
+	[0x01] = OP_ADD,
+	[0x09] = OP_OR,
+	[0x21] = OP_AND,
+	[0x29] = OP_SUB,
+	[0x31] = OP_XOR,
+	[0x39] = OP_CMP,
+
+	/* ALU: r, r/m  (RM encoding -- read from memory) */
+	[0x03] = OP_ADD,
+	[0x0B] = OP_OR,
+	[0x23] = OP_AND,
+	[0x2B] = OP_SUB,
+	[0x33] = OP_XOR,
+	[0x3B] = OP_CMP,
+
+	/* Group 1: ALU r/m, imm  (MI encoding, /reg selects operation) */
+	[0x81] = OP_GROUP1,
+	[0x83] = OP_GROUP1,
+
+	/* XCHG r/m, r */
+	[0x87] = OP_XCHG,
+
 	/* MOV */
 	[0x88] = OP_MOV,
 	[0x89] = OP_MOV,
@@ -84,16 +342,45 @@ const enum x86_opcode_type x86_1byte_opcode_tbl[255] = {
 	[0xA1] = OP_MOV,
 	[0xA2] = OP_MOV,
 	[0xA3] = OP_MOV,
+	[0xC6] = OP_MOV,
+	[0xC7] = OP_MOV,
 
 	/* MOVS */
 	[0xA4] = OP_UNSUPPORTED,
 	[0xA5] = OP_UNSUPPORTED,
 
+	/* TEST r/m, imm -- group 3, sub-opcodes /0 and /1 only. */
+	[0xF6] = OP_TEST,
+	[0xF7] = OP_TEST,
+
 	[ESCAPE] = OP_TWO_BYTE,
 };
 
 /* Lookup table for 1-byte operand encodings, in opcode alphabetical order. */
-const enum x86_operand_enc x86_1byte_operand_enc_tbl[255] = {
+const enum x86_operand_enc x86_1byte_operand_enc_tbl[256] = {
+	/* ALU: r/m, r  (MR) */
+	[0x01] = OP_ENC_MR,
+	[0x09] = OP_ENC_MR,
+	[0x21] = OP_ENC_MR,
+	[0x29] = OP_ENC_MR,
+	[0x31] = OP_ENC_MR,
+	[0x39] = OP_ENC_MR,
+
+	/* ALU: r, r/m  (RM) */
+	[0x03] = OP_ENC_RM,
+	[0x0B] = OP_ENC_RM,
+	[0x23] = OP_ENC_RM,
+	[0x2B] = OP_ENC_RM,
+	[0x33] = OP_ENC_RM,
+	[0x3B] = OP_ENC_RM,
+
+	/* Group 1: r/m, imm (MI) */
+	[0x81] = OP_ENC_MI,
+	[0x83] = OP_ENC_MI,
+
+	/* XCHG r/m, r  (MR) */
+	[0x87] = OP_ENC_MR,
+
 	/* MOV */
 	[0x88] = OP_ENC_MR,
 	[0x89] = OP_ENC_MR,
@@ -104,22 +391,42 @@ const enum x86_operand_enc x86_1byte_operand_enc_tbl[255] = {
 	[0xA1] = OP_ENC_FD,
 	[0xA2] = OP_ENC_TD,
 	[0xA3] = OP_ENC_TD,
+	[0xC6] = OP_ENC_MI,
+	[0xC7] = OP_ENC_MI,
 
 	/* MOVS */
 	[0xA4] = OP_ENC_ZO,
 	[0xA5] = OP_ENC_ZO,
+
+	/* TEST r/m, imm */
+	[0xF6] = OP_ENC_MI,
+	[0xF7] = OP_ENC_MI,
 };
 
-const enum x86_opcode_type x86_2byte_opcode_tbl[255] = {
+const enum x86_opcode_type x86_2byte_opcode_tbl[256] = {
 	/* MOVZX */
 	[0xB6] = OP_MOVZX,
 	[0xB7] = OP_MOVZX,
+
+	/* MOVSX */
+	[0xBE] = OP_MOVSX,
+	[0xBF] = OP_MOVSX,
+
+	/* BT/BTS/BTR/BTC group (0x0F BA /reg selects variant) */
+	[0xBA] = OP_BT_GROUP,
 };
 
-const enum x86_operand_enc x86_2byte_operand_enc_table[255] = {
+const enum x86_operand_enc x86_2byte_operand_enc_table[256] = {
 	/* MOVZX */
 	[0xB6] = OP_ENC_RM,
 	[0xB7] = OP_ENC_RM,
+
+	/* MOVSX */
+	[0xBE] = OP_ENC_RM,
+	[0xBF] = OP_ENC_RM,
+
+	/* BT group: r/m, imm8 (MI) */
+	[0xBA] = OP_ENC_MI,
 };
 
 /*
@@ -237,7 +544,7 @@ is_valid_state(struct x86_decode_state *state, const char *fn_name)
 	return (1);
 }
 
-#ifdef MMIO_DEBUG
+#if MMIO_DEBUG
 static void
 dump_regs(struct vcpu_reg_state *vrs)
 {
@@ -245,12 +552,12 @@ dump_regs(struct vcpu_reg_state *vrs)
 	struct vcpu_segment_info *vsi;
 
 	for (i = 0; i < VCPU_REGS_NGPRS; i++)
-		log_info("%s: %s 0x%llx", __progname, str_reg(i),
+		log_debug("%s: %s 0x%llx", __progname, str_reg(i),
 		    vrs->vrs_gprs[i]);
 
 	for (i = 0; i < VCPU_REGS_NSREGS; i++) {
 		vsi = &vrs->vrs_sregs[i];
-		log_info("%s: %s { sel: 0x%04x, lim: 0x%08x, ar: 0x%08x, "
+		log_debug("%s: %s { sel: 0x%04x, lim: 0x%08x, ar: 0x%08x, "
 		    "base: 0x%llx }", __progname, str_sreg(i),
 		    vsi->vsi_sel, vsi->vsi_limit, vsi->vsi_ar, vsi->vsi_base);
 	}
@@ -259,7 +566,7 @@ dump_regs(struct vcpu_reg_state *vrs)
 static void
 dump_insn(struct x86_insn *insn)
 {
-	log_info("instruction { %s, enc=%s, len=%d, mod=0x%02x, ("
+	log_debug("instruction { %s, enc=%s, len=%d, mod=0x%02x, ("
 	    "reg=%s, addr=0x%lx) sib=0x%02x }",
 	    str_opcode(&insn->insn_opcode),
 	    str_operand_enc(&insn->insn_opcode), insn->insn_bytes_len,
@@ -268,7 +575,7 @@ dump_insn(struct x86_insn *insn)
 }
 #endif /* MMIO_DEBUG */
 
-static const char *
+__unused static const char *
 str_cpu_mode(int mode)
 {
 	switch (mode) {
@@ -277,7 +584,7 @@ str_cpu_mode(int mode)
 	case VMM_CPU_MODE_PROT32: return "PROT32";
 	case VMM_CPU_MODE_COMPAT: return "COMPAT";
 	case VMM_CPU_MODE_LONG: return "LONG";
-	default: return "UKNOWN";
+	default: return "UNKNOWN";
 	}
 }
 
@@ -299,14 +606,27 @@ str_opcode(struct x86_opcode *opcode)
 	case OP_INS: return "INS";
 	case OP_MOV: return "MOV";
 	case OP_MOVZX: return "MOVZX";
+	case OP_MOVSX: return "MOVSX";
 	case OP_OUT: return "OUT";
 	case OP_OUTS: return "OUTS";
+	case OP_TEST: return "TEST";
+	case OP_ADD: return "ADD";
+	case OP_OR: return "OR";
+	case OP_AND: return "AND";
+	case OP_SUB: return "SUB";
+	case OP_XOR: return "XOR";
+	case OP_CMP: return "CMP";
+	case OP_XCHG: return "XCHG";
+	case OP_BT: return "BT";
+	case OP_BTS: return "BTS";
+	case OP_BTR: return "BTR";
+	case OP_BTC: return "BTC";
 	case OP_UNSUPPORTED: return "UNSUPPORTED";
 	default: return "UNKNOWN";
 	}
 }
 
-static const char *
+__unused static const char *
 str_operand_enc(struct x86_opcode *opcode)
 {
 	switch (opcode->op_encoding) {
@@ -322,7 +642,7 @@ str_operand_enc(struct x86_opcode *opcode)
 	}
 }
 
-static const char *
+__unused static const char *
 str_reg(int reg) {
 	switch (reg) {
 	case VCPU_REGS_RAX: return "RAX";
@@ -347,7 +667,7 @@ str_reg(int reg) {
 	}
 }
 
-static const char *
+__unused static const char *
 str_sreg(int sreg) {
 	switch (sreg) {
 	case VCPU_REGS_CS: return "CS";
@@ -355,10 +675,10 @@ str_sreg(int sreg) {
 	case VCPU_REGS_ES: return "ES";
 	case VCPU_REGS_FS: return "FS";
 	case VCPU_REGS_GS: return "GS";
-	case VCPU_REGS_SS: return "GS";
+	case VCPU_REGS_SS: return "SS";
 	case VCPU_REGS_LDTR: return "LDTR";
 	case VCPU_REGS_TR: return "TR";
-	default: return "UKNOWN";
+	default: return "UNKNOWN";
 	}
 }
 
@@ -473,6 +793,8 @@ decode_modrm(struct x86_decode_state *state, struct x86_insn *insn)
 {
 	enum decode_result res;
 	uint8_t byte = 0;
+	uint64_t moffs;
+	size_t asz;
 
 	if (!is_valid_state(state, __func__) || insn == NULL)
 		return (DECODE_ERROR);
@@ -491,6 +813,32 @@ decode_modrm(struct x86_decode_state *state, struct x86_insn *insn)
 		}
 		insn->insn_modrm = byte;
 		insn->insn_modrm_valid = 1;
+		break;
+
+	case OP_ENC_FD:
+	case OP_ENC_TD:
+		/*
+		 * FD/TD: direct moffs address, no ModRM.  Size is 2
+		 * bytes in 16-bit mode, 4 bytes in 32-bit mode.
+		 */
+		{
+			moffs = 0;
+			if (insn->insn_cpu_mode == VMM_CPU_MODE_REAL)
+				asz = (insn->insn_prefix.pfx_group4 ==
+				    LEG_4_ADDRSZ) ? 4 : 2;
+			else if (insn->insn_cpu_mode == VMM_CPU_MODE_PROT ||
+			    insn->insn_cpu_mode == VMM_CPU_MODE_PROT32)
+				asz = (insn->insn_prefix.pfx_group4 ==
+				    LEG_4_ADDRSZ) ? 2 : 4;
+			else
+				asz = (insn->insn_prefix.pfx_group4 ==
+				    LEG_4_ADDRSZ) ? 4 : 8;
+			res = next_value(state, asz, &moffs);
+			if (res == DECODE_ERROR)
+				break;
+			insn->insn_gva = moffs;
+			insn->insn_reg = VCPU_REGS_RAX;
+		}
 		break;
 
 	case OP_ENC_I:
@@ -560,36 +908,59 @@ get_modrm_addr(struct x86_insn *insn, struct vcpu_reg_state *vrs)
 		return (-1);
 
 	if (insn->insn_modrm_valid) {
+		int reg = -1;
+
 		rm = MODRM_RM(insn->insn_modrm);
 		mod = MODRM_MOD(insn->insn_modrm);
 
 		switch (rm) {
 		case 0b000:
-			addr = vrs->vrs_gprs[VCPU_REGS_RAX];
+			reg = VCPU_REGS_RAX;
 			break;
 		case 0b001:
-			addr = vrs->vrs_gprs[VCPU_REGS_RCX];
+			reg = VCPU_REGS_RCX;
 			break;
 		case 0b010:
-			addr = vrs->vrs_gprs[VCPU_REGS_RDX];
+			reg = VCPU_REGS_RDX;
 			break;
 		case 0b011:
-			addr = vrs->vrs_gprs[VCPU_REGS_RBX];
+			reg = VCPU_REGS_RBX;
 			break;
 		case 0b100:
+			/*
+			 * rm==4 with mod!=11 selects a SIB byte, whose base
+			 * (including REX.B) is resolved separately; only
+			 * mod==11 names a register directly here.
+			 */
 			if (mod == 0b11)
-				addr = vrs->vrs_gprs[VCPU_REGS_RSP];
+				reg = VCPU_REGS_RSP;
 			break;
 		case 0b101:
+			/*
+			 * mod==0 with rm==5 is [RIP+disp32] (resolved
+			 * post-decode); REX.B does not apply there.
+			 */
 			if (mod != 0b00)
-				addr = vrs->vrs_gprs[VCPU_REGS_RBP];
+				reg = VCPU_REGS_RBP;
 			break;
 		case 0b110:
-			addr = vrs->vrs_gprs[VCPU_REGS_RSI];
+			reg = VCPU_REGS_RSI;
 			break;
 		case 0b111:
-			addr = vrs->vrs_gprs[VCPU_REGS_RDI];
+			reg = VCPU_REGS_RDI;
 			break;
+		}
+
+		/*
+		 * REX.B extends the ModRM base register in LONG mode, the
+		 * same way REX.R extends ModRM.reg in get_modrm_reg().  It
+		 * is deliberately not applied to the SIB (rm==4, mod!=11) or
+		 * RIP-relative (rm==5, mod==0) forms, which leave reg == -1.
+		 */
+		if (reg != -1) {
+			if (insn->insn_prefix.pfx_rex & REX_B)
+				reg += 8;
+			addr = vrs->vrs_gprs[reg];
 		}
 
 		insn->insn_gva = addr;
@@ -612,8 +983,40 @@ decode_disp(struct x86_decode_state *state, struct x86_insn *insn)
 
 	switch (MODRM_MOD(insn->insn_modrm)) {
 	case 0x00:
-		insn->insn_disp_type = DISP_0;
-		res = DECODE_MORE;
+		/*
+		 * mod==0/rm==5 always encodes a disp32; the
+		 * semantics differ by mode (see below).
+		 */
+		if (MODRM_RM(insn->insn_modrm) == 5) {
+			/*
+			 * mod=0/rm=5: [disp32] in all modes.
+			 * In LONG/COMPAT this is RIP-relative (resolved
+			 * post-decode); in PROT32/PROT/REAL it is an
+			 * absolute 32-bit address.
+			 */
+			insn->insn_disp_type = DISP_4;
+			res = next_value(state, 4, &disp);
+			if (res == DECODE_ERROR)
+				return (res);
+			insn->insn_disp = disp;
+		} else if (MODRM_RM(insn->insn_modrm) == 4 &&
+		    insn->insn_sib_valid &&
+		    SIB_BASE(insn->insn_sib) == 5) {
+			/*
+			 * SIB-encoded absolute addressing: mod==0 with rm==4
+			 * (SIB follows) and SIB.base==5 encodes a disp32 with
+			 * no base register.  (REX.B does NOT extend the base
+			 * here -- this is the special "no base" encoding.)
+			 */
+			insn->insn_disp_type = DISP_4;
+			res = next_value(state, 4, &disp);
+			if (res == DECODE_ERROR)
+				return (res);
+			insn->insn_disp = disp;
+		} else {
+			insn->insn_disp_type = DISP_0;
+			res = DECODE_MORE;
+		}
 		break;
 	case 0x01:
 		insn->insn_disp_type = DISP_1;
@@ -664,7 +1067,7 @@ decode_opcode(struct x86_decode_state *state, struct x86_insn *insn)
 	switch(type) {
 	case OP_UNKNOWN:
 	case OP_UNSUPPORTED:
-		log_warnx("%s: unsupported opcode", __func__);
+		log_warnx("%s: unsupported opcode 0x%02x", __func__, byte);
 		return (DECODE_ERROR);
 
 	case OP_TWO_BYTE:
@@ -674,7 +1077,8 @@ decode_opcode(struct x86_decode_state *state, struct x86_insn *insn)
 
 		type = x86_2byte_opcode_tbl[byte2];
 		if (type == OP_UNKNOWN || type == OP_UNSUPPORTED) {
-			log_warnx("%s: unsupported 2-byte opcode", __func__);
+			log_warnx("%s: unsupported 2-byte opcode 0x0F 0x%02x",
+			    __func__, byte2);
 			return (DECODE_ERROR);
 		}
 
@@ -759,6 +1163,38 @@ decode_imm(struct x86_decode_state *state, struct x86_insn *insn)
 			    __func__);
 			return (DECODE_ERROR);
 		}
+	} else if (insn->insn_opcode.op_type == OP_TEST) {
+		/*
+		 * Group-3 TEST r/m, imm:
+		 *   0xF6 -> 8-bit imm
+		 *   0xF7 -> 16-bit imm if 0x66 prefix, else 32-bit
+		 *           (even with REX.W: TEST r/m64 takes 32-bit imm
+		 *           that is sign-extended).
+		 */
+		if (insn->insn_opcode.op_bytes[0] == 0xF6) {
+			num_bytes = 1;
+		} else if (insn->insn_prefix.pfx_group3 == LEG_3_OPSZ) {
+			num_bytes = 2;
+		} else {
+			num_bytes = 4;
+		}
+	} else if (insn->insn_opcode.op_type == OP_GROUP1) {
+		/*
+		 * Group 1 immediate sizes:
+		 *   0x81 -> 32-bit imm (sign-extended for REX.W 64-bit ops)
+		 *          16-bit imm if 0x66 prefix
+		 *   0x83 -> 8-bit sign-extended imm
+		 */
+		if (insn->insn_opcode.op_bytes[0] == 0x83) {
+			num_bytes = 1;
+		} else if (insn->insn_prefix.pfx_group3 == LEG_3_OPSZ) {
+			num_bytes = 2;
+		} else {
+			num_bytes = 4;
+		}
+	} else if (insn->insn_opcode.op_type == OP_BT_GROUP) {
+		/* BT/BTS/BTR/BTC r/m, imm8: always 1 byte immediate. */
+		num_bytes = 1;
 	} else {
 		/* Fallback to interpreting based on cpu mode and REX. */
 		if (insn->insn_cpu_mode == VMM_CPU_MODE_REAL)
@@ -794,8 +1230,13 @@ insn_decode(struct vm_exit *exit, struct x86_insn *insn)
 	enum decode_result res;
 	struct vcpu_reg_state *vrs = &exit->vrs;
 	struct x86_decode_state state;
+	char hexbuf[64];
 	uint8_t *bytes, len;
-	int mode;
+	uint8_t mod, sscale, sindex, sbase, rm;
+	int64_t disp, disp32;
+	uint64_t ea;
+	int has_base, index_reg, base_reg;
+	int mode, i, hlen;
 
 	if (exit == NULL || insn == NULL) {
 		log_warnx("%s: invalid input", __func__);
@@ -815,17 +1256,17 @@ insn_decode(struct vm_exit *exit, struct x86_insn *insn)
 	mode = detect_cpu_mode(vrs);
 	if (mode == VMM_CPU_MODE_UNKNOWN) {
 		log_warnx("%s: failed to identify cpu mode", __func__);
-#ifdef MMIO_DEBUG
+#if MMIO_DEBUG
 		dump_regs(vrs);
 #endif
 		return (-1);
 	}
 	insn->insn_cpu_mode = mode;
 
-#ifdef MMIO_DEBUG
-	log_info("%s: cpu mode %s detected", __progname, str_cpu_mode(mode));
+#if MMIO_DEBUG
+	log_debug("%s: cpu mode %s detected", __progname, str_cpu_mode(mode));
 	printf("%s: got bytes: [ ", __progname);
-	for (int i = 0; i < len; i++) {
+	for (i = 0; i < len; i++) {
 		printf("%02x ", bytes[i]);
 	}
 	printf("]\n");
@@ -838,8 +1279,9 @@ insn_decode(struct vm_exit *exit, struct x86_insn *insn)
 	} else if (res == DECODE_DONE)
 		goto done;
 
-#ifdef MMIO_DEBUG
-	log_info("%s: prefixes {g1: 0x%02x, g2: 0x%02x, g3: 0x%02x, g4: 0x%02x,"
+#if MMIO_DEBUG
+	log_debug("%s: prefixes {g1: 0x%02x, g2: 0x%02x, g3: 0x%02x,"
+	    " g4: 0x%02x,"
 	    " rex: 0x%02x }", __progname, insn->insn_prefix.pfx_group1,
 	    insn->insn_prefix.pfx_group2, insn->insn_prefix.pfx_group3,
 	    insn->insn_prefix.pfx_group4, insn->insn_prefix.pfx_rex);
@@ -853,8 +1295,8 @@ insn_decode(struct vm_exit *exit, struct x86_insn *insn)
 	} else if (res == DECODE_DONE)
 		goto done;
 
-#ifdef MMIO_DEBUG
-	log_info("%s: found opcode %s (operand encoding %s) (%s)", __progname,
+#if MMIO_DEBUG
+	log_debug("%s: found opcode %s (operand encoding %s) (%s)", __progname,
 	    str_opcode(&insn->insn_opcode), str_operand_enc(&insn->insn_opcode),
 	    str_decode_res(res));
 #endif
@@ -872,9 +1314,9 @@ insn_decode(struct vm_exit *exit, struct x86_insn *insn)
 	if (res == DECODE_DONE)
 		goto done;
 
-#ifdef MMIO_DEBUG
+#if MMIO_DEBUG
 	if (insn->insn_modrm_valid)
-		log_info("%s: found ModRM 0x%02x (%s)", __progname,
+		log_debug("%s: found ModRM 0x%02x (%s)", __progname,
 		    insn->insn_modrm, str_decode_res(res));
 #endif
 
@@ -886,9 +1328,9 @@ insn_decode(struct vm_exit *exit, struct x86_insn *insn)
 	} else if (res == DECODE_DONE)
 		goto done;
 
-#ifdef MMIO_DEBUG
+#if MMIO_DEBUG
 	if (insn->insn_sib_valid)
-		log_info("%s: found SIB 0x%02x (%s)", __progname,
+		log_debug("%s: found SIB 0x%02x (%s)", __progname,
 		    insn->insn_sib, str_decode_res(res));
 #endif
 
@@ -910,11 +1352,195 @@ insn_decode(struct vm_exit *exit, struct x86_insn *insn)
 done:
 	insn->insn_bytes_len = state.s_idx;
 
-#ifdef MMIO_DEBUG
-	log_info("%s: final instruction length is %u", __func__,
+	/*
+	 * 64-bit RIP-relative addressing: effective address is
+	 * (next-instruction RIP) + sign_extend(disp32).  Finalize
+	 * insn_gva here because total instruction length is now known.
+	 */
+	if (insn->insn_modrm_valid &&
+	    MODRM_MOD(insn->insn_modrm) == 0 &&
+	    MODRM_RM(insn->insn_modrm) == 5) {
+		if (insn->insn_cpu_mode == VMM_CPU_MODE_LONG ||
+		    insn->insn_cpu_mode == VMM_CPU_MODE_COMPAT) {
+			/* RIP-relative: next_RIP + sign_extend(disp32). */
+			disp32 = (int64_t)(int32_t)insn->insn_disp;
+			insn->insn_gva = vrs->vrs_gprs[VCPU_REGS_RIP]
+			    + insn->insn_bytes_len + disp32;
+		} else {
+			/* PROT32/PROT/REAL: absolute 32-bit address. */
+			insn->insn_gva = (uint32_t)insn->insn_disp;
+		}
+	}
+
+	/*
+	 * SIB-encoded addressing: effective address is
+	 *   disp + (index_reg << scale) + base_reg
+	 * with the special case that mod==0 + SIB.base==5 omits the base
+	 * (just disp32) -- and SIB.index==4 omits the index register.
+	 *
+	 * REX.X extends SIB.index; REX.B extends SIB.base -- but NOT in the
+	 * mod==0/base==5 "no base" encoding (Intel SDM Vol 2, 2.2.1.2).
+	 */
+	if (insn->insn_modrm_valid && insn->insn_sib_valid &&
+	    MODRM_RM(insn->insn_modrm) == 4) {
+		mod = MODRM_MOD(insn->insn_modrm);
+		sscale = SIB_SCALE(insn->insn_sib);
+		sindex = SIB_INDEX(insn->insn_sib);
+		sbase  = SIB_BASE(insn->insn_sib);
+		disp = 0;
+		ea = 0;
+
+		/* Sign-extend whatever disp we read (if any). */
+		switch (insn->insn_disp_type) {
+		case DISP_1:
+			disp = (int64_t)(int8_t)insn->insn_disp;
+			break;
+		case DISP_2:
+			disp = (int64_t)(int16_t)insn->insn_disp;
+			break;
+		case DISP_4:
+			disp = (int64_t)(int32_t)insn->insn_disp;
+			break;
+		default:
+			disp = 0;
+			break;
+		}
+
+		/* Index register: SIB.index==4 means "none". */
+		if (sindex != 4) {
+			index_reg = sindex;
+			if (insn->insn_prefix.pfx_rex & REX_X)
+				index_reg += 8;
+			ea += vrs->vrs_gprs[index_reg] << sscale;
+		}
+
+		/* Base register: special case mod==0/base==5 -> no base. */
+		has_base = !(mod == 0 && sbase == 5);
+		if (has_base) {
+			base_reg = sbase;
+			if (insn->insn_prefix.pfx_rex & REX_B)
+				base_reg += 8;
+			/*
+			 * VCPU_REGS_* encoding matches x86's GPR encoding
+			 * (0=RAX..7=RDI, 8=R8..15=R15), so index directly.
+			 */
+			ea += vrs->vrs_gprs[base_reg];
+		}
+
+		ea += (uint64_t)disp;
+		insn->insn_gva = ea;
+	}
+
+	/*
+	 * Non-SIB mod==1 / mod==2 addressing: get_modrm_addr() set insn_gva
+	 * from the base register but did NOT add the disp.  Fold in the
+	 * (sign-extended) displacement now that decode_disp has run.
+	 *
+	 * Skipped for rm==4 (SIB, handled above) and for mod==0/rm==5
+	 * (RIP-relative, handled above).
+	 */
+	if (insn->insn_modrm_valid && !insn->insn_sib_valid) {
+		mod = MODRM_MOD(insn->insn_modrm);
+		rm  = MODRM_RM(insn->insn_modrm);
+		disp = 0;
+
+		if ((mod == 1 || mod == 2) && rm != 4) {
+			switch (insn->insn_disp_type) {
+			case DISP_1:
+				disp = (int64_t)(int8_t)insn->insn_disp;
+				break;
+			case DISP_2:
+				disp = (int64_t)(int16_t)insn->insn_disp;
+				break;
+			case DISP_4:
+				disp = (int64_t)(int32_t)insn->insn_disp;
+				break;
+			default:
+				disp = 0;
+				break;
+			}
+			insn->insn_gva += (uint64_t)disp;
+		}
+	}
+
+	/*
+	 * Resolve Group 1 (0x81/0x83) to the actual ALU operation using
+	 * the ModRM /reg field.  This must happen after decode_modrm so
+	 * insn_modrm is valid.
+	 */
+	if (insn->insn_opcode.op_type == OP_GROUP1 &&
+	    insn->insn_modrm_valid) {
+		switch (MODRM_REGOP(insn->insn_modrm)) {
+		case 0:
+			insn->insn_opcode.op_type = OP_ADD;
+			break;
+		case 1:
+			insn->insn_opcode.op_type = OP_OR;
+			break;
+		case 4:
+			insn->insn_opcode.op_type = OP_AND;
+			break;
+		case 5:
+			insn->insn_opcode.op_type = OP_SUB;
+			break;
+		case 6:
+			insn->insn_opcode.op_type = OP_XOR;
+			break;
+		case 7:
+			insn->insn_opcode.op_type = OP_CMP;
+			break;
+		default:
+			log_warnx("%s: unsupported group-1 /reg=%u",
+			    __func__, MODRM_REGOP(insn->insn_modrm));
+			goto err;
+		}
+	}
+
+	/*
+	 * Resolve BT group (0x0F BA) to BT/BTS/BTR/BTC using the
+	 * ModRM /reg field.
+	 */
+	if (insn->insn_opcode.op_type == OP_BT_GROUP &&
+	    insn->insn_modrm_valid) {
+		switch (MODRM_REGOP(insn->insn_modrm)) {
+		case 4:
+			insn->insn_opcode.op_type = OP_BT;
+			break;
+		case 5:
+			insn->insn_opcode.op_type = OP_BTS;
+			break;
+		case 6:
+			insn->insn_opcode.op_type = OP_BTR;
+			break;
+		case 7:
+			insn->insn_opcode.op_type = OP_BTC;
+			break;
+		default:
+			log_warnx("%s: unsupported BT group /reg=%u",
+			    __func__, MODRM_REGOP(insn->insn_modrm));
+			goto err;
+		}
+	}
+
+	/*
+	 * Real / unpaged mode: the decoder computes insn_gva as a bare
+	 * offset (register value + displacement).  In real mode the
+	 * effective physical address is segment_base + offset.  Use
+	 * DS.base for data accesses (the common case for MMIO) so
+	 * translate_gva (which returns pa=va when CR0.PG is clear)
+	 * produces the correct GPA.
+	 */
+	if (insn->insn_cpu_mode == VMM_CPU_MODE_REAL &&
+	    insn->insn_modrm_valid) {
+		insn->insn_gva +=
+		    vrs->vrs_sregs[VCPU_REGS_DS].vsi_base;
+	}
+
+#if MMIO_DEBUG
+	log_debug("%s: final instruction length is %u", __func__,
 		insn->insn_bytes_len);
 	dump_insn(insn);
-	log_info("%s: modrm: {mod: %d, regop: %d, rm: %d}", __func__,
+	log_debug("%s: modrm: {mod: %d, regop: %d, rm: %d}", __func__,
 	    MODRM_MOD(insn->insn_modrm), MODRM_REGOP(insn->insn_modrm),
 	    MODRM_RM(insn->insn_modrm));
 	dump_regs(vrs);
@@ -922,9 +1548,16 @@ done:
 	return (0);
 
 err:
-#ifdef MMIO_DEBUG
+	hlen = 0;
+	for (i = 0; i < (int)state.s_len && i < 15 && hlen < 60; i++)
+		hlen += snprintf(hexbuf + hlen, sizeof(hexbuf) - hlen,
+		    "%02x ", state.s_bytes[i]);
+	log_warnx("%s: decode FAILED rip=0x%llx mode=%d bytes=[%s]",
+	    __func__, (unsigned long long)vrs->vrs_gprs[VCPU_REGS_RIP],
+	    mode, hexbuf);
+#if MMIO_DEBUG
 	dump_insn(insn);
-	log_info("%s: modrm: {mod: %d, regop: %d, rm: %d}", __func__,
+	log_debug("%s: modrm: {mod: %d, regop: %d, rm: %d}", __func__,
 	    MODRM_MOD(insn->insn_modrm), MODRM_REGOP(insn->insn_modrm),
 	    MODRM_RM(insn->insn_modrm));
 	dump_regs(vrs);
@@ -932,15 +1565,171 @@ err:
 	return (-1);
 }
 
+/*
+ * Generic MMIO emulation for MOV, ALU (ADD/OR/AND/SUB/XOR/CMP),
+ * TEST, and XCHG.  Table-driven: the mmio_op descriptor selects
+ * the compute function and which side-effects (flags, writeback,
+ * swap) to apply.
+ */
 static int
-emulate_mov(struct x86_insn *insn, struct vm_exit *exit)
+emulate_generic(struct x86_insn *insn, struct vm_exit *exit)
 {
-	/* XXX Only supports read to register for now */
-	if (insn->insn_opcode.op_encoding != OP_ENC_RM)
-		return (-1);
+	const struct mmio_op	*mop;
+	struct mmio_handler	*h;
+	uint64_t		 gpa, mem_val = 0, src_val, dst_val, result;
+	uint8_t			 bytes, sub;
+	int			 reg;
+	enum x86_opcode_type	 op;
 
-	/* XXX No device emulation yet. Fill with 0xFFs. */
-	exit->vrs.vrs_gprs[insn->insn_reg] = 0xFFFFFFFFFFFFFFFF;
+	op = insn->insn_opcode.op_type;
+	mop = mmio_op_for(op);
+	if (mop == NULL) {
+		log_warnx("%s: no mmio_op for opcode %d", __func__, op);
+		return (ENOTSUP);
+	}
+
+	/*
+	 * Operand size.  MOV has its own table; everything else uses ALU rules.
+	 */
+	bytes = (op == OP_MOV) ? mov_operand_bytes(insn) :
+	    alu_operand_bytes(insn);
+
+	/* TEST operand size: 0xF6 is 8-bit. */
+	if (op == OP_TEST) {
+		if (insn->insn_opcode.op_bytes[0] == 0xF6)
+			bytes = 1;
+		else if (insn->insn_prefix.pfx_group3 == LEG_3_OPSZ)
+			bytes = 2;
+		else if (insn->insn_prefix.pfx_rex & REX_W)
+			bytes = 8;
+		else
+			bytes = 4;
+	}
+
+	/* TEST group-3 sub-opcode validation. */
+	if (op == OP_TEST) {
+		sub = MODRM_REGOP(insn->insn_modrm);
+		if (sub != 0 && sub != 1) {
+			log_warnx("%s: unsupported group-3 /reg=%u",
+			    __func__, sub);
+			return (ENOTSUP);
+		}
+	}
+
+	reg = insn->insn_reg;
+
+	if (translate_gva(exit, insn->insn_gva, &gpa,
+	    PROT_READ | PROT_WRITE) != 0) {
+		log_warnx("%s: translate_gva failed gva=0x%llx",
+		    __func__, (unsigned long long)insn->insn_gva);
+		return (EFAULT);
+	}
+
+	h = mmio_find(gpa);
+
+	/* --- Read memory operand --- */
+	mem_val = 0;
+	switch (insn->insn_opcode.op_encoding) {
+	case OP_ENC_RM:
+	case OP_ENC_MR:
+	case OP_ENC_MI:
+	case OP_ENC_FD:
+		if (h != NULL && h->read != NULL)
+			h->read(gpa - h->base, bytes, &mem_val, h->cookie);
+		else if (read_mem(gpa, &mem_val, bytes) != 0)
+			mem_val = 0;
+		mem_val = mask_operand(mem_val, bytes);
+		break;
+	case OP_ENC_TD:
+		/* Pure write to memory, no read needed. */
+		break;
+	default:
+		log_warnx("%s: unsupported encoding %d", __func__,
+		    insn->insn_opcode.op_encoding);
+		return (ENOTSUP);
+	}
+
+	/* --- Determine dst and src for the compute function --- */
+	switch (insn->insn_opcode.op_encoding) {
+	case OP_ENC_RM:
+		/* reg OP [mem]: dst=reg, src=mem */
+		dst_val = exit->vrs.vrs_gprs[reg];
+		src_val = mem_val;
+		break;
+	case OP_ENC_MR:
+		/* [mem] OP reg: dst=mem, src=reg */
+		dst_val = mem_val;
+		src_val = mask_operand(exit->vrs.vrs_gprs[reg], bytes);
+		break;
+	case OP_ENC_MI:
+		/* [mem] OP imm: dst=mem, src=imm */
+		dst_val = mem_val;
+		src_val = insn->insn_immediate;
+		/*
+		 * Sign-extend immediate for Group 1 (0x83) and 64-bit MOV
+		 * (0xC7+REX.W).
+		 */
+		if (insn->insn_opcode.op_bytes[0] == 0x83)
+			src_val = sign_extend8(src_val);
+		else if (bytes == 8)
+			src_val = sign_extend32(src_val);
+		src_val = mask_operand(src_val, bytes);
+		break;
+	case OP_ENC_FD:
+		/* RAX <- [moffs]: dst=RAX, src=mem */
+		dst_val = exit->vrs.vrs_gprs[VCPU_REGS_RAX];
+		src_val = mem_val;
+		break;
+	case OP_ENC_TD:
+		/* [moffs] <- RAX: dst=mem(0), src=RAX */
+		dst_val = 0;
+		src_val = mask_operand(exit->vrs.vrs_gprs[VCPU_REGS_RAX],
+		    bytes);
+		break;
+	default:
+		return (ENOTSUP);
+	}
+
+	/* --- Compute --- */
+	result = mop->compute(dst_val, src_val);
+
+	/* --- RFLAGS --- */
+	if (mop->flags & MMIO_F_RFLAGS) {
+		update_rflags_alu(&exit->vrs.vrs_gprs[VCPU_REGS_RFLAGS],
+		    dst_val, src_val, result, bytes,
+		    (mop->flags & MMIO_F_SUB) ? 1 : 0,
+		    (mop->flags & MMIO_F_LOGIC) ? 1 : 0);
+	}
+
+	/* --- Writeback --- */
+	if (mop->flags & MMIO_F_XCHG) {
+		/* XCHG: write old reg to mem, old mem to reg. */
+		if (h != NULL && h->write != NULL)
+			h->write(gpa - h->base, bytes,
+			    mask_operand(exit->vrs.vrs_gprs[reg], bytes),
+			    h->cookie);
+		write_gpr(exit->vrs.vrs_gprs, reg, mem_val, bytes);
+	} else if (mop->flags & MMIO_F_WRITEBACK) {
+		switch (insn->insn_opcode.op_encoding) {
+		case OP_ENC_RM:
+			write_gpr(exit->vrs.vrs_gprs, reg, result, bytes);
+			break;
+		case OP_ENC_FD:
+			write_gpr(exit->vrs.vrs_gprs, VCPU_REGS_RAX,
+			    result, bytes);
+			break;
+		case OP_ENC_MR:
+		case OP_ENC_MI:
+		case OP_ENC_TD:
+			result = mask_operand(result, bytes);
+			if (h != NULL && h->write != NULL)
+				h->write(gpa - h->base, bytes, result,
+				    h->cookie);
+			break;
+		default:
+			break;
+		}
+	}
 
 	return (0);
 }
@@ -948,8 +1737,10 @@ emulate_mov(struct x86_insn *insn, struct vm_exit *exit)
 static int
 emulate_movzx(struct x86_insn *insn, struct vm_exit *exit)
 {
-	uint8_t byte, len, src = 1, dst = 2;
-	uint64_t value = 0;
+	struct mmio_handler	*h;
+	uint64_t		 gpa, val = 0;
+	uint8_t			 byte, len, src_bytes, dst_bytes;
+	int			 reg;
 
 	/* Only RM is valid for MOVZX. */
 	if (insn->insn_opcode.op_encoding != OP_ENC_RM) {
@@ -966,45 +1757,281 @@ emulate_movzx(struct x86_insn *insn, struct vm_exit *exit)
 
 	byte = insn->insn_opcode.op_bytes[len - 1];
 	switch (byte) {
-	case 0xB6:
-		src = 1;
-		if (insn->insn_cpu_mode == VMM_CPU_MODE_PROT
-		    || insn->insn_cpu_mode == VMM_CPU_MODE_REAL)
-			dst = 2;
-		else if (insn->insn_prefix.pfx_rex == REX_NONE)
-			dst = 4;
-		else // XXX validate CPU mode
-			dst = 8;
+	case 0xB6:	/* movzx r, r/m8 */
+		src_bytes = 1;
+		if (insn->insn_prefix.pfx_rex & REX_W)
+			dst_bytes = 8;
+		else if (insn->insn_prefix.pfx_group3 == LEG_3_OPSZ ||
+		    insn->insn_cpu_mode == VMM_CPU_MODE_PROT ||
+		    insn->insn_cpu_mode == VMM_CPU_MODE_REAL)
+			dst_bytes = 2;
+		else
+			dst_bytes = 4;
 		break;
-	case 0xB7:
-		src = 2;
-		if (insn->insn_prefix.pfx_rex == REX_NONE)
-			dst = 4;
-		else // XXX validate CPU mode
-			dst = 8;
+	case 0xB7:	/* movzx r, r/m16 */
+		src_bytes = 2;
+		if (insn->insn_prefix.pfx_rex & REX_W)
+			dst_bytes = 8;
+		else
+			dst_bytes = 4;
 		break;
 	default:
 		log_warnx("invalid byte in MOVZX opcode: %x", byte);
 		return (-1);
 	}
 
-	if (dst == 4)
-		exit->vrs.vrs_gprs[insn->insn_reg] &= 0xFFFFFFFF00000000;
-	else
-		exit->vrs.vrs_gprs[insn->insn_reg] = 0x0UL;
+	reg = insn->insn_reg;
 
-	/* XXX No device emulation yet. Fill with 0xFFs. */
-	switch (src) {
-	case 1: value = 0xFF; break;
-	case 2: value = 0xFFFF; break;
-	case 4: value = 0xFFFFFFFF; break;
-	case 8: value = 0xFFFFFFFFFFFFFFFF; break;
-	default:
-		log_warnx("invalid source size: %d", src);
+	if (translate_gva(exit, insn->insn_gva, &gpa, PROT_READ) != 0) {
+		log_warnx("emulate_movzx: translate_gva failed gva=0x%llx",
+		    (unsigned long long)insn->insn_gva);
+		return (EFAULT);
+	}
+
+	h = mmio_find(gpa);
+	if (h != NULL && h->read != NULL)
+		h->read(gpa - h->base, src_bytes, &val, h->cookie);
+	else if (read_mem(gpa, &val, src_bytes) != 0)
+		val = 0;
+
+	/* Zero-extend from the source size, then write the destination. */
+	if (src_bytes == 1)
+		val &= 0xFF;
+	else
+		val &= 0xFFFF;
+
+	write_gpr(exit->vrs.vrs_gprs, reg, val, dst_bytes);
+
+	return (0);
+}
+
+/*
+ * emulate_movsx
+ *
+ * MOVSX r, r/m -- sign-extending load from MMIO.
+ * 0x0F BE: sign-extend byte to word/dword/qword
+ * 0x0F BF: sign-extend word to dword/qword
+ */
+static int
+emulate_movsx(struct x86_insn *insn, struct vm_exit *exit)
+{
+	struct mmio_handler	*h;
+	uint64_t		 gpa, val = 0;
+	uint8_t			 byte, len, src_bytes, dst_bytes;
+	int			 reg;
+
+	if (insn->insn_opcode.op_encoding != OP_ENC_RM) {
+		log_warnx("invalid op encoding for MOVSX: %d",
+		    insn->insn_opcode.op_encoding);
 		return (-1);
 	}
 
-	exit->vrs.vrs_gprs[insn->insn_reg] |= value;
+	len = insn->insn_opcode.op_bytes_len;
+	if (len < 1 || len > sizeof(insn->insn_opcode.op_bytes)) {
+		log_warnx("invalid opcode byte length for MOVSX: %d", len);
+		return (-1);
+	}
+
+	byte = insn->insn_opcode.op_bytes[len - 1];
+	switch (byte) {
+	case 0xBE:
+		src_bytes = 1;
+		break;
+	case 0xBF:
+		src_bytes = 2;
+		break;
+	default:
+		log_warnx("invalid byte in MOVSX opcode: 0x%02x", byte);
+		return (-1);
+	}
+
+	/* Destination size follows REX.W / 0x66 rules. */
+	if (insn->insn_prefix.pfx_rex & REX_W)
+		dst_bytes = 8;
+	else
+		dst_bytes = 4;
+
+	reg = insn->insn_reg;
+
+	if (translate_gva(exit, insn->insn_gva, &gpa, PROT_READ) != 0) {
+		log_warnx("emulate_movsx: translate_gva failed gva=0x%llx",
+		    (unsigned long long)insn->insn_gva);
+		return (EFAULT);
+	}
+
+	h = mmio_find(gpa);
+	if (h != NULL && h->read != NULL)
+		h->read(gpa - h->base, src_bytes, &val, h->cookie);
+	else if (read_mem(gpa, &val, src_bytes) != 0)
+		val = 0;
+
+	/* Sign-extend from source size. */
+	if (src_bytes == 1)
+		val = sign_extend8(val);
+	else
+		val = sign_extend16(val);
+
+	/* Write to destination register. */
+	write_gpr(exit->vrs.vrs_gprs, reg, val, dst_bytes);
+
+	return (0);
+}
+
+/*
+ * update_rflags_alu
+ *
+ * Update RFLAGS for an ALU operation.  Handles ADD, SUB, AND, OR, XOR, CMP.
+ *
+ *   a, b:     source operands (for sub/cmp: a - b)
+ *   result:   computed result
+ *   bytes:    operand size (1, 2, 4, or 8)
+ *   is_sub:   1 for SUB/CMP, 0 for ADD
+ *   is_logic: 1 for AND/OR/XOR (CF=OF=0, AF undef), 0 for arith
+ */
+static void
+update_rflags_alu(uint64_t *rflags, uint64_t a, uint64_t b, uint64_t result,
+    uint8_t bytes, int is_sub, int is_logic)
+{
+	uint64_t mask, sign_bit, fl;
+
+	switch (bytes) {
+	case 1: mask = 0xFFULL; sign_bit = 1ULL << 7; break;
+	case 2: mask = 0xFFFFULL; sign_bit = 1ULL << 15; break;
+	case 4: mask = 0xFFFFFFFFULL; sign_bit = 1ULL << 31; break;
+	case 8: mask = 0xFFFFFFFFFFFFFFFFULL; sign_bit = 1ULL << 63; break;
+	default: return;
+	}
+
+	a &= mask;
+	b &= mask;
+	result &= mask;
+
+	fl = *rflags;
+	fl &= ~((1ULL << 0)    /* CF */
+	      | (1ULL << 2)    /* PF */
+	      | (1ULL << 4)    /* AF */
+	      | (1ULL << 6)    /* ZF */
+	      | (1ULL << 7)    /* SF */
+	      | (1ULL << 11)); /* OF */
+
+	/* ZF */
+	if (result == 0)
+		fl |= (1ULL << 6);
+
+	/* SF */
+	if (result & sign_bit)
+		fl |= (1ULL << 7);
+
+	/* PF -- parity of low byte */
+	if (parity_even((uint8_t)result))
+		fl |= (1ULL << 2);
+
+	if (is_logic) {
+		/* AND/OR/XOR: CF=0, OF=0, AF undefined (leave cleared). */
+	} else if (is_sub) {
+		/* CF: borrow -- set if a < b (unsigned). */
+		if (a < b)
+			fl |= (1ULL << 0);
+
+		/*
+		 * OF: signed overflow -- (a^b) has different signs AND
+		 * (a^result) has different signs.
+		 */
+		if ((a ^ b) & (a ^ result) & sign_bit)
+			fl |= (1ULL << 11);
+
+		/* AF: borrow from bit 4. */
+		if ((a & 0xF) < (b & 0xF))
+			fl |= (1ULL << 4);
+	} else {
+		/* ADD: CF = carry out. */
+		if (result < a)
+			fl |= (1ULL << 0);
+
+		/* OF: both operands same sign, result different sign. */
+		if (~(a ^ b) & (a ^ result) & sign_bit)
+			fl |= (1ULL << 11);
+
+		/* AF: carry from bit 3 to bit 4. */
+		if (((a & 0xF) + (b & 0xF)) > 0xF)
+			fl |= (1ULL << 4);
+	}
+
+	*rflags = fl;
+}
+
+/*
+ * emulate_bt_group
+ *
+ * BT/BTS/BTR/BTC r/m, imm8 -- bit test (and set/reset/complement).
+ *
+ * Reads a bit from the MMIO value, sets CF accordingly, then optionally
+ * modifies the bit in the MMIO value.
+ *
+ * Other RFLAGS (OF, SF, AF, PF) are undefined per Intel SDM.
+ */
+static int
+emulate_bt_group(struct x86_insn *insn, struct vm_exit *exit)
+{
+	struct mmio_handler	*h;
+	uint64_t		 gpa, val = 0, bit_mask;
+	uint64_t		*rflags;
+	uint8_t			 bytes, bit_offset;
+	enum x86_opcode_type	 op;
+
+	bytes = alu_operand_bytes(insn);
+	op = insn->insn_opcode.op_type;
+	rflags = &exit->vrs.vrs_gprs[VCPU_REGS_RFLAGS];
+
+	if (translate_gva(exit, insn->insn_gva, &gpa,
+	    PROT_READ | PROT_WRITE) != 0) {
+		log_warnx("emulate_bt_group: translate_gva failed gva=0x%llx",
+		    (unsigned long long)insn->insn_gva);
+		return (EFAULT);
+	}
+
+	h = mmio_find(gpa);
+
+	/* Read current value. */
+	if (h != NULL && h->read != NULL)
+		h->read(gpa - h->base, bytes, &val, h->cookie);
+	else if (read_mem(gpa, &val, bytes) != 0)
+		val = 0;
+
+	/* Bit offset is modulo operand size in bits. */
+	bit_offset = (uint8_t)insn->insn_immediate % (bytes * 8);
+	bit_mask = 1ULL << bit_offset;
+
+	/* Set CF from the tested bit. */
+	if (val & bit_mask)
+		*rflags |= (1ULL << 0);   /* CF */
+	else
+		*rflags &= ~(1ULL << 0);  /* CF */
+
+	/* Modify the bit if needed. */
+	switch (op) {
+	case OP_BT:
+		/* Test only, no modification. */
+		break;
+	case OP_BTS:
+		val |= bit_mask;
+		if (h != NULL && h->write != NULL)
+			h->write(gpa - h->base, bytes, val, h->cookie);
+		break;
+	case OP_BTR:
+		val &= ~bit_mask;
+		if (h != NULL && h->write != NULL)
+			h->write(gpa - h->base, bytes, val, h->cookie);
+		break;
+	case OP_BTC:
+		val ^= bit_mask;
+		if (h != NULL && h->write != NULL)
+			h->write(gpa - h->base, bytes, val, h->cookie);
+		break;
+	default:
+		log_warnx("emulate_bt_group: unexpected op %d", op);
+		return (ENOTSUP);
+	}
 
 	return (0);
 }
@@ -1023,13 +2050,38 @@ insn_emulate(struct vm_exit *exit, struct x86_insn *insn)
 {
 	int res;
 
+	if (insn->insn_reg < 0 || insn->insn_reg >= VCPU_REGS_NGPRS) {
+		log_warnx("%s: insn_reg %d out of bounds", __func__,
+		    insn->insn_reg);
+		return (-1);
+	}
+
 	switch (insn->insn_opcode.op_type) {
 	case OP_MOV:
-		res = emulate_mov(insn, exit);
+	case OP_ADD:
+	case OP_OR:
+	case OP_AND:
+	case OP_SUB:
+	case OP_XOR:
+	case OP_CMP:
+	case OP_TEST:
+	case OP_XCHG:
+		res = emulate_generic(insn, exit);
 		break;
 
 	case OP_MOVZX:
 		res = emulate_movzx(insn, exit);
+		break;
+
+	case OP_MOVSX:
+		res = emulate_movsx(insn, exit);
+		break;
+
+	case OP_BT:
+	case OP_BTS:
+	case OP_BTR:
+	case OP_BTC:
+		res = emulate_bt_group(insn, exit);
 		break;
 
 	default:
