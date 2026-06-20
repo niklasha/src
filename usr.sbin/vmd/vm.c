@@ -31,9 +31,11 @@
 #include <poll.h>
 #include <pthread.h>
 #include <pthread_np.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <util.h>
 
@@ -42,12 +44,17 @@
 #include "virtio.h"
 #include "vmd.h"
 
-#define MMIO_NOTYET 0
+/*
+ * Seconds to wait for all vcpu threads to exit after the VM is known to be
+ * terminating before the per-VM process force-exits (suicide watchdog).
+ */
+#define VM_TERMINATE_TIMEOUT_SEC 3
 
 static int run_vm(struct vmd_vm *, struct vcpu_reg_state *);
 static void vm_dispatch_vmm(int, short, void *);
 static void *event_thread(void *);
 static void *vcpu_run_loop(void *);
+static void vm_set_terminating(void);
 static int vmm_create_vm(struct vmd_vm *);
 static void pause_vm(struct vmd_vm *);
 static void unpause_vm(struct vmd_vm *);
@@ -57,6 +64,7 @@ int con_fd;
 struct vmd_vm *current_vm;
 
 extern struct vmd *env;
+extern __thread uint32_t current_vcpu_id;
 
 pthread_mutex_t threadmutex;
 pthread_cond_t threadcond;
@@ -70,6 +78,15 @@ pthread_mutex_t vcpu_unpause_mtx[VMM_MAX_VCPUS_PER_VM];
 pthread_mutex_t vm_mtx;
 uint8_t vcpu_hlt[VMM_MAX_VCPUS_PER_VM];
 uint8_t vcpu_done[VMM_MAX_VCPUS_PER_VM];
+
+/*
+ * Set once the kernel vm object is gone (force-stop / guest terminated).
+ * Written under vm_mtx by vm_set_terminating(); read both under vm_mtx
+ * (reaper) and as a lock-free fast path (vcpu_run_loop top).  Once set, every
+ * vcpu thread must stop spinning and exit so the per-VM process can die
+ * instead of orphaning.
+ */
+volatile sig_atomic_t vm_terminating;
 
 /*
  * vm_main
@@ -352,12 +369,44 @@ vm_dispatch_vmm(int fd, short event, void *arg)
 			    sizeof(verbose));
 			break;
 		case IMSG_VMDOP_VM_SHUTDOWN:
-			if (vmmci_ctl(&vmmci, VMMCI_SHUTDOWN) == -1)
+			if (vmmci_ctl(&vmmci, VMMCI_SHUTDOWN) == -1) {
+				/*
+				 * Guest has no vmmci driver (e.g. Linux), so
+				 * the graceful request was a no-op and we exit
+				 * now.  Quiesce the vcpu threads first:
+				 * pause_vm drives them out of
+				 * ioctl(VMM_IOC_RUN) to the pause barrier
+				 * (userspace), so the subsequent _exit ->
+				 * uvm_map_teardown does not race a sibling vcpu
+				 * still inside uvm_fault_wire on the shared
+				 * guest-memory map -- that race strands a wired
+				 * PG_PVLIST PTE on a freed page and panics the
+				 * host (pmap_remove_ptes: unmanaged page marked
+				 * PG_PVLIST).  Only exposed once cpus>1 was
+				 * allowed.
+				 */
+				pause_vm(vm);
 				_exit(0);
+			}
 			break;
 		case IMSG_VMDOP_VM_REBOOT:
-			if (vmmci_ctl(&vmmci, VMMCI_REBOOT) == -1)
+			if (vmmci_ctl(&vmmci, VMMCI_REBOOT) == -1) {
+				pause_vm(vm);
 				_exit(0);
+			}
+			break;
+		case IMSG_VMDOP_VM_TERMINATE:
+			/*
+			 * Operator force-stop (vmctl stop -f): PROC_VMM is
+			 * destroying the kernel VM object.  Set the terminate
+			 * flag directly rather than waiting for a vcpu to
+			 * discover ENOENT on its own -- this wakes any halted
+			 * vcpus (broadcast) so they exit, and arms the reaper's
+			 * bounded suicide watchdog, so the process cannot
+			 * orphan in "stopping" when no vcpu happens to be in
+			 * ioctl(VMM_IOC_RUN) to see the VM vanish.
+			 */
+			vm_set_terminating();
 			break;
 		case IMSG_VMDOP_PAUSE_VM:
 			vmr.vmr_result = 0;
@@ -589,7 +638,7 @@ run_vm(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 {
 	struct vmop_create_params *vmc;
 	uint8_t evdone = 0;
-	size_t i;
+	size_t i, joined;
 	int ret;
 	pthread_t *tid, evtid;
 	char tname[MAXCOMLEN + 1];
@@ -622,6 +671,11 @@ run_vm(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 	log_debug("%s: starting %zu vcpu thread(s) for vm %s", __func__,
 	    vmc->vmc_ncpus, vmc->vmc_name);
 
+	/* LAPIC/IOAPIC MMIO handlers for SMP and MP-kernel guests. */
+	if (lapic_smp_init(vm->vm_vmmid, vmc->vmc_ncpus) != 0)
+		log_warnx("%s: lapic_smp_init failed (continuing)",
+		    __func__);
+
 	/*
 	 * Create and launch one thread for each VCPU. These threads may
 	 * migrate between PCPUs over time; the need to reload CPU state
@@ -645,7 +699,8 @@ run_vm(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 		vrp[i]->vrp_vcpu_id = i;
 
 		if (vcpu_reset(vm->vm_vmmid, i, vrs)) {
-			log_warnx("cannot reset vcpu %zu", i);
+			log_warnx("cannot reset vcpu %zu (vmmid=%u)",
+			    i, vm->vm_vmmid);
 			return (EIO);
 		}
 
@@ -693,7 +748,10 @@ run_vm(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 			return (ret);
 		}
 
-		vcpu_hlt[i] = 0;
+		/*
+		 * APs start halted; INIT/SIPI from BSP's LAPIC ICR wakes them.
+		 */
+		vcpu_hlt[i] = (i == 0) ? 0 : 1;
 
 		/* Start each VCPU run thread at vcpu_run_loop */
 		ret = pthread_create(&tid[i], NULL, vcpu_run_loop, vrp[i]);
@@ -718,20 +776,60 @@ run_vm(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 	}
 	pthread_set_name_np(evtid, "event");
 
-	for (;;) {
-		ret = pthread_cond_wait(&threadcond, &threadmutex);
-		if (ret) {
+	/* Timer thread must start after vcpu threads (kernel state). */
+	if (vmc->vmc_ncpus > 1) {
+		if (lapic_smp_timer_start() != 0)
+			log_warnx("%s: lapic_smp_timer_start failed",
+			    __func__);
+	}
+
+	joined = 0;
+	while (joined < vmc->vmc_ncpus) {
+		int terminating;
+
+		mutex_lock(&vm_mtx);
+		terminating = vm_terminating;
+		mutex_unlock(&vm_mtx);
+
+		if (terminating) {
+			/*
+			 * (D) The VM is going away: bound how long we wait for
+			 * the vcpu threads to exit.  If one is wedged (stuck in
+			 * the kernel, or a device subprocess will not drain),
+			 * force the process down rather than orphan forever.
+			 */
+			struct timespec ts;
+
+			clock_gettime(CLOCK_REALTIME, &ts);
+			ts.tv_sec += VM_TERMINATE_TIMEOUT_SEC;
+			ret = pthread_cond_timedwait(&threadcond, &threadmutex,
+			    &ts);
+			if (ret == ETIMEDOUT) {
+				log_warnx("%s: vcpu threads still running %d s "
+				    "after termination (%zu/%zu joined); "
+				    "forcing exit", __func__,
+				    VM_TERMINATE_TIMEOUT_SEC, joined,
+				    vmc->vmc_ncpus);
+				_exit(0);
+			}
+		} else
+			ret = pthread_cond_wait(&threadcond, &threadmutex);
+
+		if (ret && ret != ETIMEDOUT) {
 			log_warn("%s: waiting on thread state condition "
 			    "variable failed", __func__);
 			return (ret);
 		}
 
 		/*
-		 * Did a VCPU thread exit with an error? => return the first one
+		 * Reap every vcpu thread that has exited, joining each exactly
+		 * once: tid[i] is zeroed after a successful join so a later
+		 * wakeup does not re-join an already-joined thread (which
+		 * returns an error and would otherwise be treated as fatal).
 		 */
 		mutex_lock(&vm_mtx);
 		for (i = 0; i < vmc->vmc_ncpus; i++) {
-			if (vcpu_done[i] == 0)
+			if (vcpu_done[i] == 0 || tid[i] == 0)
 				continue;
 
 			if (pthread_join(tid[i], &exit_status)) {
@@ -740,6 +838,8 @@ run_vm(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 				return (EIO);
 			}
 
+			tid[i] = 0;
+			joined++;
 			ret = (intptr_t)exit_status;
 		}
 		mutex_unlock(&vm_mtx);
@@ -754,19 +854,10 @@ run_vm(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 			log_warnx("event thread exited unexpectedly");
 			return (EIO);
 		}
-
-		/* Did all VCPU threads exit successfully? => return */
-		mutex_lock(&vm_mtx);
-		for (i = 0; i < vmc->vmc_ncpus; i++) {
-			if (vcpu_done[i] == 0)
-				break;
-		}
-		mutex_unlock(&vm_mtx);
-		if (i == vmc->vmc_ncpus)
-			break;
-
-		/* Some more threads to wait for, start over */
 	}
+
+	lapic_smp_timer_stop();
+	lapic_smp_free();
 
 	if (pthread_barrier_destroy(&vm_pause_barrier))
 		log_warnx("could not destroy pause barrier");
@@ -792,6 +883,46 @@ event_thread(void *arg)
  }
 
 /*
+ * vm_set_terminating
+ *
+ * Mark the VM as going away (the kernel vm object was destroyed -- e.g. by a
+ * force-stop -- or the guest terminated) and wake every vcpu thread that may
+ * be blocked waiting for a kick or on the unpause cond.  Without this, a
+ * halted/idle vcpu sleeping on vcpu_run_cond[] never wakes (nothing will kick
+ * it once the kernel can no longer run the vm), so it never sets vcpu_done[],
+ * the reaper never sees all threads exit, and the per-VM process orphans.
+ *
+ * The flag is set under vm_mtx first; the per-vcpu broadcast is then issued
+ * while holding vcpu_run_mtx[i], which orders against vcpu_run_loop's
+ * locked check of vm_terminating before it waits -- no lost wakeup.
+ * Idempotent and safe to call from any vcpu thread.
+ */
+static void
+vm_set_terminating(void)
+{
+	size_t i, ncpus;
+
+	mutex_lock(&vm_mtx);
+	if (vm_terminating) {
+		mutex_unlock(&vm_mtx);
+		return;
+	}
+	vm_terminating = 1;
+	mutex_unlock(&vm_mtx);
+
+	ncpus = current_vm->vm_params.vmc_ncpus;
+	for (i = 0; i < ncpus; i++) {
+		mutex_lock(&vcpu_run_mtx[i]);
+		pthread_cond_broadcast(&vcpu_run_cond[i]);
+		mutex_unlock(&vcpu_run_mtx[i]);
+
+		mutex_lock(&vcpu_unpause_mtx[i]);
+		pthread_cond_broadcast(&vcpu_unpause_cond[i]);
+		mutex_unlock(&vcpu_unpause_mtx[i]);
+	}
+}
+
+/*
  * vcpu_run_loop
  *
  * Runs a single VCPU until vmm(4) requires help handling an exit,
@@ -810,9 +941,22 @@ vcpu_run_loop(void *arg)
 	struct vm_run_params *vrp = (struct vm_run_params *)arg;
 	intptr_t ret = 0;
 	uint32_t n = vrp->vrp_vcpu_id;
-	int paused = 0, halted = 0;
+	int paused = 0;
+
+	/* Identify this thread for LAPIC/IOAPIC dispatch. */
+	current_vcpu_id = n;
 
 	for (;;) {
+		/*
+		 * Whole-VM teardown in progress: stop spinning and let this
+		 * thread exit so the process can reap and die (see
+		 * vm_set_terminating()).  Lock-free fast path; the
+		 * authoritative check is under vcpu_run_mtx[n] before we wait,
+		 * below.
+		 */
+		if (vm_terminating)
+			break;
+
 		ret = pthread_mutex_lock(&vcpu_run_mtx[n]);
 
 		if (ret) {
@@ -823,7 +967,6 @@ vcpu_run_loop(void *arg)
 
 		mutex_lock(&vm_mtx);
 		paused = (current_vm->vm_state & VM_STATE_PAUSED) != 0;
-		halted = vcpu_hlt[n];
 		mutex_unlock(&vm_mtx);
 
 		/* If we need to pause, wait on the barrier. */
@@ -862,8 +1005,22 @@ vcpu_run_loop(void *arg)
 			}
 		}
 
-		/* If we are halted and not paused, wait */
-		if (halted) {
+		/*
+		 * Re-read vcpu_hlt AND the pending-interrupt state under
+		 * vcpu_run_mtx to avoid a lost wakeup.  The LAPIC 1ms timer
+		 * thread can set IRR and call vcpu_unhalt()/kick in the window
+		 * between the kernel HLT exit and vcpu_halt() (reached via
+		 * vcpu_exit below) re-setting vcpu_hlt[n]=1, swallowing the
+		 * wake.  A one-shot timer disarms when it fires, so nothing
+		 * retries -- an idle AP would then sleep forever with the
+		 * vector stuck in IRR (RCU stall; the BSP is immune because its
+		 * i8259/PIT re-asserts IRQ0 every tick).  lapic_set_irr_locked
+		 * sets IRR before lapic_kick takes vcpu_run_mtx[n], so a racing
+		 * kick is visible to intr_pending() now that we hold the mtx.
+		 * Only block when truly idle (halted with nothing pending).
+		 */
+		if (!vm_terminating && vcpu_hlt[n] &&
+		    !intr_pending_nofire(current_vm, n)) {
 			ret = pthread_cond_wait(&vcpu_run_cond[n],
 			    &vcpu_run_mtx[n]);
 
@@ -877,6 +1034,27 @@ vcpu_run_loop(void *arg)
 			}
 		}
 
+		/*
+		 * Woken (possibly by vm_set_terminating()'s broadcast): if the
+		 * VM is going away, exit now instead of issuing a run ioctl
+		 * that would only fail.  Checked while holding vcpu_run_mtx[n],
+		 * so it is ordered against the broadcast -- no lost wakeup.
+		 */
+		if (vm_terminating) {
+			(void)pthread_mutex_unlock(&vcpu_run_mtx[n]);
+			break;
+		}
+		/*
+		 * A vector raced the halt (or arrived during the wait): clear
+		 * the halt flag so we resume and inject it instead of blocking
+		 * again next iteration against an already-disarmed one-shot.
+		 * Use the nofire variant: we hold vcpu_run_mtx[n] here, and the
+		 * normal intr_pending() can fire a due timer whose kick
+		 * re-takes this very mutex (self-deadlock).
+		 */
+		if (vcpu_hlt[n] && intr_pending_nofire(current_vm, n))
+			vcpu_hlt[n] = 0;
+
 		ret = pthread_mutex_unlock(&vcpu_run_mtx[n]);
 
 		if (ret) {
@@ -885,25 +1063,57 @@ vcpu_run_loop(void *arg)
 			break;
 		}
 
-		if (vrp->vrp_irqready && intr_pending(current_vm)) {
-			vrp->vrp_inject.vie_vector = intr_ack(current_vm);
+		/* Apply deferred SIPI reset from our own thread context. */
+		(void)vcpu_sipi_pending(current_vm->vm_vmmid, n);
+
+		int acked_vec = -1;
+		if (vrp->vrp_irqready && intr_pending(current_vm, n)) {
+			vrp->vrp_inject.vie_vector = intr_ack(current_vm, n);
+			acked_vec = vrp->vrp_inject.vie_vector;
 			vrp->vrp_inject.vie_type = VCPU_INJECT_INTR;
-		} else
+		} else {
 			vrp->vrp_inject.vie_type = VCPU_INJECT_NONE;
+		}
 
 		/* Still more interrupts pending? */
-		vrp->vrp_intr_pending = intr_pending(current_vm);
+		vrp->vrp_intr_pending = intr_pending(current_vm, n);
 
 		if (ioctl(env->vmd_fd, VMM_IOC_RUN, vrp) == -1) {
-			/* If run ioctl failed, exit */
 			ret = errno;
 			log_warn("%s: vm %d / vcpu %d run ioctl failed",
 			    __func__, current_vm->vm_vmid, n);
+			/*
+			 * The kernel can no longer run this vm (ENOENT once the
+			 * vm object is gone, or any other fatal run error): the
+			 * whole VM is dying.  Wake the other vcpu threads so a
+			 * halted sibling does not sleep forever and orphan the
+			 * process.
+			 */
+			vm_set_terminating();
 			break;
 		}
 
+		/*
+		 * Gated ack: intr_ack() above moved the vector IRR->ISR
+		 * speculatively.  The kernel reflects whether it actually
+		 * injected by clearing vrp_inject.vie_type to VCPU_INJECT_NONE;
+		 * if it is still VCPU_INJECT_INTR the guest was not
+		 * interruptible (STI/MOV-SS shadow) and the vector was NOT
+		 * delivered.  Undo the speculative ack so the vector returns to
+		 * IRR and is retried, instead of being orphaned in ISR -- a
+		 * stranded ISR bit pins PPR and permanently masks all
+		 * lower-priority vectors (e.g. a stuck timer 0xec masking the
+		 * vioblk completion 0x22 -> guest hangs in io_schedule).
+		 */
+		if (acked_vec >= 0 &&
+		    vrp->vrp_inject.vie_type == VCPU_INJECT_INTR)
+			intr_unack(current_vm, n, (uint8_t)acked_vec);
+
+
 		/* If the VM is terminating, exit normally */
 		if (vrp->vrp_exit_reason == VM_EXIT_TERMINATED) {
+			/* Wake any halted sibling so it exits too. */
+			vm_set_terminating();
 			ret = (intptr_t)NULL;
 			break;
 		}
@@ -1125,17 +1335,23 @@ remap_guest_mem(struct vmd_vm *vm, int vmm_fd)
 void
 vcpu_halt(uint32_t vcpu_id)
 {
-	mutex_lock(&vm_mtx);
+	/* vcpu_run_mtx: ordered with vcpu_run_loop's check + cond_wait. */
+	mutex_lock(&vcpu_run_mtx[vcpu_id]);
 	vcpu_hlt[vcpu_id] = 1;
-	mutex_unlock(&vm_mtx);
+	mutex_unlock(&vcpu_run_mtx[vcpu_id]);
 }
 
+/*
+ * Signal inside vcpu_run_mtx so the wakeup cannot be lost between
+ * vcpu_run_loop's halted check and its cond_wait.
+ */
 void
 vcpu_unhalt(uint32_t vcpu_id)
-	{
-	mutex_lock(&vm_mtx);
+{
+	mutex_lock(&vcpu_run_mtx[vcpu_id]);
 	vcpu_hlt[vcpu_id] = 0;
-	mutex_unlock(&vm_mtx);
+	pthread_cond_signal(&vcpu_run_cond[vcpu_id]);
+	mutex_unlock(&vcpu_run_mtx[vcpu_id]);
 }
 
 void

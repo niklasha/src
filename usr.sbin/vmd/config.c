@@ -72,6 +72,9 @@ config_init(struct vmd *env)
 	ps->ps_what[PROC_PARENT] = CONFIG_ALL;
 	ps->ps_what[PROC_VMM] = CONFIG_VMS;
 
+	/* Monotonic per-launch generation counter (never reset on reload) */
+	env->vmd_gen = 0;
+
 	/* Local prefix */
 	if (config_init_localprefix(&env->vmd_cfg) == -1)
 		return (-1);
@@ -479,6 +482,19 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		goto fail;
 	}
 
+	/*
+	 * Stamp a fresh per-launch generation.  vm_vmid is sticky (reused
+	 * across stop/start of the same name+uid), so a lagging terminate
+	 * event for a prior instance can otherwise match this new launch by
+	 * vmid alone and drop it from the registry ("disappearing VM").  The
+	 * generation rides to PROC_VMM inside vmc (vmc_generation) so the
+	 * reaper there echoes the SAME value back; the PARENT terminate-event
+	 * handler then rejects stale generations.  This runs on every launch
+	 * (fresh, restart, and guest-reboot respawn).
+	 */
+	vm->vm_generation = ++((struct vmd *)ps->ps_env)->vmd_gen;
+	vmc->vmc_generation = vm->vm_generation;
+
 	/* Send VM information */
 	/* XXX check proc_compose_imsg return values */
 	proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_REQUEST,
@@ -572,6 +588,13 @@ config_getvm(struct privsep *ps, struct imsg *imsg)
 	vm->vm_state |= VM_STATE_RUNNING;
 	vm->vm_peerid = (uint32_t)-1;
 	vm->vm_kernel = fd;
+	/*
+	 * Mirror the per-launch generation stamped by the PARENT (carried in
+	 * vmc_generation) onto the PROC_VMM-side vmd_vm, so the SIGCHLD reaper
+	 * echoes the SAME value back in the terminate event.  Must match what
+	 * the PARENT stamped or legitimate terminates would be rejected.
+	 */
+	vm->vm_generation = vmc.vmc_generation;
 	return (0);
 
  fail:
