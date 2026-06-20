@@ -42,11 +42,67 @@
 
 #include "i8253.h"
 #include "i8259.h"
+#include "ioapic.h"
+#include "lapic.h"
 #include "loadfile.h"
 #include "mc146818.h"
 #include "ns8250.h"
 #include "pci.h"
 #include "virtio.h"
+
+/*
+ * Hooks from lapic_smp.c: lapic_smp_get returns the per-vcpu LAPIC
+ * (NULL on legacy single-cpu path); lapic_smp_ncpus returns 0 when the
+ * SMP fabric is uninitialised.  intr_pending/intr_ack use these to
+ * consult IRR before falling back to the legacy 8259 PIC.
+ * lapic_smp_ioapic returns the per-VM IOAPIC (NULL on legacy path);
+ * vcpu_assert_irq / vcpu_deassert_irq use it to pulse IOAPIC pins so
+ * APs receive ISA IRQs via mpbios's IOAPIC->LAPIC routing.
+ */
+
+/*
+ * ACPI PM timer: 24-bit free-running counter at 3.579545 MHz.
+ * Readable at port 0x608 (32 bits, high 8 bits read as zero).
+ * Provides a stable reference clock for guest timekeeping;
+ * Linux uses it to validate TSC and as a clocksource fallback.
+ */
+#define ACPI_PM_TIMER_PORT	0x608
+#define ACPI_PM_TIMER_FREQ	3579545ULL
+
+static struct timespec acpi_pmtimer_ts;
+
+static void
+acpi_pmtimer_init(void)
+{
+	clock_gettime(CLOCK_MONOTONIC, &acpi_pmtimer_ts);
+}
+
+static uint8_t
+vcpu_exit_acpi_pmtimer(struct vm_run_params *vrp)
+{
+	struct vm_exit *vei = vrp->vrp_exit;
+	struct timespec now, delta;
+	uint64_t ns;
+	uint32_t count;
+
+	if (vei->vei.vei_dir == VEI_DIR_OUT)
+		return (0xFF);	/* writes ignored */
+
+	/* Only the PM timer port returns a meaningful value. */
+	if (vei->vei.vei_port != ACPI_PM_TIMER_PORT) {
+		set_return_data(vei, 0);
+		return (0xFF);
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	timespecsub(&now, &acpi_pmtimer_ts, &delta);
+	ns = delta.tv_sec * 1000000000ULL + delta.tv_nsec;
+	count = (uint32_t)((ns * ACPI_PM_TIMER_FREQ) / 1000000000ULL);
+	count &= 0x00FFFFFF;	/* 24-bit counter */
+
+	set_return_data(vei, count);
+	return (0xFF);
+}
 
 typedef uint8_t (*io_fn_t)(struct vm_run_params *);
 
@@ -120,7 +176,7 @@ static const struct vcpu_reg_state vcpu_init_flat64 = {
  * Represents a standard register set for an BIOS to be booted
  * as a flat 16 bit address space.
  */
-static const struct vcpu_reg_state vcpu_init_flat16 = {
+const struct vcpu_reg_state vcpu_init_flat16 = {
 	.vrs_gprs[VCPU_REGS_RFLAGS] = 0x2,
 	.vrs_gprs[VCPU_REGS_RIP] = 0xFFF0,
 	.vrs_gprs[VCPU_REGS_RSP] = 0x0,
@@ -492,6 +548,67 @@ vcpu_exit_inout(struct vm_run_params *vrp)
 		vcpu_assert_irq(vrp->vrp_vm_id, vrp->vrp_vcpu_id, intr);
 }
 
+/* KVM hypercall number for SEND_IPI (from dev/pv/pvreg.h). */
+#define KVM_HC_SEND_IPI		10
+
+/*
+ * vcpu_exit_vmcall
+ *
+ * Handle KVM paravirtual hypercalls.  Currently supports:
+ *  - KVM_HC_SEND_IPI: deliver an IPI to a bitmap of target vcpus.
+ *    rax = KVM_HC_SEND_IPI
+ *    rbx = bitmap_lo (bits 0-63)
+ *    rcx = bitmap_hi (bits 64-127)
+ *    rdx = min_apic_id (bitmap is relative to this base)
+ *    rsi = icr (vector in low 8 bits)
+ *
+ * Sets rax to number of IPIs delivered.
+ */
+static void
+vcpu_exit_vmcall(struct vm_run_params *vrp)
+{
+	struct vcpu_reg_state *vrs = &vrp->vrp_exit->vrs;
+	uint64_t hcall = vrs->vrs_gprs[VCPU_REGS_RAX];
+	uint64_t bitmap_lo, bitmap_hi, min, icr;
+	uint8_t vec;
+	uint32_t target;
+	int i, delivered = 0;
+
+	if (hcall != KVM_HC_SEND_IPI) {
+		/* Unknown hypercall - return -1000 (KVM_EPERM). */
+		vrs->vrs_gprs[VCPU_REGS_RAX] = (uint64_t)-1000;
+		return;
+	}
+
+	bitmap_lo = vrs->vrs_gprs[VCPU_REGS_RBX];
+	bitmap_hi = vrs->vrs_gprs[VCPU_REGS_RCX];
+	min = vrs->vrs_gprs[VCPU_REGS_RDX];	/* APIC id offset for bitmap */
+	icr = vrs->vrs_gprs[VCPU_REGS_RSI];	/* ICR value */
+	vec = (uint8_t)(icr & 0xff);
+
+	for (i = 0; i < 64; i++) {
+		if (bitmap_lo & (1ULL << i)) {
+			target = (uint32_t)(min + i);
+			/*
+			 * lapic_smp_deliver_ipi resolves APIC ID -> vcpu
+			 * and silently ignores invalid targets, so no
+			 * bounds check needed here.
+			 */
+			lapic_smp_deliver_ipi(target, vec);
+			delivered++;
+		}
+	}
+	for (i = 0; i < 64; i++) {
+		if (bitmap_hi & (1ULL << i)) {
+			target = (uint32_t)(min + 64 + i);
+			lapic_smp_deliver_ipi(target, vec);
+			delivered++;
+		}
+	}
+
+	vrs->vrs_gprs[VCPU_REGS_RAX] = delivered;
+}
+
 /*
  * vcpu_exit
  *
@@ -534,7 +651,14 @@ vcpu_exit(struct vm_run_params *vrp)
 		break;
 	case SVM_VMEXIT_NPF:
 	case VMX_EXIT_EPT_VIOLATION:
+	case VMX_EXIT_APIC_ACCESS:
 		ret = vcpu_exit_eptviolation(vrp);
+		/*
+		 * Propagate failure (EAGAIN on a decode/emulate miss,
+		 * EFAULT on a protection fault) to vcpu_run_loop so it
+		 * tears the VM down instead of re-running the same RIP
+		 * forever (a guest-triggerable host-core livelock).
+		 */
 		if (ret)
 			return (ret);
 		break;
@@ -545,6 +669,9 @@ vcpu_exit(struct vm_run_params *vrp)
 	case VMX_EXIT_HLT:
 	case SVM_VMEXIT_HLT:
 		vcpu_halt(vrp->vrp_vcpu_id);
+		break;
+	case VMX_EXIT_VMCALL:
+		vcpu_exit_vmcall(vrp);
 		break;
 	case VMX_EXIT_TRIPLE_FAULT:
 	case SVM_VMEXIT_SHUTDOWN:
@@ -912,15 +1039,47 @@ hvaddr_mem(paddr_t gpa, size_t len)
 void
 vcpu_assert_irq(uint32_t vmm_id, uint32_t vcpu_id, int irq)
 {
-	i8259_assert_irq(irq);
+	static int intr_fail_ct;
+	struct ioapic *io;
 
-	if (i8259_is_pending()) {
-		if (vcpu_intr(vmm_id, vcpu_id, 1))
-			fatalx("%s: can't assert INTR", __func__);
-
-		vcpu_unhalt(vcpu_id);
-		vcpu_signal_run(vcpu_id);
+	/*
+	 * Route to EXACTLY ONE controller per assert.  Previously we
+	 * always poked both the i8259 and the IOAPIC, which leaked
+	 * (master_vec_base + irq) onto cpu0 in APIC-mode SMP guests --
+	 * e.g. Linux with PIC base 0x30 + COM1 IRQ 4 = vec 52, the
+	 * spurious "0.52 No irq handler for vector" the user observed.
+	 * In APIC mode (IOAPIC present and the pin's RTE unmasked) the
+	 * guest owns this line through the IOAPIC; otherwise fall back
+	 * to the legacy PIC.
+	 */
+	io = lapic_smp_ioapic();
+	if (io != NULL && irq >= 0 && irq < 24 &&
+	    ioapic_pin_configured(io, (uint8_t)irq)) {
+		/*
+		 * Guest owns this line through the IOAPIC.  Assert there even
+		 * if the pin is momentarily masked (Linux masks a level RTE
+		 * while servicing it) -- ioapic_assert_irq latches line_state
+		 * and the unmask path re-delivers.  Spilling to the i8259 here
+		 * loses the interrupt (the guest isn't listening on the PIC for
+		 * an APIC-mode line) and the device IRQ storms (e.g. a vioblk
+		 * completion never reaches the guest -> disk I/O hangs).
+		 */
+		ioapic_assert_irq(io, (uint8_t)irq);
+	} else {
+		i8259_assert_irq(irq);
 	}
+
+	if (vcpu_intr(vmm_id, vcpu_id, 1)) {
+		if (++intr_fail_ct < 20)
+			log_warnx("%s: can't assert INTR for vm %u vcpu %u",
+			    __func__, vmm_id, vcpu_id);
+		if (intr_fail_ct == 20)
+			log_warnx("%s: suppressing further warnings",
+			    __func__);
+	} else
+		intr_fail_ct = 0;
+	vcpu_unhalt(vcpu_id);
+	vcpu_signal_run(vcpu_id);
 }
 
 /*
@@ -936,11 +1095,26 @@ vcpu_assert_irq(uint32_t vmm_id, uint32_t vcpu_id, int irq)
 void
 vcpu_deassert_irq(uint32_t vmm_id, uint32_t vcpu_id, int irq)
 {
-	i8259_deassert_irq(irq);
+	struct ioapic *io;
+
+	/*
+	 * Mirror vcpu_assert_irq: deassert on the same controller that
+	 * the assert went to.  Keeping both deassert calls is safe (they
+	 * just clear line-state on a controller that wasn't asserted),
+	 * but routing precisely keeps the i8259 IRR coherent with what
+	 * the guest sees and avoids spurious i8259_is_pending below.
+	 */
+	io = lapic_smp_ioapic();
+	if (io != NULL && irq >= 0 && irq < 24 &&
+	    ioapic_pin_configured(io, (uint8_t)irq)) {
+		ioapic_deassert_irq(io, (uint8_t)irq);
+	} else {
+		i8259_deassert_irq(irq);
+	}
 
 	if (!i8259_is_pending()) {
 		if (vcpu_intr(vmm_id, vcpu_id, 0))
-			fatalx("%s: can't deassert INTR for vmm_id %d, "
+			log_warnx("%s: can't deassert INTR for vmm_id %d, "
 			    "vcpu_id %d", __func__, vmm_id, vcpu_id);
 	}
 }
@@ -1144,17 +1318,81 @@ translate_gva(struct vm_exit* exit, uint64_t va, uint64_t* pa, int mode)
 }
 
 int
-intr_pending(struct vmd_vm *vm)
+intr_pending(struct vmd_vm *vm, uint32_t vcpu_id)
 {
-	/* XXX select active interrupt controller */
-	return i8259_is_pending();
+	struct lapic *l;
+
+	/* i8259 first: LAPIC timer always-pending can starve disk IRQs. */
+	if (vcpu_id == 0 && i8259_is_pending())
+		return (1);
+	if (lapic_smp_ncpus() > 1 && vcpu_id < lapic_smp_ncpus()) {
+		l = lapic_smp_get(vcpu_id);
+		if (l != NULL && lapic_pending(l) >= 0)
+			return (1);
+	}
+	return (0);
+}
+
+/*
+ * Undo a speculative intr_ack() when the kernel declined to inject the
+ * vector (see vcpu_run_loop gated-ack).  Restores the LAPIC vector from
+ * ISR back to IRR so it is retried, preventing a stranded ISR bit from
+ * pinning PPR and masking lower-priority vectors.  i8259 vectors are not
+ * restored here (lapic_unack is a no-op for them); the legacy PIC has
+ * its own in-service/EOI handling and is not the SMP-orphan path.
+ */
+void
+intr_unack(struct vmd_vm *vm, uint32_t vcpu_id, uint8_t vec)
+{
+	struct lapic *l;
+
+	if (lapic_smp_ncpus() > 1 && vcpu_id < lapic_smp_ncpus()) {
+		l = lapic_smp_get(vcpu_id);
+		if (l != NULL)
+			lapic_unack(l, vec);
+	}
+}
+
+/*
+ * Side-effect-free counterpart to intr_pending(): does NOT fire/kick a
+ * due LAPIC timer (i8259_is_pending and lapic_pending_nofire are pure
+ * reads).  Safe to call while holding vcpu_run_mtx -- intr_pending()
+ * itself is not, because lapic_pending() can fire a timer whose kick
+ * re-enters vcpu_unhalt()/vcpu_run_mtx.  Used by the halt decision in
+ * vcpu_run_loop to catch a vector a racing timer-thread kick already set.
+ */
+int
+intr_pending_nofire(struct vmd_vm *vm, uint32_t vcpu_id)
+{
+	struct lapic *l;
+
+	if (vcpu_id == 0 && i8259_is_pending())
+		return (1);
+	if (lapic_smp_ncpus() > 1 && vcpu_id < lapic_smp_ncpus()) {
+		l = lapic_smp_get(vcpu_id);
+		if (l != NULL && lapic_pending_nofire(l) >= 0)
+			return (1);
+	}
+	return (0);
 }
 
 int
-intr_ack(struct vmd_vm *vm)
+intr_ack(struct vmd_vm *vm, uint32_t vcpu_id)
 {
-	/* XXX select active interrupt controller */
-	return i8259_ack();
+	struct lapic *l;
+	int lvec;
+
+	l = (lapic_smp_ncpus() > 1 && vcpu_id < lapic_smp_ncpus()) ?
+	    lapic_smp_get(vcpu_id) : NULL;
+	lvec = (l != NULL) ? lapic_pending(l) : -1;
+
+	/* Same priority as intr_pending: i8259 first. */
+	if (vcpu_id == 0 && i8259_is_pending())
+		/* i8259 first: timer can starve disk IRQs */
+		return (i8259_ack());
+	if (l != NULL && lvec >= 0)
+		return ((int)lapic_ack(l));
+	return (0xff);		/* spurious */
 }
 
 void
