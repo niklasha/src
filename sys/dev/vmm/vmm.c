@@ -367,8 +367,7 @@ vm_create(struct vm_create_params *vcp, struct proc *p)
 	if (memsize == 0)
 		return (EINVAL);
 
-	/* XXX - support UP only (for now) */
-	if (vcp->vcp_ncpus != 1)
+	if (vcp->vcp_ncpus < 1 || vcp->vcp_ncpus > VMM_MAX_VCPUS_PER_VM)
 		return (EINVAL);
 
 	/*
@@ -785,16 +784,18 @@ vm_resetcpu(struct vm_resetcpu_params *vrp)
 
 	/* Not found? exit. */
 	if (error != 0) {
-		DPRINTF("%s: vm id %u not found\n", __func__,
-		    vrp->vrp_vm_id);
+		DPRINTF("%s: vm id %u not found (error %d)\n", __func__,
+		    vrp->vrp_vm_id, error);
 		return (error);
 	}
 
 	vcpu = vm_find_vcpu(vm, vrp->vrp_vcpu_id);
 
 	if (vcpu == NULL) {
-		DPRINTF("%s: vcpu id %u of vm %u not found\n", __func__,
-		    vrp->vrp_vcpu_id, vrp->vrp_vm_id);
+		DPRINTF("%s: vcpu id %u of vm %u not found "
+		    "(vm_vcpu_ct=%u)\n", __func__,
+		    vrp->vrp_vcpu_id, vrp->vrp_vm_id,
+		    vm->vm_vcpu_ct);
 		ret = ENOENT;
 		goto out;
 	}
