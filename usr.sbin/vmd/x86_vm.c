@@ -45,6 +45,8 @@
 #include "ioapic.h"
 #include "lapic.h"
 #include "loadfile.h"
+#include "mptable.h"
+#include "acpi.h"
 #include "mc146818.h"
 #include "ns8250.h"
 #include "pci.h"
@@ -437,6 +439,26 @@ init_emulated_hw(struct vmd_vm *vm, int child_cdrom,
 	ioports_map[TIMER_BASE + TIMER_CNTR1] = vcpu_exit_i8253;
 	ioports_map[TIMER_BASE + TIMER_CNTR2] = vcpu_exit_i8253;
 	ioports_map[PCKBC_AUX] = vcpu_exit_i8253_misc;
+	ioports_map[0x64] = vcpu_exit_i8253_misc;	/* KBC status: ready */
+	ioports_map[0x60] = vcpu_exit_i8253_misc;	/* KBC data */
+
+	/* Init ACPI PM timer */
+	acpi_pmtimer_init();
+	/* ACPI PM I/O block: 0x600-0x60B (PM base).
+	 * Only the PM timer at +8 returns meaningful data;
+	 * other offsets return 0 on read and ignore writes.
+	 * NOTE: MUST stay below VM_PCI_IO_BAR_BASE (0x1000): the PCI I/O BAR
+	 * window (0x1000-0xFFFF) is mapped to vcpu_exit_pci just below and
+	 * would otherwise overwrite these entries, misrouting PM1/PM-timer
+	 * accesses to the PCI dispatcher (guest ACPI reads garbage -> the
+	 * "PM1 stuck" SCI spin).  The matching FADT base is acpi.c ACPI_PM_BASE.
+	 */
+	{
+		int p;
+		for (p = 0x600; p <= 0x60B; p++)
+			ioports_map[p] = vcpu_exit_acpi_pmtimer;
+	}
+
 
 	/* Init mc146818 RTC */
 	mc146818_init(vm->vm_vmmid, memlo, memhi);
@@ -477,6 +499,23 @@ init_emulated_hw(struct vmd_vm *vm, int child_cdrom,
 	 * detection.
 	 */
 	fw_cfg_init(vmc);
+
+	/* ELF boot: write MP table for guest SMP discovery.
+	 * IOAPIC's APIC ID must not collide with any LAPIC's APIC ID
+	 * (LAPIC IDs are 0..ncpus-1).  If it does, Linux renumbers
+	 * the colliding LAPIC, and subsequent IOAPIC RTE writes carry
+	 * the renumbered (out-of-range) APIC ID, causing silent IRQ
+	 * drops in ioapic_assert_to_lapic.  ncpus is safely above the
+	 * LAPIC range.
+	 */
+	if (vmc->vmc_ncpus > 1 &&
+	    mptable_init(vmc->vmc_ncpus, 0, vmc->vmc_ncpus) != 0)
+		log_warnx("mptable_init failed");
+
+	/* ACPI FADT with PM timer for guest timekeeping. */
+	if (acpi_init(vmc->vmc_ncpus) != 0)
+		log_warnx("acpi_init failed");
+
 	ioports_map[FW_CFG_IO_SELECT] = vcpu_exit_fw_cfg;
 	ioports_map[FW_CFG_IO_DATA] = vcpu_exit_fw_cfg;
 	ioports_map[FW_CFG_IO_DMA_ADDR_HIGH] = vcpu_exit_fw_cfg_dma;

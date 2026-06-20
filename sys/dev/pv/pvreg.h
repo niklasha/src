@@ -40,6 +40,10 @@
 #define	KVM_FEATURE_PV_UNHALT			7
 #define	KVM_FEATURE_PV_IPI			11
 #define	KVM_FEATURE_CLOCKSOURCE_STABLE_BIT	24
+#define	KVM_FEATURE_PV_IPI		11
+
+/* KVM hypercall numbers */
+#define	KVM_HC_SEND_IPI			10
 
 /* KVM hypercall numbers */
 #define	KVM_HC_SEND_IPI				10
