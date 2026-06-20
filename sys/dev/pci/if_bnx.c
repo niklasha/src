@@ -697,6 +697,16 @@ bnx_attach(struct device *parent, struct device *self, void *aux)
 	sc->bnx_flags = 0;
 	sc->bnx_phy_flags = 0;
 
+	/*
+	 * config(8) flag 0x0001: candidate for an in-kernel link-up after the
+	 * firmware load (so an NC-SI shared-LOM BMC on this port -- e.g. an
+	 * iDRAC -- recovers without waiting for netstart).  Whether to act is
+	 * decided at the attachhook tail, gated on the port actually carrying
+	 * management firmware (BNX_PORT_FEATURE ASF/IMD).
+	 */
+	if (self->dv_cfdata->cf_flags & 0x0001)
+		sc->bnx_flags |= BNX_KEEP_PHY_UP_FLAG;
+
 	/* Get PCI bus information (speed and type). */
 	val = REG_RD(sc, BNX_PCICFG_MISC_STATUS);
 	if (val & BNX_PCICFG_MISC_STATUS_PCIX_DET) {
@@ -935,6 +945,27 @@ bnx_attachhook(struct device *self)
 
 	/* Handle interrupts */
 	sc->bnx_flags |= BNX_ACTIVE_FLAG;
+
+	/*
+	 * config(8) flag 0x0001 on a port carrying NC-SI management firmware
+	 * (shared-LOM BMC, e.g. an iDRAC): the deferred heavy init above
+	 * (bnx_reset + bnx_init_cpus->bnx_load_cpu_fw) just tore the on-chip
+	 * management firmware down and reloaded it; bnx_mgmt_init alone does
+	 * NOT relight the external PHY link, so the BMC goes dark until
+	 * netstart runs `ifconfig up`.  A full bnx_init() here is the in-core
+	 * equivalent of that ifconfig up -- it relinks the PHY (proven to
+	 * recover NC-SI at runtime) without waiting for userland.
+	 */
+	if (sc->bnx_flags & BNX_KEEP_PHY_UP_FLAG) {
+		u_int32_t pf = REG_RD_IND(sc,
+		    sc->bnx_shmem_base + BNX_PORT_FEATURE);
+		if (pf & (BNX_PORT_FEATURE_ASF_ENABLED |
+		    BNX_PORT_FEATURE_IMD_ENABLED)) {
+			printf("%s: NC-SI management port: bringing link up "
+			    "after fw load\n", sc->bnx_dev.dv_xname);
+			bnx_init(sc);
+		}
+	}
 
 	goto bnx_attach_exit;
 
