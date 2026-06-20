@@ -885,14 +885,14 @@ vcpu_run_loop(void *arg)
 			break;
 		}
 
-		if (vrp->vrp_irqready && intr_pending(current_vm)) {
-			vrp->vrp_inject.vie_vector = intr_ack(current_vm);
+		if (vrp->vrp_irqready && intr_pending(current_vm, 0)) {
+			vrp->vrp_inject.vie_vector = intr_ack(current_vm, 0);
 			vrp->vrp_inject.vie_type = VCPU_INJECT_INTR;
 		} else
 			vrp->vrp_inject.vie_type = VCPU_INJECT_NONE;
 
 		/* Still more interrupts pending? */
-		vrp->vrp_intr_pending = intr_pending(current_vm);
+		vrp->vrp_intr_pending = intr_pending(current_vm, 0);
 
 		if (ioctl(env->vmd_vmm_fd, VMM_IOC_RUN, vrp) == -1) {
 			/* If run ioctl failed, exit */
