@@ -5,9 +5,9 @@
  * MP table via CONFIG_MPTABLE.
  *
  * Lays out:
- *   0xF0000  MP Floating Pointer Structure        (16 bytes, sig "_MP_")
- *   0xF0010  MP Configuration Table header       (44 bytes, sig "PCMP")
- *   0xF003C  N processor entries                 (20 bytes each, type 0)
+ *   0xF0BF0  MP Floating Pointer Structure        (16 bytes, sig "_MP_")
+ *   0x9FC10  MP Configuration Table header       (44 bytes, sig "PCMP")
+ *   0x9FC3C  N processor entries                 (20 bytes each, type 0)
  *   ...      1 bus entry "ISA"                   (8 bytes, type 1)
  *   ...      1 IOAPIC entry                      (8 bytes, type 2)
  *
@@ -153,7 +153,7 @@ mptable_init(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id)
 	    + sizeof(ioapic)
 	    + 16 * sizeof(struct mp_int_entry));
 
-	/* Floating pointer at 0xF0000 */
+	/* Floating pointer at 0xF0BF0 */
 	memset(&fp, 0, sizeof(fp));
 	memcpy(fp.sig, MP_FP_SIG, 4);
 	fp.phys_addr = (uint32_t)MPTABLE_CFG_GPA;

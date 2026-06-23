@@ -328,6 +328,7 @@ int pmap_find_pte_direct(struct pmap *pm, vaddr_t va, pt_entry_t **pd, int *offs
 void pmap_free_ptp(struct pmap *, struct vm_page *,
     vaddr_t, struct pg_to_free *);
 void pmap_freepage(struct pmap *, struct vm_page *, int, struct pg_to_free *);
+int pmap_ptp_popcnt(struct vm_page *);
 #ifdef MULTIPROCESSOR
 static int pmap_is_active(struct pmap *, struct cpu_info *);
 #endif
@@ -1200,12 +1201,13 @@ pmap_free_ptp(struct pmap *pmap, struct vm_page *ptp, vaddr_t va,
 		    pmap_is_curpmap(curpcb->pcb_pmap));
 		if (level < PTP_LEVELS - 1) {
 			ptp = pmap_find_ptp(pmap, va, (paddr_t)-1, level + 1);
+			if (ptp == NULL)
+				break;
 			/*
 			 * a wrong/recycled parent must not be driven below its
 			 * real child count
 			 */
-			if (ptp != NULL && (int)ptp->wire_count >
-			    1 + pmap_ptp_popcnt(ptp))
+			if ((int)ptp->wire_count > 1 + pmap_ptp_popcnt(ptp))
 				ptp->wire_count--;
 			if (ptp->wire_count > 1)
 				break;
@@ -1467,7 +1469,6 @@ pmap_destroy(struct pmap *pmap)
 		while ((pg = RBT_ROOT(uvm_objtree,
 		    &pmap->pm_obj[i].memt)) != NULL) {
 			KASSERT((pg->pg_flags & PG_BUSY) == 0);
-
 
 			pg->wire_count = 0;
 			pmap->pm_stats.resident_count--;
