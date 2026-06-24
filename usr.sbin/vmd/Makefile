@@ -11,6 +11,7 @@ SRCS+=		vionet.c
 .if ${MACHINE} == "amd64"
 SRCS+=		i8253.c i8259.c fw_cfg.c loadfile_elf.c mc146818.c ns8250.c
 SRCS+=		x86_vm.c x86_mmio.c lapic.c ioapic.c lapic_smp.c
+SRCS+=		mptable.c
 SRCS+=		psp.c sev.c
 .endif # amd64
 .if ${MACHINE} == "arm64"
