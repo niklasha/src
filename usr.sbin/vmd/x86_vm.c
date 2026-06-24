@@ -301,6 +301,8 @@ create_memory_map(struct vmd_vm *vm)
 		vmc->vmc_nmemranges = 5;
 }
 
+static int vm_boot_is_bios;
+
 int
 load_firmware(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 {
@@ -314,6 +316,12 @@ load_firmware(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 	 */
 	memcpy(vrs, &vcpu_init_flat64, sizeof(*vrs));
 
+	/*
+	 * Set when the firmware is a (SeaBIOS) BIOS image rather than an
+	 * ELF kernel; gates how the MP table is published below.
+	 */
+	vm_boot_is_bios = 0;
+
 	/* Find and open kernel image */
 	if ((fp = gzdopen(vm->vm_kernel, "r")) == NULL)
 		fatalx("failed to open kernel - exiting");
@@ -326,8 +334,10 @@ load_firmware(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 	 * with vm->vm_kernel and the file is not compressed)
 	 */
 	if (ret && errno == ENOEXEC && vm->vm_kernel != -1 &&
-	    gzdirect(fp) && (ret = fstat(vm->vm_kernel, &sb)) == 0)
+	    gzdirect(fp) && (ret = fstat(vm->vm_kernel, &sb)) == 0) {
 		ret = loadfile_bios(fp, sb.st_size, vrs);
+		vm_boot_is_bios = 1;
+	}
 
 	gzclose(fp);
 
@@ -510,13 +520,21 @@ init_emulated_hw(struct vmd_vm *vm, int child_cdrom,
 	 * drops in ioapic_assert_to_lapic.  ncpus is safely above the
 	 * LAPIC range.
 	 */
-	if (vmc->vmc_ncpus > 1 &&
-	    mptable_init(vmc->vmc_ncpus, 0, vmc->vmc_ncpus) != 0)
-		log_warnx("mptable_init failed");
-
-	/* ACPI FADT with PM timer for guest timekeeping. */
-	if (acpi_init(vmc->vmc_ncpus) != 0)
-		log_warnx("acpi_init failed");
+	if (vmc->vmc_ncpus > 1) {
+		/*
+		 * SeaBIOS owns the low-memory MP scan regions and its own
+		 * MP table mis-resolves at high vcpu counts, so hand it the
+		 * table via fw_cfg.  Direct ELF boot has no firmware loader,
+		 * so write it to guest RAM directly.
+		 */
+		if (vm_boot_is_bios) {
+			if (mptable_fwcfg(vmc->vmc_ncpus, 0,
+			    vmc->vmc_ncpus) != 0)
+				log_warnx("mptable_fwcfg failed");
+		} else if (mptable_init(vmc->vmc_ncpus, 0,
+		    vmc->vmc_ncpus) != 0)
+			log_warnx("mptable_init failed");
+	}
 
 	ioports_map[FW_CFG_IO_SELECT] = vcpu_exit_fw_cfg;
 	ioports_map[FW_CFG_IO_DATA] = vcpu_exit_fw_cfg;

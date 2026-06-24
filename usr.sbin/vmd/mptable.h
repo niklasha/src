@@ -6,5 +6,6 @@
 #include <stdint.h>
 
 int mptable_init(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id);
+int mptable_fwcfg(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id);
 
 #endif /* _MPTABLE_H_ */

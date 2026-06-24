@@ -597,8 +597,6 @@ void	 lapic_smp_timer_stop(void);
 void	 lapic_smp_free(void);
 void	 lapic_smp_deliver_ipi(uint32_t, uint8_t);
 
-/* acpi.c */
-int	 acpi_init(uint32_t);
 
 /* config.c */
 int	 config_init(struct vmd *);

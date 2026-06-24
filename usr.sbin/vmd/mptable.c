@@ -1,8 +1,10 @@
 /* $OpenBSD$ */
 /*
  * Intel MultiProcessor Specification v1.4 table generator for vmd.
- * Used by the ELF direct-boot path only; SeaBIOS generates its own
- * MP table via CONFIG_MPTABLE.
+ * The table is published two ways: written straight to guest RAM for
+ * the ELF direct-boot path (mptable_init), or handed to SeaBIOS through
+ * the fw_cfg BIOS linker/loader for the firmware-boot path
+ * (mptable_fwcfg, with the firmware's own CONFIG_MPTABLE disabled).
  *
  * Lays out:
  *   0xF0BF0  MP Floating Pointer Structure        (16 bytes, sig "_MP_")
@@ -20,9 +22,11 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stddef.h>
 
 #include "vmd.h"
 #include "mptable.h"
+#include "fw_cfg.h"
 
 #define MPTABLE_FP_GPA		0xF0BF0UL	/* BIOS ROM range */
 #define MPTABLE_CFG_GPA		0x9FC10UL
@@ -130,22 +134,24 @@ mp_checksum(const void *buf, size_t len)
 	return ((uint8_t)(0u - mp_acc(buf, len)));
 }
 
-int
-mptable_init(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id)
+/*
+ * Build the MP configuration table image (header + cpu/bus/ioapic/int
+ * entries) into buf, leaving cfg.checksum = 0.  Returns the table length
+ * (== cfg.base_length).  The checksum is filled by the caller: mptable_init
+ * computes it directly, mptable_fwcfg lets the fw_cfg loader's ADD_CHECKSUM
+ * do it after relocation.
+ */
+static uint16_t
+mptable_build(uint8_t *buf, uint32_t ncpus, uint8_t lapic_base,
+    uint8_t ioapic_id)
 {
-	struct mp_floating_pointer fp;
-	struct mp_config_table cfg;
-	struct mp_proc_entry cpu;
-	struct mp_int_entry ie;
-	struct mp_bus_entry bus;
-	struct mp_ioapic_entry ioapic;
-	uint32_t off, i, k;
-	uint16_t base_len;
-	uint8_t s;
-	int rc;
-
-	if (ncpus == 0)
-		ncpus = 1;
+	struct mp_config_table	cfg;
+	struct mp_proc_entry	cpu;
+	struct mp_int_entry	ie;
+	struct mp_bus_entry	bus;
+	struct mp_ioapic_entry	ioapic;
+	uint32_t		off, i, k;
+	uint16_t		base_len;
 
 	base_len = (uint16_t)(sizeof(cfg)
 	    + ncpus * sizeof(cpu)
@@ -153,16 +159,7 @@ mptable_init(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id)
 	    + sizeof(ioapic)
 	    + 16 * sizeof(struct mp_int_entry));
 
-	/* Floating pointer at 0xF0BF0 */
-	memset(&fp, 0, sizeof(fp));
-	memcpy(fp.sig, MP_FP_SIG, 4);
-	fp.phys_addr = (uint32_t)MPTABLE_CFG_GPA;
-	fp.length    = 1;
-	fp.spec_rev  = 0x04;
-	fp.checksum  = 0;
-	fp.checksum  = mp_checksum(&fp, sizeof(fp));
-
-	/* Configuration table header */
+	/* Configuration table header (checksum left 0 for the caller). */
 	memset(&cfg, 0, sizeof(cfg));
 	memcpy(cfg.sig, MP_CFG_SIG, 4);
 	cfg.base_length    = base_len;
@@ -172,67 +169,9 @@ mptable_init(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id)
 	cfg.entry_count    = (uint16_t)(ncpus + 2 + 16);
 	cfg.lapic_addr     = (uint32_t)MPTABLE_LAPIC_ADDR;
 
-	/* Compute checksum by summing the byte image piece by piece. */
-	s = mp_acc(&cfg, sizeof(cfg));
-	for (i = 0; i < ncpus; i++) {
-		memset(&cpu, 0, sizeof(cpu));
-		cpu.type      = MP_ENTRY_CPU;
-		cpu.apic_id   = (uint8_t)(lapic_base + i);
-		cpu.apic_ver  = MP_APIC_VERSION;
-		cpu.cpu_flags = (uint8_t)(MP_CPU_EN |
-		    (i == 0 ? MP_CPU_BP : 0));
-		cpu.cpu_signature = 0x00000600;
-		cpu.feature_flags = 0x00000201;
-		s = (uint8_t)(s + mp_acc(&cpu, sizeof(cpu)));
-	}
-	memset(&bus, 0, sizeof(bus));
-	bus.type   = MP_ENTRY_BUS;
-	bus.bus_id = 0;
-	memcpy(bus.bus_type, "ISA   ", 6);
-	s = (uint8_t)(s + mp_acc(&bus, sizeof(bus)));
-
-	memset(&ioapic, 0, sizeof(ioapic));
-	ioapic.type     = MP_ENTRY_IOAPIC;
-	ioapic.apic_id  = ioapic_id;
-	ioapic.apic_ver = MP_APIC_VERSION;
-	ioapic.flags    = MP_IOAPIC_EN;
-	ioapic.addr     = (uint32_t)MPTABLE_IOAPIC_ADDR;
-	s = (uint8_t)(s + mp_acc(&ioapic, sizeof(ioapic)));
-
-	/*
-	 * INT entries: full identity -- ISA IRQ N -> IOAPIC pin N for all
-	 * 16 ISA IRQs, including IRQ0 -> pin 0.  This MUST match where vmd
-	 * actually asserts each line: vcpu_assert_irq() casts the irq number
-	 * straight to the IOAPIC pin (ioapic_assert_irq(io, irq), x86_vm.c),
-	 * so IRQ0 is driven on pin 0.  The MADT (acpi.c) emits no Interrupt
-	 * Source Override, so an ACPI guest also identity-maps IRQ0 -> GSI0
-	 * -> pin 0.  Keeping this loop identity makes MP-table and MADT
-	 * discovery agree with the assert path on pin 0.  Flags = 0
-	 * (conforming polarity + edge-triggered, the ISA default).
-	 */
-	for (k = 0; k < 16; k++) {
-			memset(&ie, 0, sizeof(ie));
-			ie.type         = MP_ENTRY_INT;
-			ie.int_type     = 0;	/* vectored INT */
-			ie.flags        = 0;	/* conforming/edge */
-			ie.src_bus_id   = 0;	/* ISA */
-			ie.src_bus_irq  = (uint8_t)k;
-			ie.dst_apic_id  = ioapic_id;
-			ie.dst_apic_pin = (uint8_t)k;
-			s = (uint8_t)(s + mp_acc(&ie, sizeof(ie)));
-		}
-
-	cfg.checksum = (uint8_t)(0u - s);
-
-	/* Emit */
-	if ((rc = write_mem(MPTABLE_FP_GPA, &fp, sizeof(fp))) != 0)
-		return (rc);
-
-	off = MPTABLE_CFG_GPA;
-	if ((rc = write_mem(off, &cfg, sizeof(cfg))) != 0)
-		return (rc);
+	off = 0;
+	memcpy(buf + off, &cfg, sizeof(cfg));
 	off += sizeof(cfg);
-
 	for (i = 0; i < ncpus; i++) {
 		memset(&cpu, 0, sizeof(cpu));
 		cpu.type      = MP_ENTRY_CPU;
@@ -242,17 +181,14 @@ mptable_init(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id)
 		    (i == 0 ? MP_CPU_BP : 0));
 		cpu.cpu_signature = 0x00000600;
 		cpu.feature_flags = 0x00000201;
-		if ((rc = write_mem(off, &cpu, sizeof(cpu))) != 0)
-			return (rc);
+		memcpy(buf + off, &cpu, sizeof(cpu));
 		off += sizeof(cpu);
 	}
-
 	memset(&bus, 0, sizeof(bus));
 	bus.type   = MP_ENTRY_BUS;
 	bus.bus_id = 0;
 	memcpy(bus.bus_type, "ISA   ", 6);
-	if ((rc = write_mem(off, &bus, sizeof(bus))) != 0)
-		return (rc);
+	memcpy(buf + off, &bus, sizeof(bus));
 	off += sizeof(bus);
 
 	memset(&ioapic, 0, sizeof(ioapic));
@@ -261,26 +197,187 @@ mptable_init(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id)
 	ioapic.apic_ver = MP_APIC_VERSION;
 	ioapic.flags    = MP_IOAPIC_EN;
 	ioapic.addr     = (uint32_t)MPTABLE_IOAPIC_ADDR;
-	if ((rc = write_mem(off, &ioapic, sizeof(ioapic))) != 0)
-		return (rc);
+	memcpy(buf + off, &ioapic, sizeof(ioapic));
 	off += sizeof(ioapic);
 
 	/*
-	 * 16 INT entries: ISA IRQ N -> IOAPIC pin N.
+	 * INT entries: full identity -- ISA IRQ N -> IOAPIC pin N for all
+	 * 16 ISA IRQs, including IRQ0 -> pin 0.  This MUST match where vmd
+	 * actually asserts each line: vcpu_assert_irq() casts the irq number
+	 * straight to the IOAPIC pin (x86_vm.c), so IRQ0 is driven on pin 0.
+	 * Flags = 0 (conforming polarity + edge-triggered, the ISA default).
 	 */
 	for (k = 0; k < 16; k++) {
-			memset(&ie, 0, sizeof(ie));
-			ie.type         = MP_ENTRY_INT;
-			ie.int_type     = 0;
-			ie.flags        = 0;
-			ie.src_bus_id   = 0;
-			ie.src_bus_irq  = (uint8_t)k;
-			ie.dst_apic_id  = ioapic_id;
-			ie.dst_apic_pin = (uint8_t)k;
-			if ((rc = write_mem(off, &ie, sizeof(ie))) != 0)
-				return (rc);
-			off += sizeof(ie);
-		}
+		memset(&ie, 0, sizeof(ie));
+		ie.type         = MP_ENTRY_INT;
+		ie.int_type     = 0;	/* vectored INT */
+		ie.flags        = 0;	/* conforming/edge */
+		ie.src_bus_id   = 0;	/* ISA */
+		ie.src_bus_irq  = (uint8_t)k;
+		ie.dst_apic_id  = ioapic_id;
+		ie.dst_apic_pin = (uint8_t)k;
+		memcpy(buf + off, &ie, sizeof(ie));
+		off += sizeof(ie);
+	}
+
+	return (base_len);
+}
+
+/*
+ * mptable_init: publish the MP table by writing it straight to guest RAM.
+ * Used by the direct ELF-boot path (no firmware to relocate tables).  The
+ * floating pointer goes in the BIOS ROM range, the config table just below
+ * 0xA0000.  Both carry a checksum byte (sum of all bytes == 0 mod 256).
+ */
+int
+mptable_init(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id)
+{
+	static uint8_t			cfgbuf[2048];
+	struct mp_floating_pointer	fp;
+	uint16_t			base_len;
+	int				rc;
+
+	if (ncpus == 0)
+		ncpus = 1;
+
+	base_len = mptable_build(cfgbuf, ncpus, lapic_base, ioapic_id);
+	if ((size_t)base_len > sizeof(cfgbuf))
+		return (-1);
+	((struct mp_config_table *)(void *)cfgbuf)->checksum =
+	    mp_checksum(cfgbuf, base_len);
+
+	memset(&fp, 0, sizeof(fp));
+	memcpy(fp.sig, MP_FP_SIG, 4);
+	fp.phys_addr = (uint32_t)MPTABLE_CFG_GPA;
+	fp.length    = 1;
+	fp.spec_rev  = 0x04;
+	fp.checksum  = 0;
+	fp.checksum  = mp_checksum(&fp, sizeof(fp));
+
+	if ((rc = write_mem(MPTABLE_FP_GPA, &fp, sizeof(fp))) != 0)
+		return (rc);
+	if ((rc = write_mem(MPTABLE_CFG_GPA, cfgbuf, base_len)) != 0)
+		return (rc);
+	return (0);
+}
+
+/*
+ * mptable_fwcfg: publish the MP table to a SeaBIOS-booted guest via the QEMU
+ * fw_cfg "BIOS linker/loader" (etc/table-loader), the same mechanism acpi.c
+ * uses for the MADT.  Writing the table straight to guest RAM is unreliable
+ * under SeaBIOS (it owns the EBDA / MP scan regions, and its own MP table
+ * mis-resolves at high vcpu counts).  SeaBIOS ALLOCATEs the config in HIGH
+ * memory and the floating pointer in the FSEG (scanned by the guest),
+ * ADD_POINTERs the fp->config link, and ADD_CHECKSUMs both.  Needs firmware
+ * with CONFIG_FW_ROMFILE_LOAD=y and CONFIG_MPTABLE off.
+ */
+#define MPFW_ALLOCATE		0x1
+#define MPFW_ADD_POINTER	0x2
+#define MPFW_ADD_CHECKSUM	0x3
+#define MPFW_ZONE_HIGH		0x1
+#define MPFW_ZONE_FSEG		0x2
+
+struct mpfw_allocate {
+	char		file[56];
+	uint32_t	align;
+	uint8_t		zone;
+} __packed;
+struct mpfw_add_pointer {
+	char		dest_file[56];
+	char		src_file[56];
+	uint32_t	offset;
+	uint8_t		size;
+} __packed;
+struct mpfw_add_checksum {
+	char		file[56];
+	uint32_t	offset;
+	uint32_t	start;
+	uint32_t	length;
+} __packed;
+struct mpfw_entry {
+	uint32_t	command;
+	union {
+		struct mpfw_allocate		allocate;
+		struct mpfw_add_pointer		add_pointer;
+		struct mpfw_add_checksum	add_checksum;
+		char				pad[124];
+	} u;
+} __packed;
+
+#define MPFW_FILE_CFG		"etc/mptable"
+#define MPFW_FILE_FP		"etc/mpfp"
+#define MPFW_FILE_LOADER	"etc/table-loader"
+
+int
+mptable_fwcfg(uint32_t ncpus, uint8_t lapic_base, uint8_t ioapic_id)
+{
+	static uint8_t			cfgbuf[2048];
+	static struct mp_floating_pointer fp;
+	static struct mpfw_entry	loader[6];
+	struct mpfw_entry		*e;
+	uint16_t			base_len;
+	int				nloader = 0;
+
+	if (ncpus == 0)
+		ncpus = 1;
+
+	base_len = mptable_build(cfgbuf, ncpus, lapic_base, ioapic_id);
+	if ((size_t)base_len > sizeof(cfgbuf))
+		return (-1);
+
+	/* Floating pointer: phys_addr + checksum filled by the loader. */
+	memset(&fp, 0, sizeof(fp));
+	memcpy(fp.sig, MP_FP_SIG, 4);
+	fp.phys_addr = 0;
+	fp.length    = 1;
+	fp.spec_rev  = 0x04;
+	fp.checksum  = 0;
+
+	/* Loader command stream: allocate, link, then checksum (last). */
+	e = &loader[nloader++];
+	e->command = MPFW_ALLOCATE;
+	strlcpy(e->u.allocate.file, MPFW_FILE_CFG, sizeof(e->u.allocate.file));
+	e->u.allocate.align = 16;
+	e->u.allocate.zone = MPFW_ZONE_HIGH;
+
+	e = &loader[nloader++];
+	e->command = MPFW_ALLOCATE;
+	strlcpy(e->u.allocate.file, MPFW_FILE_FP, sizeof(e->u.allocate.file));
+	e->u.allocate.align = 16;
+	e->u.allocate.zone = MPFW_ZONE_FSEG;
+
+	e = &loader[nloader++];
+	e->command = MPFW_ADD_POINTER;
+	strlcpy(e->u.add_pointer.dest_file, MPFW_FILE_FP,
+	    sizeof(e->u.add_pointer.dest_file));
+	strlcpy(e->u.add_pointer.src_file, MPFW_FILE_CFG,
+	    sizeof(e->u.add_pointer.src_file));
+	e->u.add_pointer.offset =
+	    (uint32_t)offsetof(struct mp_floating_pointer, phys_addr);
+	e->u.add_pointer.size = 4;
+
+	e = &loader[nloader++];
+	e->command = MPFW_ADD_CHECKSUM;
+	strlcpy(e->u.add_checksum.file, MPFW_FILE_CFG,
+	    sizeof(e->u.add_checksum.file));
+	e->u.add_checksum.offset =
+	    (uint32_t)offsetof(struct mp_config_table, checksum);
+	e->u.add_checksum.start = 0;
+	e->u.add_checksum.length = base_len;
+
+	e = &loader[nloader++];
+	e->command = MPFW_ADD_CHECKSUM;
+	strlcpy(e->u.add_checksum.file, MPFW_FILE_FP,
+	    sizeof(e->u.add_checksum.file));
+	e->u.add_checksum.offset =
+	    (uint32_t)offsetof(struct mp_floating_pointer, checksum);
+	e->u.add_checksum.start = 0;
+	e->u.add_checksum.length = sizeof(fp);
+
+	fw_cfg_add_file(MPFW_FILE_CFG, cfgbuf, base_len);
+	fw_cfg_add_file(MPFW_FILE_FP, &fp, sizeof(fp));
+	fw_cfg_add_file(MPFW_FILE_LOADER, loader,
+	    (size_t)nloader * sizeof(struct mpfw_entry));
 
 	return (0);
 }
