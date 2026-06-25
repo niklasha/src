@@ -484,8 +484,18 @@ pause_vm(struct vmd_vm *vm)
 	current_vm->vm_state |= VM_STATE_PAUSED;
 	mutex_unlock(&vm_mtx);
 
+	/*
+	 * Broadcast under vcpu_run_mtx[n] so the wakeup orders against
+	 * vcpu_run_loop()'s locked predicate check before it waits on
+	 * vcpu_run_cond[n]; an unlocked broadcast can be missed by a vcpu
+	 * just entering the wait (lost wakeup), so it never reaches the
+	 * pause barrier and pause_vm() hangs.  Same fix as
+	 * vm_set_terminating().
+	 */
 	for (n = 0; n < vm->vm_params.vmc_ncpus; n++) {
+		mutex_lock(&vcpu_run_mtx[n]);
 		ret = pthread_cond_broadcast(&vcpu_run_cond[n]);
+		mutex_unlock(&vcpu_run_mtx[n]);
 		if (ret) {
 			log_warnx("%s: can't broadcast vcpu run cond (%d)",
 			    __func__, (int)ret);
@@ -516,8 +526,11 @@ unpause_vm(struct vmd_vm *vm)
 	current_vm->vm_state &= ~VM_STATE_PAUSED;
 	mutex_unlock(&vm_mtx);
 
+	/* Broadcast under vcpu_unpause_mtx[n] to avoid the same lost wakeup. */
 	for (n = 0; n < vm->vm_params.vmc_ncpus; n++) {
+		mutex_lock(&vcpu_unpause_mtx[n]);
 		ret = pthread_cond_broadcast(&vcpu_unpause_cond[n]);
+		mutex_unlock(&vcpu_unpause_mtx[n]);
 		if (ret) {
 			log_warnx("%s: can't broadcast vcpu unpause cond (%d)",
 			    __func__, (int)ret);
