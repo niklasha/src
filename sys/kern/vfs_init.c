@@ -100,6 +100,10 @@ static struct vfsconf vfsconflist[] = {
 	{ &tmpfs_vfsops, MOUNT_TMPFS, 19, 0, MNT_LOCAL,
 	    sizeof(struct tmpfs_args) },
 #endif
+#ifdef VIO9PFS
+	{ &vio9p_vfsops, MOUNT_VIO9P, 20, 0, 0,
+	    sizeof(struct vio9p_args) },
+#endif
 };
 
 

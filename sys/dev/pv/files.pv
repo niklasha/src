@@ -73,6 +73,10 @@ device	viornd
 attach	viornd at virtio
 file	dev/pv/viornd.c			viornd
 
+device	vio9p
+attach	vio9p at virtio
+file	dev/pv/vio9p.c			vio9p
+
 device	vioscsi: scsi
 attach	vioscsi at virtio
 file	dev/pv/vioscsi.c		vioscsi

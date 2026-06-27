@@ -1,0 +1,89 @@
+.\"	$OpenBSD$
+.\"
+.\" Copyright (c) 2026 Niklas Hallqvist <niklas@appli.se>
+.\"
+.\" Permission to use, copy, modify, and distribute this software for any
+.\" purpose with or without fee is hereby granted, provided that the above
+.\" copyright notice and this permission notice appear in all copies.
+.\"
+.\" THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+.\" WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+.\" MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+.\" ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+.\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+.\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+.\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+.\"
+.Dd $Mdocdate$
+.Dt MOUNT_VIO9P 8
+.Os
+.Sh NAME
+.Nm mount_vio9p
+.Nd mount a host directory shared over virtio-9p
+.Sh SYNOPSIS
+.Nm mount_vio9p
+.Op Fl o Ar options
+.Op Fl u Ar unit
+.Ar tag
+.Ar mount_point
+.Sh DESCRIPTION
+The
+.Nm
+command attaches the host directory exported by the
+.Xr vmd 8
+hypervisor over the virtio-9p transport, identified by its mount
+.Ar tag ,
+to the global file system namespace at the point named by
+.Ar mount_point .
+This command is normally executed by
+.Xr mount 8
+at boot time, or via the
+.Xr fstab 5
+file.
+.Pp
+The
+.Ar tag
+argument is the 9P mount tag advertised by the
+.Xr vio9p 4
+device, not a path name, and is matched against the device's exported
+tag by the kernel.
+.Pp
+The vio9p file system is read-only.
+.Nm
+always sets the
+.Dv MNT_RDONLY
+mount flag regardless of the options requested; the file metadata
+.Pq owner, group and mode bits
+is squashed by the host server.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl o Ar options
+Options are specified with a
+.Fl o
+flag followed by a comma separated string of options.
+See the
+.Xr mount 8
+man page for possible options and their meanings.
+.It Fl u Ar unit
+Select the
+.Xr vio9p 4
+device instance, by its driver unit number, to mount from.
+The default is
+.Ar unit
+0.
+.El
+.Sh SEE ALSO
+.Xr vio9p 4 ,
+.Xr fstab 5 ,
+.Xr mount 8 ,
+.Xr vmd 8
+.Sh HISTORY
+The
+.Nm
+command first appeared in
+.Ox 7.9 .
+.Sh CAVEATS
+The vio9p file system is read-only.
+Attempts to modify a mounted share fail with
+.Er EROFS .
