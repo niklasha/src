@@ -17,21 +17,31 @@
  */
 
 /*
- * vio9p RO vnode operations (M2c).  Clones fuse_vnops.c / fuse_lookup.c, routes
- * every mutating op to vio9p_erofs (EROFS), keeps lock/unlock/islocked (rrwlock)
- * and inactive/reclaim real, and implements the full RO file-I/O path against
- * the host server:
+ * vio9p vnode operations.  Clones fuse_vnops.c / fuse_lookup.c, keeps
+ * lock/unlock/islocked (rrwlock) and inactive/reclaim real, and implements the
+ * full file-I/O path against the host server:
  *
  *   lookup   -- Twalk-clone a fresh per-vnode fid one component at a time
- *   open     -- lazy Tlopen of the vnode's owned fid (RO)
+ *   open     -- lazy Tlopen of the vnode's owned fid (RDWR for a writable reg)
  *   read     -- Tread loop, chunked by msize, into the uio
+ *   write    -- Twrite loop, chunked by msize, from the uio (M3)
  *   readdir  -- Treaddir cookie stream -> struct dirent (uio_offset = 9P cookie)
  *   readlink -- Treadlink, target verbatim (guest resolves; NFS model)
+ *
+ * M3 read-write: create/mkdir/remove/rmdir/setattr/rename/symlink/link become
+ * real, each mirroring a host p9_* write handler.  The guest is mode-agnostic
+ * (it stops refusing write ops on a RW mount); the HOST server still enforces
+ * RO/RW and squash identity.  mknod, bmap, strategy and advlock stay refused
+ * (vio9p_erofs): no device/special files, no buffer cache, no advisory locks.
  *
  * The fid/vnode lifecycle (M2_DESIGN.md section 7) is the load-bearing invariant:
  * every vnode OWNS one Twalk-cloned fid backed by its own host fd; that fid is
  * Tclunk'd in vop_reclaim and ONLY there (the unique free site), except the one
  * redundant just-walked fid that a hash-hit in vio9p_vget makes superfluous.
+ * The M3 create/mkdir/symlink paths preserve this EXACTLY: they bind a fresh
+ * fid via an RPC the server backs with its own host fd (Tlcreate REPLACES the
+ * clone; Tmkdir/Tsymlink + a follow-up Twalk-clone), then vio9p_vget becomes
+ * the sole owner -- the new node owns one fid, clunked only in its reclaim.
  */
 
 #include <sys/param.h>
@@ -47,6 +57,9 @@
 #include <sys/vnode.h>
 #include <sys/lock.h>
 #include <sys/unistd.h>
+#include <sys/pool.h>			/* namei_pool, pool_put */
+
+#include <uvm/uvm_extern.h>		/* uvm_vnp_setsize, uvm_vnp_uncache */
 
 #include <dev/pv/vio9preg.h>
 #include <dev/pv/vio9pvar.h>
@@ -93,29 +106,40 @@ int	vio9p_islocked(void *);
 int	vio9p_ioctl(void *);
 int	vio9p_erofs(void *);
 
+/* M3 read-write vops */
+int	vio9p_write(void *);
+int	vio9p_create(void *);
+int	vio9p_mkdir(void *);
+int	vio9p_remove(void *);
+int	vio9p_rmdir(void *);
+int	vio9p_setattr(void *);
+int	vio9p_rename(void *);
+int	vio9p_symlink(void *);
+int	vio9p_link(void *);
+
 /* node layer (vio9p_node.c) -- not in vio9p.h yet */
 
 const struct vops vio9p_vops = {
 	.vop_lookup	= vio9p_lookup,
-	.vop_create	= vio9p_erofs,
-	.vop_mknod	= vio9p_erofs,
+	.vop_create	= vio9p_create,		/* M3 (was vio9p_erofs) */
+	.vop_mknod	= vio9p_erofs,		/* refused: no device/special */
 	.vop_open	= vio9p_open,
 	.vop_close	= vio9p_close,
 	.vop_access	= vio9p_access,
 	.vop_getattr	= vio9p_getattr,
-	.vop_setattr	= vio9p_erofs,
+	.vop_setattr	= vio9p_setattr,	/* M3 (was vio9p_erofs) */
 	.vop_read	= vio9p_read,
-	.vop_write	= vio9p_erofs,
+	.vop_write	= vio9p_write,		/* M3 (was vio9p_erofs) */
 	.vop_ioctl	= vio9p_ioctl,
 	.vop_kqfilter	= vio9p_erofs,
 	.vop_revoke	= NULL,
 	.vop_fsync	= nullop,
-	.vop_remove	= vio9p_erofs,
-	.vop_link	= vio9p_erofs,
-	.vop_rename	= vio9p_erofs,
-	.vop_mkdir	= vio9p_erofs,
-	.vop_rmdir	= vio9p_erofs,
-	.vop_symlink	= vio9p_erofs,
+	.vop_remove	= vio9p_remove,		/* M3 (was vio9p_erofs) */
+	.vop_link	= vio9p_link,		/* M3 (was vio9p_erofs) */
+	.vop_rename	= vio9p_rename,		/* M3 (was vio9p_erofs) */
+	.vop_mkdir	= vio9p_mkdir,		/* M3 (was vio9p_erofs) */
+	.vop_rmdir	= vio9p_rmdir,		/* M3 (was vio9p_erofs) */
+	.vop_symlink	= vio9p_symlink,	/* M3 (was vio9p_erofs) */
 	.vop_readdir	= vio9p_readdir,
 	.vop_readlink	= vio9p_readlink,
 	.vop_abortop	= vop_generic_abortop,
@@ -133,9 +157,10 @@ const struct vops vio9p_vops = {
 };
 
 /*
- * Catch-all for every mutating operation on a read-only mount.  The mount is
- * forced MNT_RDONLY and the host server also refuses any write flag, so this
- * is purely a fast-path wall.
+ * Catch-all for operations vio9p never supports (mknod, bmap, strategy,
+ * advlock).  On a RO mount the host server also refuses any write flag, so the
+ * real mutating ops short-circuit on !vm_rw too; this remains the wall for the
+ * ops that are unsupported regardless of mode.
  */
 int
 vio9p_erofs(void *v)
@@ -282,20 +307,22 @@ vio9p_lookup(void *v)
 		return (error);
 
 	/*
-	 * RO gate: any name operation that would mutate the directory on the
-	 * last component is refused before any RPC (fuse_lookup.c:65).
+	 * On a RO mount, refuse a name op that would mutate the directory on the
+	 * last component before any RPC (fuse_lookup.c:65).  On a RW mount let it
+	 * through; the create/rename/delete vop (and the host) enforce.
 	 */
-	if ((flags & ISLASTCN) &&
+	if (!vmp->vm_rw && (flags & ISLASTCN) &&
 	    (nameiop == CREATE || nameiop == RENAME || nameiop == DELETE))
 		return (EROFS);
 
 	/*
-	 * cache_lookup returns 0 on a name-cache hit (with *vpp set / locked
-	 * per the cache rules), or a positive errno (ENOENT on a negative-cache
-	 * hit).  A return of -1 means "not cached" -> fall through and walk.
+	 * No VFS name cache (cache_lookup/cache_enter): fusefs deliberately uses
+	 * none, and neither do we.  A name-cache NEGATIVE entry created by an
+	 * lstat() miss (e.g. mv/mkdir/cp probing the destination) survived the
+	 * subsequent create and made a later rm/rmdir/open return a stale ENOENT.
+	 * The per-mount qid hash (vio9p_ihashget) still coalesces vnodes; every
+	 * name resolution simply walks, which is always correct.
 	 */
-	if ((error = cache_lookup(dvp, vpp, cnp)) >= 0)
-		return (error);
 
 	/* "." -- the directory itself. */
 	if (cnp->cn_namelen == 1 && cnp->cn_nameptr[0] == '.') {
@@ -352,8 +379,6 @@ vio9p_lookup(void *v)
 			cnp->cn_flags &= ~PDIRUNLOCK;
 		}
 		*vpp = tdp;
-		if (flags & MAKEENTRY)
-			cache_enter(dvp, *vpp, cnp);
 		return (0);
 	}
 
@@ -372,12 +397,25 @@ vio9p_lookup(void *v)
 		vio9p_fid_free(vmp, cfid);	/* never bound (viofs.c:964) */
 		if (error == ENOENT) {
 			/*
-			 * Negative-cache the miss for a plain lookup.  RENAME
-			 * is excluded so a later create-by-rename still walks.
+			 * A not-yet-existing last component being created or
+			 * renamed-onto: tell the VFS the name is absent but
+			 * creation is intended (EJUSTRETURN) so it calls
+			 * vop_create/etc.  Write access to the dir = create
+			 * permission (fuse_lookup.c:99-116).  The !vm_rw case
+			 * already returned EROFS above.
 			 */
-			if ((flags & MAKEENTRY) && nameiop != CREATE &&
-			    nameiop != RENAME)
-				cache_enter(dvp, NULL, cnp);
+			if ((nameiop == CREATE || nameiop == RENAME) &&
+			    (flags & ISLASTCN)) {
+				if ((error = VOP_ACCESS(dvp, VWRITE, cred,
+				    p)) != 0)
+					return (error);
+				cnp->cn_flags |= SAVENAME;
+				if (!lockparent) {
+					VOP_UNLOCK(dvp);
+					cnp->cn_flags |= PDIRUNLOCK;
+				}
+				return (EJUSTRETURN);
+			}
 			return (ENOENT);
 		}
 		return (error);
@@ -397,6 +435,24 @@ vio9p_lookup(void *v)
 	*vpp = tdp;
 
 	/*
+	 * DELETE/RENAME of an EXISTING last component (fuse_lookup.c:136-163):
+	 * the matching vop (vio9p_remove/rmdir/rename) dereferences
+	 * cnp->cn_nameptr AFTER namei returns.  Without SAVENAME the namei layer
+	 * frees cn_pnbuf first, so the vop reads freed memory and ships a GARBAGE
+	 * name in Tunlinkat/Trenameat -> the host can't find it -> spurious
+	 * ENOENT (rm/rmdir of files that demonstrably exist).  Require VWRITE on
+	 * the directory, exactly like fuse_lookup and ufs_lookup.
+	 */
+	if ((nameiop == DELETE || nameiop == RENAME) && (flags & ISLASTCN)) {
+		if ((error = VOP_ACCESS(dvp, VWRITE, cred, p)) != 0) {
+			vput(tdp);
+			*vpp = NULL;
+			return (error);
+		}
+		cnp->cn_flags |= SAVENAME;
+	}
+
+	/*
 	 * Release the parent lock unless the caller wants it held on the last
 	 * component (fuse_lookup.c:214-217).
 	 */
@@ -404,17 +460,18 @@ vio9p_lookup(void *v)
 		VOP_UNLOCK(dvp);
 		cnp->cn_flags |= PDIRUNLOCK;
 	}
-	if (flags & MAKEENTRY)
-		cache_enter(dvp, *vpp, cnp);
 
 	return (0);
 }
 
 /*
- * vop_open: lazily Tlopen the vnode's owned fid read-only.  RO -- a write open
- * is refused before the wire.  The Tlopen reuses the walk fid in place (the
- * server flips f->opened, viofs.c:1113 -- no second fid), so a vnode owns at
- * most one fid for its whole life.  Idempotent: a second open is a no-op.
+ * vop_open: lazily Tlopen the vnode's owned fid.  The server flips f->opened in
+ * place on the FIRST Tlopen (viofs.c -- no second fid), so a vnode owns at most
+ * one fid for its whole life and we cannot widen the access of an already-open
+ * fid.  Therefore the first open requests the WIDEST access this vnode may need:
+ * on a RW mount a regular file opens RDWR (so a later FWRITE needs no re-open);
+ * directories, symlinks, and everything on a RO mount open RDONLY.  A write open
+ * on a RO mount is refused before any RPC.  Idempotent: a second open is a no-op.
  */
 int
 vio9p_open(void *v)
@@ -423,16 +480,22 @@ vio9p_open(void *v)
 	struct vnode *vp = ap->a_vp;
 	struct vio9p_node *np = VTON(vp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
-	uint32_t iounit;
+	uint32_t iounit, oflags;
 	int error;
 
-	if (ap->a_mode & FWRITE)
+	/* Write open on a RO mount: refuse before any RPC. */
+	if ((ap->a_mode & FWRITE) && !vmp->vm_rw)
 		return (EROFS);
 
 	if (np->n_fid_opened)
 		return (0);
 
-	error = p9c_lopen(vmp->vm_sc, np->n_fid, L_O_RDONLY, &iounit);
+	if (vmp->vm_rw && vp->v_type == VREG)
+		oflags = L_O_RDWR;
+	else
+		oflags = L_O_RDONLY;
+
+	error = p9c_lopen(vmp->vm_sc, np->n_fid, oflags, &iounit);
 	if (error)
 		return (error);
 
@@ -513,6 +576,716 @@ vio9p_read(void *v)
 	}
 
 	free(buf, M_MISCFSMNT, vmp->vm_iomax);
+	return (error);
+}
+
+/*
+ * vop_write: msize-chunked Twrite from the uio (the inverse of vio9p_read).
+ * The vnode is exclusively locked by the caller (VOP_WRITE contract), so n_size
+ * and the uvm size are updated without further locking.  IO_APPEND seeks to EOF
+ * first.  The server enforces RO/identity; the guest just streams bytes.
+ */
+int
+vio9p_write(void *v)
+{
+	struct vop_write_args *ap = v;
+	struct vnode *vp = ap->a_vp;
+	struct uio *uio = ap->a_uio;
+	struct vio9p_node *np = VTON(vp);
+	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
+	struct vio9p_softc *sc = vmp->vm_sc;
+	int ioflag = ap->a_ioflag;
+	uint8_t *buf;
+	uint32_t want, put;
+	off_t off;
+	int error = 0;
+
+	if (vp->v_type == VDIR)
+		return (EISDIR);
+	if (vp->v_type == VLNK)
+		return (EINVAL);
+	if (!vmp->vm_rw)
+		return (EROFS);
+	if (uio->uio_resid == 0)
+		return (0);
+
+	if (ioflag & IO_APPEND)
+		uio->uio_offset = np->n_size;
+
+	if (uio->uio_offset < 0)
+		return (EINVAL);
+
+	/* Lazily open the fid for writing (RDWR so reads on it still work). */
+	if (!np->n_fid_opened) {
+		error = p9c_lopen(sc, np->n_fid, L_O_RDWR, &put);
+		if (error)
+			return (error);
+		np->n_fid_opened = 1;
+	}
+
+	buf = malloc(vmp->vm_womax, M_MISCFSMNT, M_WAITOK);
+
+	while (uio->uio_resid > 0) {
+		/*
+		 * Size by the WRITE budget (vm_womax = msize - 23), not the read
+		 * budget (vm_iomax = msize - 11): p9c_write can only carry
+		 * vm_womax data bytes per Twrite.  Asking for more makes p9c_write
+		 * clamp and return a short count, which this loop would misread as
+		 * a short server write and stop -> a short VOP_WRITE that breaks
+		 * single-write callers (cp).  With vm_womax, put == want always.
+		 */
+		want = (uint32_t)ulmin((size_t)uio->uio_resid, vmp->vm_womax);
+
+		/*
+		 * Capture the write offset BEFORE uiomove advances uio_offset
+		 * by `want` -- p9c_write must use the pre-advance offset, else
+		 * every chunk lands `want` bytes too far (a hole).
+		 */
+		off = uio->uio_offset;
+		error = uiomove(buf, want, uio);
+		if (error)
+			break;
+
+		error = p9c_write(sc, np->n_fid, (uint64_t)off,
+		    buf, want, &put);
+		if (error)
+			break;
+		if (put == 0) {		/* server accepted nothing: avoid spin */
+			error = EIO;
+			break;
+		}
+		if (put > want) {	/* defensive: server overran */
+			error = EIO;
+			break;
+		}
+
+		/*
+		 * uiomove already advanced uio_offset/uio_resid by `want`.  If
+		 * the server took a SHORT write (put < want), rewind the
+		 * unwritten tail so the loop re-ships it from the right offset
+		 * (mirrors the fuse short-write fixup).
+		 */
+		if (put < want) {
+			size_t diff = (size_t)(want - put);
+
+			uio->uio_resid += diff;
+			uio->uio_offset -= diff;
+		}
+
+		if (uio->uio_offset > np->n_size) {
+			np->n_size = uio->uio_offset;
+			uvm_vnp_setsize(vp, np->n_size);
+		}
+		uvm_vnp_uncache(vp);
+
+		if (put < want)		/* short write: stop (re-issue next call) */
+			break;
+	}
+
+	free(buf, M_MISCFSMNT, vmp->vm_womax);
+	return (error);
+}
+
+/*
+ * vop_create: create a regular file and return it, preserving the
+ * per-vnode-owned-fid single-owner contract (M2_DESIGN.md section 7).
+ *
+ * Fid crux: allocate a fresh fid, Twalk-CLONE it off the (locked) parent's fid,
+ * then Tlcreate on the clone.  Per 9P2000.L the server REPLACES the cloned dir
+ * fid with the newly-created, opened FILE fid -- so the clone now refers to the
+ * new file (backed by its own host fd) and is handed to vio9p_vget, which
+ * becomes its sole owner exactly like a walk fid.
+ *
+ * Error fid disposition: a failed Twalk never bound the clone (no Tclunk).  A
+ * failed Tlcreate leaves the DIRECTORY fid still bound server-side (the host
+ * p9_lcreate does not touch the slot on an openat() error), so we MUST
+ * p9c_clunk(cfid) before vio9p_fid_free(cfid) (FIX D4) -- otherwise the host
+ * leaks a bound dir fid.
+ */
+int
+vio9p_create(void *v)
+{
+	struct vop_create_args *ap = v;
+	struct vnode *dvp = ap->a_dvp;
+	struct vnode **vpp = ap->a_vpp;
+	struct componentname *cnp = ap->a_cnp;
+	struct vattr *vap = ap->a_vap;
+	struct vio9p_node *dnp = VTON(dvp);
+	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
+	struct vio9p_softc *sc = vmp->vm_sc;
+	struct vnode *tdp;
+	struct p9_qid q;
+	char name[NAME_MAX + 1];
+	uint32_t cfid, iounit, mode;
+	int nwq, error;
+
+	*vpp = NULL;
+
+	/*
+	 * VOP_CREATE contract (OpenBSD): the CALLER releases dvp -- vn_open and
+	 * uipc_usrreq both do "VOP_CREATE(...); vput(ni_dvp);" unconditionally.
+	 * So this vop must NEVER vput(dvp) (doing so double-frees the parent dir
+	 * vnode -> refcount underflow panic on the FIRST create).  On error we
+	 * VOP_ABORTOP(dvp, cnp) (vop_generic_abortop frees cn_pnbuf); on success
+	 * we free cn_pnbuf ourselves (the caller frees neither).  dvp stays
+	 * locked+referenced on return; the caller drops it.  Mirrors ufs_create.
+	 */
+	if (!vmp->vm_rw) {
+		VOP_ABORTOP(dvp, cnp);
+		return (EROFS);
+	}
+	if (cnp->cn_namelen > NAME_MAX) {
+		VOP_ABORTOP(dvp, cnp);
+		return (ENAMETOOLONG);
+	}
+	memcpy(name, cnp->cn_nameptr, cnp->cn_namelen);
+	name[cnp->cn_namelen] = '\0';
+
+	/* Squash SUID/SGID/sticky guest-side too (server masks again). */
+	mode = MAKEIMODE(vap->va_type, vap->va_mode) & 0777;
+
+	/* Fresh fid, cloned off the (locked) parent: clone => nwname 0. */
+	cfid = vio9p_fid_alloc(vmp);
+	if (cfid == VIO9P_NOFID) {
+		VOP_ABORTOP(dvp, cnp);
+		return (EMFILE);
+	}
+	error = p9c_walk(sc, dnp->n_fid, cfid, NULL, &q, &nwq);
+	if (error) {
+		vio9p_fid_free(vmp, cfid);	/* clone never bound */
+		VOP_ABORTOP(dvp, cnp);
+		return (error);
+	}
+
+	/*
+	 * Tlcreate REPLACES cfid (the dir clone) with the new opened file fid.
+	 * O_EXCL: vfs_lookup already proved the name absent (CREATE path), and
+	 * the server adds O_CREAT|O_EXCL|O_NOFOLLOW to refuse a pre-placed
+	 * symlink/file race.
+	 */
+	/*
+	 * Open the new fid L_O_RDWR (not WRONLY): the created vnode keeps this one
+	 * fid for its whole life (n_fid_opened=1, no reopen), and the same vnode
+	 * is commonly READ back while still cached (e.g. cp then cksum), where
+	 * vio9p_open is a no-op -- a WRONLY host fd would then EBADF the read.
+	 * RDWR matches vio9p_open's "widest access" policy for VREG on a RW mount.
+	 */
+	error = p9c_lcreate(sc, cfid, name,
+	    L_O_RDWR | L_O_CREAT | L_O_EXCL, mode, vmp->vm_owner_gid,
+	    &q, &iounit);
+	if (error) {
+		/*
+		 * FIX D4: the host left the cloned DIR fid bound on the error
+		 * path, so clunk it before returning the slot to the pool.
+		 */
+		p9c_clunk(sc, cfid);
+		vio9p_fid_free(vmp, cfid);
+		VOP_ABORTOP(dvp, cnp);
+		return (error);
+	}
+
+	/* vio9p_vget is sole owner of cfid from here (installs or drops it). */
+	error = vio9p_vget(vmp->vm_mp, &q, cfid, &tdp);
+	if (error) {
+		VOP_ABORTOP(dvp, cnp);
+		return (error);
+	}
+
+	/* The fid is already opened (Tlcreate opened it) -> mark it. */
+	VTON(tdp)->n_fid_opened = 1;
+	VTON(tdp)->n_parentpath = dnp->n_qidpath;
+	VTON(tdp)->n_size = 0;
+
+	*vpp = tdp;
+	VN_KNOTE(dvp, NOTE_WRITE);
+	pool_put(&namei_pool, cnp->cn_pnbuf);
+	return (0);
+}
+
+/*
+ * vop_mkdir: Tmkdir on the parent fid (no fid replacement), then Twalk-clone a
+ * fresh owned fid for the new directory vnode (the lookup-after-create pattern)
+ * and vio9p_vget it (sole owner).
+ */
+int
+vio9p_mkdir(void *v)
+{
+	struct vop_mkdir_args *ap = v;
+	struct vnode *dvp = ap->a_dvp;
+	struct vnode **vpp = ap->a_vpp;
+	struct componentname *cnp = ap->a_cnp;
+	struct vattr *vap = ap->a_vap;
+	struct vio9p_node *dnp = VTON(dvp);
+	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
+	struct vio9p_softc *sc = vmp->vm_sc;
+	struct vnode *tdp;
+	struct p9_qid q, wq;
+	char name[NAME_MAX + 1];
+	uint32_t cfid, mode;
+	int nwq, error;
+
+	*vpp = NULL;
+
+	if (!vmp->vm_rw) {
+		error = EROFS;
+		goto bad;
+	}
+	if (cnp->cn_namelen > NAME_MAX) {
+		error = ENAMETOOLONG;
+		goto bad;
+	}
+	memcpy(name, cnp->cn_nameptr, cnp->cn_namelen);
+	name[cnp->cn_namelen] = '\0';
+	mode = MAKEIMODE(vap->va_type, vap->va_mode) & 0777;
+
+	error = p9c_mkdir(sc, dnp->n_fid, name, mode, vmp->vm_owner_gid, &q);
+	if (error)
+		goto bad;
+
+	/* Resolve the new dir to its own owned fid (lookup-after-create). */
+	cfid = vio9p_fid_alloc(vmp);
+	if (cfid == VIO9P_NOFID) {
+		error = EMFILE;
+		goto bad;
+	}
+	error = p9c_walk(sc, dnp->n_fid, cfid, name, &wq, &nwq);
+	if (error == 0 && nwq < 1)
+		error = ENOENT;
+	if (error) {
+		vio9p_fid_free(vmp, cfid);	/* clone never bound */
+		goto bad;
+	}
+
+	error = vio9p_vget(vmp->vm_mp, &wq, cfid, &tdp);
+	if (error)
+		goto bad;
+
+	VTON(tdp)->n_parentpath = dnp->n_qidpath;
+	*vpp = tdp;
+	VN_KNOTE(dvp, NOTE_WRITE | NOTE_LINK);
+bad:
+	pool_put(&namei_pool, cnp->cn_pnbuf);
+	vput(dvp);
+	return (error);
+}
+
+/*
+ * vop_remove: unlink `cnp->cn_nameptr` from dir dvp via Tunlinkat (flags 0).
+ * Both dvp and vp enter locked+referenced; both are released here.  The removed
+ * vnode's own fid is still clunked in ITS vop_reclaim (the file fid is
+ * independent of the dir fid -- the D41844 separation), so unlink does not touch
+ * vp->n_fid.
+ */
+int
+vio9p_remove(void *v)
+{
+	struct vop_remove_args *ap = v;
+	struct vnode *dvp = ap->a_dvp;
+	struct vnode *vp = ap->a_vp;
+	struct componentname *cnp = ap->a_cnp;
+	struct vio9p_node *dnp = VTON(dvp);
+	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
+	char name[NAME_MAX + 1];
+	int error;
+
+	if (!vmp->vm_rw) {
+		error = EROFS;
+		goto out;
+	}
+	if (cnp->cn_namelen > NAME_MAX) {
+		error = ENAMETOOLONG;
+		goto out;
+	}
+	memcpy(name, cnp->cn_nameptr, cnp->cn_namelen);
+	name[cnp->cn_namelen] = '\0';
+
+	error = p9c_unlinkat(vmp->vm_sc, dnp->n_fid, name, 0);
+	if (error == 0) {
+		VN_KNOTE(vp, NOTE_DELETE);
+		VN_KNOTE(dvp, NOTE_WRITE);
+		cache_purge(vp);
+	}
+out:
+	/*
+	 * UNLIKE every other create-family op, the VOP_REMOVE wrapper
+	 * (kern/vfs_vops.c) releases BOTH vnodes itself after we return:
+	 *	error = vop_remove(&a);
+	 *	if (dvp == vp) vrele(vp); else vput(vp);
+	 *	vput(dvp);
+	 * so this vop must NOT release them (ufs_remove does not either).
+	 * Doing our own vput(vp) double-freed vp -> "vput: bad ref count,
+	 * use 0" panic in dounlinkat.  (VOP_RMDIR's wrapper does NOT release,
+	 * so vio9p_rmdir DOES vput both -- the asymmetry is real.)
+	 */
+	return (error);
+}
+
+/*
+ * vop_rmdir: remove dir `cnp` from dvp via Tunlinkat(AT_REMOVEDIR).  Same
+ * contract as remove, plus refuse ".." (would corrupt the tree; the server also
+ * rejects it via name_ok).
+ */
+int
+vio9p_rmdir(void *v)
+{
+	struct vop_rmdir_args *ap = v;
+	struct vnode *dvp = ap->a_dvp;
+	struct vnode *vp = ap->a_vp;
+	struct componentname *cnp = ap->a_cnp;
+	struct vio9p_node *dnp = VTON(dvp);
+	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
+	char name[NAME_MAX + 1];
+	int error;
+
+	if (!vmp->vm_rw) {
+		error = EROFS;
+		goto out;
+	}
+	/* Don't try to rmdir "..". */
+	if (cnp->cn_namelen == 2 && cnp->cn_nameptr[0] == '.' &&
+	    cnp->cn_nameptr[1] == '.') {
+		error = ENOTEMPTY;
+		goto out;
+	}
+	if (cnp->cn_namelen > NAME_MAX) {
+		error = ENAMETOOLONG;
+		goto out;
+	}
+	memcpy(name, cnp->cn_nameptr, cnp->cn_namelen);
+	name[cnp->cn_namelen] = '\0';
+
+	error = p9c_unlinkat(vmp->vm_sc, dnp->n_fid, name, P9_AT_REMOVEDIR);
+	if (error == 0) {
+		VN_KNOTE(dvp, NOTE_WRITE | NOTE_LINK);
+		VN_KNOTE(vp, NOTE_DELETE);
+		cache_purge(vp);
+	}
+out:
+	vput(dvp);
+	vput(vp);
+	return (error);
+}
+
+/*
+ * vop_setattr: build the Tsetattr valid mask from the supplied vattr and apply
+ * mode/size/atime/mtime.  uid/gid are IGNORED in squash mode (the host owns
+ * identity); va_flags are unsupported.  SUID/SGID/sticky are masked guest-side
+ * (the server masks again).  After a successful truncate, sync n_size + uvm.
+ * The vnode enters EXCLUSIVELY locked.
+ */
+int
+vio9p_setattr(void *v)
+{
+	struct vop_setattr_args *ap = v;
+	struct vnode *vp = ap->a_vp;
+	struct vattr *vap = ap->a_vap;
+	struct vio9p_node *np = VTON(vp);
+	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
+	uint32_t valid = 0, mode = 0;
+	uint64_t size = 0;
+	int64_t at_s = 0, at_ns = 0, mt_s = 0, mt_ns = 0;
+	int error;
+
+	/* Flag changes are not supported. */
+	if (vap->va_flags != VNOVAL)
+		return (EOPNOTSUPP);
+	/* Reject unsettable attributes (mirror fuse). */
+	if (vap->va_type != VNON || vap->va_nlink != VNOVAL ||
+	    vap->va_fsid != VNOVAL || vap->va_fileid != VNOVAL ||
+	    vap->va_blocksize != VNOVAL || vap->va_rdev != VNOVAL ||
+	    (int)vap->va_bytes != VNOVAL || vap->va_gen != VNOVAL)
+		return (EINVAL);
+
+	if (!vmp->vm_rw)
+		return (EROFS);
+
+	/* uid/gid: silently ignored in squash (NOT an error -- chown(-1) noop). */
+
+	if (vap->va_mode != (mode_t)VNOVAL) {
+		mode = vap->va_mode & 0777;	/* drop SUID/SGID/sticky */
+		valid |= P9_SETATTR_MODE;
+	}
+	if (vap->va_size != VNOVAL) {
+		if (vp->v_type == VDIR)
+			return (EISDIR);
+		if (vp->v_type != VREG && vp->v_type != VLNK)
+			return (EINVAL);
+		size = vap->va_size;
+		valid |= P9_SETATTR_SIZE;
+	}
+	if (vap->va_atime.tv_nsec != VNOVAL) {
+		at_s = vap->va_atime.tv_sec;
+		at_ns = vap->va_atime.tv_nsec;
+		valid |= P9_SETATTR_ATIME | P9_SETATTR_ATIME_SET;
+	}
+	if (vap->va_mtime.tv_nsec != VNOVAL) {
+		mt_s = vap->va_mtime.tv_sec;
+		mt_ns = vap->va_mtime.tv_nsec;
+		valid |= P9_SETATTR_MTIME | P9_SETATTR_MTIME_SET;
+	}
+
+	if (valid == 0)
+		return (0);		/* nothing to do */
+
+	error = p9c_setattr(vmp->vm_sc, np->n_fid, valid, mode, 0, 0, size,
+	    at_s, at_ns, mt_s, mt_ns);
+	if (error)
+		return (error);
+
+	if (valid & P9_SETATTR_SIZE) {
+		np->n_size = (off_t)size;
+		uvm_vnp_setsize(vp, np->n_size);
+		uvm_vnp_uncache(vp);
+	}
+	VN_KNOTE(vp, NOTE_ATTRIB);
+	return (0);
+}
+
+/*
+ * vop_rename: rename fvp (in fdvp) to tcnp name in tdvp via a single
+ * Trenameat(fdvp->n_fid, fromname, tdvp->n_fid, toname).  FIX D1: the host
+ * refuses the legacy Trename for a non-symlink fid (it holds only a host fd to
+ * the object, not a (parentdir,leaf) it can renameat() from), so we always emit
+ * Trenameat, which carries BOTH parents + BOTH leaf names.  Cross-mount is
+ * refused (EXDEV); "."/".." and same-source-dest are refused.  All four vnodes
+ * are released per the VOP_RENAME contract; the moved vnode and any clobbered
+ * target have their name caches purged.
+ */
+int
+vio9p_rename(void *v)
+{
+	struct vop_rename_args *ap = v;
+	struct vnode *fdvp = ap->a_fdvp;
+	struct vnode *fvp = ap->a_fvp;
+	struct vnode *tdvp = ap->a_tdvp;
+	struct vnode *tvp = ap->a_tvp;
+	struct componentname *tcnp = ap->a_tcnp;
+	struct componentname *fcnp = ap->a_fcnp;
+	struct vio9p_mnt *vmp = VFSTOVIO9P(fdvp->v_mount);
+	struct vio9p_node *fdnp = VTON(fdvp);
+	struct vio9p_node *tdnp = VTON(tdvp);
+	char fromname[NAME_MAX + 1];
+	char toname[NAME_MAX + 1];
+	int error = 0;
+
+	/* Cross-device (cross-mount) rename. */
+	if (fvp->v_mount != tdvp->v_mount ||
+	    (tvp != NULL && fvp->v_mount != tvp->v_mount)) {
+		error = EXDEV;
+abortit:
+		VOP_ABORTOP(tdvp, tcnp);
+		if (tdvp == tvp)
+			vrele(tdvp);
+		else
+			vput(tdvp);
+		if (tvp != NULL)
+			vput(tvp);
+		VOP_ABORTOP(fdvp, fcnp);
+		vrele(fdvp);
+		vrele(fvp);
+		return (error);
+	}
+
+	/* Nothing to do if source == dest. */
+	if (tvp == fvp) {
+		error = 0;
+		goto abortit;
+	}
+	if (!vmp->vm_rw) {
+		error = EROFS;
+		goto abortit;
+	}
+
+	if ((error = vn_lock(fvp, LK_EXCLUSIVE | LK_RETRY)) != 0)
+		goto abortit;
+
+	/* Refuse "."/".." and aliases of "." that would cripple the tree. */
+	if (fvp->v_type == VDIR) {
+		if ((fcnp->cn_namelen == 1 && fcnp->cn_nameptr[0] == '.') ||
+		    fdnp == VTON(fvp) ||
+		    (fcnp->cn_flags & ISDOTDOT) ||
+		    (tcnp->cn_flags & ISDOTDOT)) {
+			VOP_UNLOCK(fvp);
+			error = EINVAL;
+			goto abortit;
+		}
+	}
+	if (fcnp->cn_namelen > NAME_MAX || tcnp->cn_namelen > NAME_MAX) {
+		VOP_UNLOCK(fvp);
+		error = ENAMETOOLONG;
+		goto abortit;
+	}
+	memcpy(fromname, fcnp->cn_nameptr, fcnp->cn_namelen);
+	fromname[fcnp->cn_namelen] = '\0';
+	memcpy(toname, tcnp->cn_nameptr, tcnp->cn_namelen);
+	toname[tcnp->cn_namelen] = '\0';
+
+	/*
+	 * FIX D1: Trenameat carries the SOURCE-parent fid + source name and the
+	 * DEST-dir fid + dest name (the host renameat()s between the two dir
+	 * fds).  This works for every fid type, unlike legacy Trename.
+	 */
+	error = p9c_renameat(vmp->vm_sc, fdnp->n_fid, fromname, tdnp->n_fid,
+	    toname);
+
+	if (error == 0) {
+		VN_KNOTE(fvp, NOTE_RENAME);
+		VN_KNOTE(fdvp, NOTE_WRITE);
+		VN_KNOTE(tdvp, NOTE_WRITE);
+		if (tvp != NULL)
+			VN_KNOTE(tvp, NOTE_DELETE);
+		/*
+		 * The moved node's n_parentpath is now stale (it pointed at the
+		 * old parent's qid.path); fix it so a later ".." on the moved
+		 * vnode resolves correctly.  qid.path itself is stable across a
+		 * rename (the host inode id is unchanged), so the qid hash key
+		 * stays valid and no re-keying is needed.
+		 */
+		VTON(fvp)->n_parentpath = tdnp->n_qidpath;
+		cache_purge(fvp);
+		if (tvp != NULL)
+			cache_purge(tvp);
+	}
+
+	VOP_UNLOCK(fvp);
+	if (tdvp == tvp)
+		vrele(tdvp);
+	else
+		vput(tdvp);
+	if (tvp != NULL)
+		vput(tvp);
+	vrele(fdvp);
+	vrele(fvp);
+	return (error);
+}
+
+/*
+ * vop_symlink: create a symlink with body a_target via Tsymlink on the parent
+ * fid, then Twalk-clone a fresh owned fid for the new link vnode and
+ * vio9p_vget it (sole owner).  The target is stored verbatim (NFS model).
+ */
+int
+vio9p_symlink(void *v)
+{
+	struct vop_symlink_args *ap = v;
+	struct vnode *dvp = ap->a_dvp;
+	struct vnode **vpp = ap->a_vpp;
+	struct componentname *cnp = ap->a_cnp;
+	char *target = ap->a_target;
+	struct vio9p_node *dnp = VTON(dvp);
+	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
+	struct vio9p_softc *sc = vmp->vm_sc;
+	struct vnode *tdp;
+	struct p9_qid q, wq;
+	char name[NAME_MAX + 1];
+	uint32_t cfid;
+	int nwq, error;
+
+	*vpp = NULL;
+
+	if (!vmp->vm_rw) {
+		error = EROFS;
+		goto bad;
+	}
+	if (cnp->cn_namelen > NAME_MAX) {
+		error = ENAMETOOLONG;
+		goto bad;
+	}
+	memcpy(name, cnp->cn_nameptr, cnp->cn_namelen);
+	name[cnp->cn_namelen] = '\0';
+
+	error = p9c_symlink(sc, dnp->n_fid, name, target, vmp->vm_owner_gid,
+	    &q);
+	if (error)
+		goto bad;
+
+	cfid = vio9p_fid_alloc(vmp);
+	if (cfid == VIO9P_NOFID) {
+		error = EMFILE;
+		goto bad;
+	}
+	error = p9c_walk(sc, dnp->n_fid, cfid, name, &wq, &nwq);
+	if (error == 0 && nwq < 1)
+		error = ENOENT;
+	if (error) {
+		vio9p_fid_free(vmp, cfid);	/* clone never bound */
+		goto bad;
+	}
+
+	error = vio9p_vget(vmp->vm_mp, &wq, cfid, &tdp);
+	if (error)
+		goto bad;
+
+	VTON(tdp)->n_parentpath = dnp->n_qidpath;
+	tdp->v_type = VLNK;
+	*vpp = tdp;
+	VN_KNOTE(dvp, NOTE_WRITE);
+	/*
+	 * VOP_SYMLINK contract (OpenBSD): the caller (sys_symlinkat) ignores
+	 * ni_vp on success and never releases it, so the vop owns the new vnode
+	 * end to end -- vput it here (mirrors ufs_symlink's "vput(vp)").  Leaving
+	 * it referenced+locked would strand it and deadlock the next lookup
+	 * (e.g. the readlink that follows ln -s).  *vpp is left dangling by
+	 * design; the caller does not dereference it.
+	 */
+	vput(tdp);
+bad:
+	pool_put(&namei_pool, cnp->cn_pnbuf);
+	vput(dvp);
+	return (error);
+}
+
+/*
+ * vop_link: create hard link `cnp` in dvp to vp via Tlink(dvp->n_fid,
+ * vp->n_fid, name).  NOTE: OpenBSD linkat(2) lacks AT_EMPTY_PATH, so the HOST
+ * may be unable to express link-by-fid and reply EOPNOTSUPP; we surface it.
+ * vp is same-mount (the VFS guarantees it for VOP_LINK).
+ */
+int
+vio9p_link(void *v)
+{
+	struct vop_link_args *ap = v;
+	struct vnode *dvp = ap->a_dvp;
+	struct vnode *vp = ap->a_vp;
+	struct componentname *cnp = ap->a_cnp;
+	struct vio9p_node *dnp = VTON(dvp);
+	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
+	char name[NAME_MAX + 1];
+	int error = 0;
+
+	if (!vmp->vm_rw) {
+		VOP_ABORTOP(dvp, cnp);
+		error = EROFS;
+		goto out2;
+	}
+	if (vp->v_type == VDIR) {
+		VOP_ABORTOP(dvp, cnp);
+		error = EPERM;		/* no hardlinks to dirs */
+		goto out2;
+	}
+	if (cnp->cn_namelen > NAME_MAX) {
+		VOP_ABORTOP(dvp, cnp);
+		error = ENAMETOOLONG;
+		goto out2;
+	}
+	if (dvp != vp && (error = vn_lock(vp, LK_EXCLUSIVE))) {
+		VOP_ABORTOP(dvp, cnp);
+		goto out2;
+	}
+	memcpy(name, cnp->cn_nameptr, cnp->cn_namelen);
+	name[cnp->cn_namelen] = '\0';
+
+	error = p9c_link(vmp->vm_sc, dnp->n_fid, VTON(vp)->n_fid, name);
+	if (error == 0) {
+		VN_KNOTE(vp, NOTE_LINK);
+		VN_KNOTE(dvp, NOTE_WRITE);
+	}
+
+	pool_put(&namei_pool, cnp->cn_pnbuf);
+	if (dvp != vp)
+		VOP_UNLOCK(vp);
+out2:
+	vput(dvp);
 	return (error);
 }
 
