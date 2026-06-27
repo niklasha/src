@@ -496,6 +496,13 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 	vm->vm_generation = ++env->vmd_gen;
 	vmc->vmc_generation = vm->vm_generation;
 
+	/*
+	 * Shares (virtio-9p / vio9p) carry only a host path + tag inside vmc,
+	 * which travels in the START_VM_REQUEST below.  The device subprocess
+	 * opens the share directory itself under unveil(2); we must not open it
+	 * here and pass the fd, because pledge "sendfd" rejects directory fds.
+	 */
+
 	/* Send VM information */
 	/* XXX check proc_compose_imsg return values */
 	proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_REQUEST,

@@ -643,6 +643,7 @@ main(int argc, char **argv)
 			case VMD_DEVTYPE_NET:
 			case VMD_DEVTYPE_DISK:
 			case VMD_DEVTYPE_SCSI:
+			case VMD_DEVTYPE_VIOFS:
 				break;
 			default: fatalx("invalid device type");
 			}
@@ -716,6 +717,10 @@ main(int argc, char **argv)
 		} else if (dev_type == VMD_DEVTYPE_SCSI) {
 			log_procinit("vm/%s/vioscsi", title);
 			vioscsi_main(vm_fd, vmm_fd);
+			/* NOTREACHED */
+		} else if (dev_type == VMD_DEVTYPE_VIOFS) {
+			log_procinit("vm/%s/vio9p", title);
+			viofs_main(vm_fd, vmm_fd);
 			/* NOTREACHED */
 		}
 		fatalx("unsupported device type '%c'", dev_type);

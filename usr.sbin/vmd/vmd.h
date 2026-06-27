@@ -64,6 +64,9 @@
 #define VM_TTYNAME_MAX		16
 #define VM_MAX_DISKS_PER_VM	4
 #define VM_MAX_NICS_PER_VM	4
+#define VM_MAX_SHARES_PER_VM	4
+#define VIO9P_TAG_MAX		32	/* virtio-9p mount tag length cap */
+#define VMSHARE_RDONLY		0x1	/* share is read-only (M0: always) */
 
 #define VM_PCI_MMIO_BAR_SIZE	0x00010000
 #define VM_PCI_IO_BAR_BASE	0x1000
@@ -84,6 +87,7 @@
 #define VMD_DEVTYPE_NET		'n'
 #define VMD_DEVTYPE_DISK	'd'
 #define VMD_DEVTYPE_SCSI	's'
+#define VMD_DEVTYPE_VIOFS	'f'
 
 /* Rate-limit fast reboots */
 #define VM_START_RATE_SEC	6	/* min. seconds since last reboot */
@@ -238,6 +242,7 @@ struct vmop_create_params {
 #define VMOP_CREATE_DISK	0x10
 #define VMOP_CREATE_CDROM	0x20
 #define VMOP_CREATE_INSTANCE	0x40
+#define VMOP_CREATE_SHARE	0x80
 	/* same flags as vmc_flags; check for access to these resources */
 	unsigned int		 vmc_checkaccess;
 
@@ -268,6 +273,12 @@ struct vmop_create_params {
 	enum vm_disk_fmt	 vmc_disktypes[VM_MAX_DISKS_PER_VM];
 	unsigned int		 vmc_diskbases[VM_MAX_DISKS_PER_VM];
 	char			 vmc_cdrom[PATH_MAX];
+
+	/* Shared host directories (virtio-9p / vio9p) */
+	size_t			 vmc_nshares;
+	char			 vmc_shares[VM_MAX_SHARES_PER_VM][PATH_MAX];
+	char			 vmc_share_tag[VM_MAX_SHARES_PER_VM][VIO9P_TAG_MAX];
+	unsigned int		 vmc_share_flags[VM_MAX_SHARES_PER_VM];
 
 	/* Emulated network devices */
 	size_t			 vmc_nnics;
@@ -631,6 +642,8 @@ __dead void vionet_main(int, int);
 __dead void vioblk_main(int, int);
 /* vioscsi.c */
 __dead void vioscsi_main(int, int);
+/* viofs.c */
+__dead void viofs_main(int, int);
 
 /* psp.c */
 int	 psp_get_pstate(uint16_t *, uint8_t *, uint8_t *, uint8_t *, uint8_t *);

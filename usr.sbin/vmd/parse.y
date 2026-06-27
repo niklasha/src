@@ -89,6 +89,7 @@ char		*symget(const char *);
 
 ssize_t		 parse_size(char *, int64_t);
 int		 parse_disk(char *, enum vm_disk_fmt);
+int		 parse_share(char *, char *);
 enum vm_disk_fmt parse_format(const char *);
 
 static struct vmop_create_params vmc;
@@ -124,6 +125,7 @@ typedef struct {
 %token	INET6 INSTANCE INTERFACE LLADDR LOCAL LOCKED MEMORY NET NIFS OWNER
 %token	PATH PREFIX RDOMAIN SIZE SOCKET SWITCH UP VM VMID STAGGERED START
 %token  PARALLEL DELAY SEV SEVES
+%token	SHARE TAG
 %token	<v.number>	NUMBER
 %token	<v.string>	STRING
 %type	<v.lladdr>	lladdr
@@ -426,6 +428,17 @@ vm_opts		: disable			{
 			}
 			free($2);
 			vmc.vmc_flags |= VMOP_CREATE_DISK;
+		}
+		| SHARE string TAG string	{
+			if (parse_share($2, $4) != 0) {
+				yyerror("failed to parse share: %s", $2);
+				free($2);
+				free($4);
+				YYERROR;
+			}
+			free($2);
+			free($4);
+			vmc.vmc_flags |= VMOP_CREATE_SHARE;
 		}
 		| local INTERFACE optstring iface_opts_o {
 			unsigned int	i;
@@ -865,11 +878,13 @@ lookup(char *s)
 		{ "rdomain",		RDOMAIN },
 		{ "sev",		SEV },
 		{ "seves",		SEVES },
+		{ "share",		SHARE },
 		{ "size",		SIZE },
 		{ "socket",		SOCKET },
 		{ "staggered",		STAGGERED },
 		{ "start",		START  },
 		{ "switch",		SWITCH },
+		{ "tag",		TAG },
 		{ "up",			UP },
 		{ "vm",			VM }
 	};
@@ -1391,6 +1406,40 @@ parse_disk(char *word, enum vm_disk_fmt type)
 	vmc.vmc_disktypes[vmc.vmc_ndisks] = type;
 
 	vmc.vmc_ndisks++;
+
+	return (0);
+}
+
+int
+parse_share(char *path, char *tag)
+{
+	char	 rpath[PATH_MAX];
+
+	if (vmc.vmc_nshares >= VM_MAX_SHARES_PER_VM) {
+		log_warnx("too many shares");
+		return (-1);
+	}
+
+	if (realpath(path, rpath) == NULL) {
+		log_warn("share %s", path);
+		return (-1);
+	}
+
+	if (strlcpy(vmc.vmc_shares[vmc.vmc_nshares], rpath,
+	    sizeof(vmc.vmc_shares[vmc.vmc_nshares])) >=
+	    sizeof(vmc.vmc_shares[vmc.vmc_nshares])) {
+		log_warnx("share path too long");
+		return (-1);
+	}
+	if (strlcpy(vmc.vmc_share_tag[vmc.vmc_nshares], tag,
+	    sizeof(vmc.vmc_share_tag[vmc.vmc_nshares])) >=
+	    sizeof(vmc.vmc_share_tag[vmc.vmc_nshares])) {
+		log_warnx("share tag too long");
+		return (-1);
+	}
+	vmc.vmc_share_flags[vmc.vmc_nshares] = VMSHARE_RDONLY;
+
+	vmc.vmc_nshares++;
 
 	return (0);
 }

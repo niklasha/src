@@ -336,12 +336,22 @@ struct ioinfo {
 	off_t offset;
 };
 
+struct viofs_dev {
+	int		share_fd;	/* O_DIRECTORY share root [r] */
+	char		path[PATH_MAX];	/* share root path, for unveil() */
+	char		tag[VIO9P_TAG_MAX];	/* virtio-9p mount tag */
+	unsigned int	flags;		/* VMSHARE_RDONLY */
+	uint32_t	msize;		/* negotiated 9P msize */
+	unsigned int	idx;
+};
+
 struct virtio_dev {
 	uint16_t device_id;			/* Virtio device id [r] */
 	union {
 		/* Multi-process enabled. */
 		struct vioblk_dev vioblk;
 		struct vionet_dev vionet;
+		struct viofs_dev viofs;
 
 		/* In-process only. */
 		struct vmmci_dev vmmci;
