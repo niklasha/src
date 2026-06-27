@@ -76,6 +76,16 @@ SLIST_HEAD(virtio_dev_head, virtio_dev) virtio_devs;
 #define RXQ	0
 #define TXQ	1
 
+/*
+ * Virtio 9p (vio9p).  The modern virtio PCI product id 0x1049 (0x1040 + virtio
+ * device id 9) is not yet in pcidevs(5); define it here for now (move to
+ * sys/dev/pci/pcidevs for upstream).
+ */
+#define PCI_PRODUCT_QUMRANET_VIO1_9P	0x1049
+#define VIRTIO_9P_F_MOUNT_TAG		(1ULL << 0)
+#define VIRTIO_9P_QUEUES		1
+#define VIOFS_QUEUE_SIZE_DEFAULT	128
+
 static void virtio_dev_init(struct vmd_vm *, struct virtio_dev *, uint8_t,
     uint16_t, uint16_t, uint64_t);
 static int virtio_dev_launch(struct vmd_vm *, struct virtio_dev *);
@@ -1248,6 +1258,61 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 		SLIST_INSERT_HEAD(&virtio_devs, dev, dev_next);
 	}
 
+	/* Virtio 1.x Shared Filesystems (vio9p) */
+	if (vmc->vmc_nshares > 0) {
+		for (i = 0; i < vmc->vmc_nshares; i++) {
+			dev = malloc(sizeof(struct virtio_dev));
+			if (dev == NULL) {
+				log_warn("%s: failure allocating viofs",
+				    __func__);
+				return (1);
+			}
+			if (pci_add_device(&id, PCI_VENDOR_QUMRANET,
+			    PCI_PRODUCT_QUMRANET_VIO1_9P, PCI_CLASS_SYSTEM,
+			    PCI_SUBCLASS_SYSTEM_MISC, PCI_VENDOR_OPENBSD,
+			    PCI_PRODUCT_VIRTIO_9P, 1, 1, NULL)) {
+				log_warnx("can't add PCI virtio 9p device");
+				return (1);
+			}
+			virtio_dev_init(vm, dev, id, VIOFS_QUEUE_SIZE_DEFAULT,
+			    VIRTIO_9P_QUEUES,
+			    (VIRTIO_F_VERSION_1 | VIRTIO_9P_F_MOUNT_TAG));
+
+			bar_id = pci_add_bar(id, PCI_MAPREG_TYPE_IO,
+			    virtio_pci_io, dev);
+			if (bar_id == -1 || bar_id > 0xff) {
+				log_warnx("can't add bar for virtio 9p device");
+				return (1);
+			}
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_COMMON_CFG,
+			    bar_id, 0);
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_DEVICE_CFG,
+			    bar_id, 2 + VIO9P_TAG_MAX);
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_ISR_CFG, bar_id,
+			    0);
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_NOTIFY_CFG,
+			    bar_id, 0);
+
+			/*
+			 * Device specific initialization.  The share dir fd is
+			 * opened by the device subprocess itself under unveil(2)
+			 * (a directory fd cannot be passed here: pledge "sendfd"
+			 * rejects it), so leave it unset.
+			 */
+			dev->dev_type = VMD_DEVTYPE_VIOFS;
+			dev->vmm_id = vm->vm_vmmid;
+			dev->viofs.share_fd = -1;
+			dev->viofs.flags = vmc->vmc_share_flags[i];
+			dev->viofs.idx = i;
+			(void)strlcpy(dev->viofs.path, vmc->vmc_shares[i],
+			    sizeof(dev->viofs.path));
+			(void)strlcpy(dev->viofs.tag, vmc->vmc_share_tag[i],
+			    sizeof(dev->viofs.tag));
+
+			SLIST_INSERT_HEAD(&virtio_devs, dev, dev_next);
+		}
+	}
+
 	/*
 	 * Launch virtio devices that support subprocess execution.
 	 */
@@ -1556,6 +1621,10 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 		break;
 	case VMD_DEVTYPE_SCSI:
 		log_debug("%s: launching vioscsi", vm->vm_params.vmc_name);
+		break;
+	case VMD_DEVTYPE_VIOFS:
+		log_debug("%s: launching vio9p%d", vm->vm_params.vmc_name,
+		    dev->viofs.idx);
 		break;
 		/* NOTREACHED */
 	default:
@@ -2023,6 +2092,10 @@ virtio_dev_closefds(struct virtio_dev *dev)
 		case VMD_DEVTYPE_SCSI:
 			close_fd(dev->vioscsi.cdrom_fd);
 			dev->vioscsi.cdrom_fd = -1;
+			break;
+		case VMD_DEVTYPE_VIOFS:
+			close_fd(dev->viofs.share_fd);
+			dev->viofs.share_fd = -1;
 			break;
 	default:
 		log_warnx("%s: invalid device type", __func__);
