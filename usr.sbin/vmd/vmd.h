@@ -66,7 +66,17 @@
 #define VM_MAX_NICS_PER_VM	4
 #define VM_MAX_SHARES_PER_VM	4
 #define VIO9P_TAG_MAX		32	/* virtio-9p mount tag length cap */
-#define VMSHARE_RDONLY		0x1	/* share is read-only (M0: always) */
+#define VMSHARE_RDONLY		0x1	/* share is read-only (default) */
+#define VMSHARE_WRITABLE	0x2	/* `rw': guest writes allowed (M3) */
+
+/*
+ * Credential mode for a writable share (forward-compat seam, M3b).
+ * SQUASH is the only mode implemented now; the others reserve the wire
+ * and config syntax so transparent/maproot can be added without a
+ * struct or protocol reshape.
+ */
+#define VMSHARE_CRED_SQUASH	0	/* all writes act as share owner */
+#define VMSHARE_CRED_TRANSPARENT 1	/* M3b: per-op seteuid(fid->uid) */
 
 #define VM_PCI_MMIO_BAR_SIZE	0x00010000
 #define VM_PCI_IO_BAR_BASE	0x1000
@@ -279,6 +289,8 @@ struct vmop_create_params {
 	char			 vmc_shares[VM_MAX_SHARES_PER_VM][PATH_MAX];
 	char			 vmc_share_tag[VM_MAX_SHARES_PER_VM][VIO9P_TAG_MAX];
 	unsigned int		 vmc_share_flags[VM_MAX_SHARES_PER_VM];
+	unsigned int		 vmc_share_credmode[VM_MAX_SHARES_PER_VM];
+	uid_t			 vmc_share_maproot[VM_MAX_SHARES_PER_VM];
 
 	/* Emulated network devices */
 	size_t			 vmc_nnics;

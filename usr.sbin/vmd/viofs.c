@@ -27,6 +27,16 @@
  * rooted at share_fd, so a guest can never escape the share.  See
  * plan/M1_DESIGN.md.  Directory reads (Treaddir) and the off-vcpu deferral land
  * in M1c/M1d; this servicing is synchronous.
+ *
+ * M3: optional read-write support.  When the share is mounted "rw"
+ * (VMSHARE_WRITABLE), the subprocess unveils the share "rwc" and a wider pledge,
+ * and the mutating handlers (Twrite, Tlcreate, Tmkdir, Tunlinkat, Tsetattr,
+ * Trename, Trenameat, Tsymlink) are enabled.  Each mutating syscall is bracketed
+ * by viofs_setcred()/viofs_restorecred(): in the shipped SQUASH mode these are
+ * no-ops (the subprocess already runs as the single share-owner identity); the
+ * bracket is the forward-compat seam for the M3b transparent (per-fid euid)
+ * mode.  Every fid carries (parentfd,name) so an existing file can be reopened
+ * read-write at Tlopen time without a second walk.  See plan/M3_DESIGN.md.
  */
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -86,25 +96,34 @@ extern struct vmd_vm *current_vm;
 #define P9_RREAD	117
 #define P9_TCLUNK	120
 #define P9_RCLUNK	121
-/* Mutating ops we explicitly refuse (RO). */
+/* Mutating ops (enabled for RW shares in M3; still refused for RO). */
 #define P9_TLCREATE	14
+#define P9_RLCREATE	15
 #define P9_TSYMLINK	16
+#define P9_RSYMLINK	17
 #define P9_TMKNOD	18
 #define P9_TRENAME	20
+#define P9_RRENAME	21
 #define P9_TXATTRWALK	30
 #define P9_TXATTRCREATE	32
 #define P9_TMKDIR	72
+#define P9_RMKDIR	73
 #define P9_TRENAMEAT	74
+#define P9_RRENAMEAT	75
 #define P9_TUNLINKAT	76
+#define P9_RUNLINKAT	77
 #define P9_TLOCK	52
 #define P9_TGETLOCK	54
 #define P9_RLOCK	53
 #define P9_RGETLOCK	55
 #define P9_TLINK	70
+#define P9_RLINK	71
 #define P9_TFSYNC	50
 #define P9_RFSYNC	51
 #define P9_TSETATTR	26
+#define P9_RSETATTR	27
 #define P9_TWRITE	118
+#define P9_RWRITE	119
 #define P9_TAUTH	102
 #define P9_TREMOVE	122
 
@@ -119,6 +138,35 @@ extern struct vmd_vm *current_vm;
 
 /* Tgetattr request_mask bits a RO server fills (P9_GETATTR_BASIC). */
 #define P9_GETATTR_BASIC	0x000007ffULL
+
+/*
+ * 9P2000.L Tsetattr valid[4] bitmask (Linux <net/9p/9p.h> P9_ATTR_*).  We honor
+ * MODE/SIZE/ATIME/MTIME (+ the _SET variants that carry an explicit timespec);
+ * UID/GID are parsed but ignored in squash mode (the choke point owns identity).
+ */
+#define P9_SETATTR_MODE		0x00000001U
+#define P9_SETATTR_UID		0x00000002U
+#define P9_SETATTR_GID		0x00000004U
+#define P9_SETATTR_SIZE		0x00000008U
+#define P9_SETATTR_ATIME	0x00000010U
+#define P9_SETATTR_MTIME	0x00000020U
+#define P9_SETATTR_CTIME	0x00000040U
+#define P9_SETATTR_ATIME_SET	0x00000080U
+#define P9_SETATTR_MTIME_SET	0x00000100U
+
+/* Tunlinkat flags[4]: the only defined bit is Linux AT_REMOVEDIR (0x200). */
+#ifndef P9_DOTL_AT_REMOVEDIR
+#define P9_DOTL_AT_REMOVEDIR	0x200U
+#endif
+
+/*
+ * Credential-mode value mirrored from vmd.h.  The pure-libc Stage-0 harness
+ * builds this file without vmd.h, so provide the squash constant as a fallback
+ * (it MUST stay numerically identical to vmd.h's VMSHARE_CRED_SQUASH == 0).
+ */
+#ifndef VMSHARE_CRED_SQUASH
+#define VMSHARE_CRED_SQUASH	0
+#endif
 
 /*
  * Linux errno values (the wire is Linux; OpenBSD numbers diverge above 34).
@@ -159,6 +207,9 @@ extern struct vmd_vm *current_vm;
 #define L_O_EXCL	0200
 #define L_O_TRUNC	01000
 #define L_O_APPEND	02000
+
+/* The write-intent flags that force a RW reopen at Tlopen/Tlcreate time. */
+#define L_O_WRITE_MASK	(L_O_WRONLY | L_O_RDWR | L_O_TRUNC | L_O_APPEND)
 
 #define VIOFS_MSIZE_MIN	512
 #define VIOFS_MSIZE_MAX	(64 * 1024)
@@ -352,7 +403,7 @@ errno_xlate(int oerr)
 struct viofs_fid {
 	uint32_t		fid;		/* P9_NOFID == free */
 	int			fd;		/* -1 for a symlink FID */
-	int			parentfd;	/* symlink FID: dir holding link */
+	int			parentfd;	/* dir holding this object (dup) */
 	uint8_t			qtype;
 	uint8_t			opened;
 	uint8_t			is_dir;
@@ -360,7 +411,9 @@ struct viofs_fid {
 	uint64_t		qidpath;
 	uint32_t		qidversion;
 	off_t			dir_off;
-	char			name[NAME_MAX + 1];	/* symlink FID only */
+	uid_t			uid;		/* owning uid (squash: owner) */
+	gid_t			gid;		/* owning gid (squash: owner) */
+	char			name[NAME_MAX + 1];	/* leaf within parentfd */
 	struct viofs_fid	*hnext;
 	struct viofs_fid	*fnext;
 };
@@ -369,6 +422,10 @@ static struct viofs_fid	 *fid_pool;
 static struct viofs_fid	**fid_bkt;
 static struct viofs_fid	 *fid_free;
 static size_t		  fid_max;
+
+/* squash identity (set by viofs_main before any fid_alloc can run) */
+static uint32_t	viofs_owner_uid;
+static uint32_t	viofs_owner_gid;
 
 static int
 fid_init(size_t max)
@@ -424,6 +481,8 @@ fid_alloc(uint32_t fid)
 	p->qidpath = 0;
 	p->qidversion = 0;
 	p->dir_off = 0;
+	p->uid = viofs_owner_uid;
+	p->gid = viofs_owner_gid;
 	p->name[0] = '\0';
 	b = FID_HASH(fid);
 	p->hnext = fid_bkt[b];
@@ -693,11 +752,50 @@ name_ok(const char *n)
 	return (1);
 }
 
+/*
+ * Sanitize a guest-supplied mode word before it touches a host object: keep
+ * only the 12 permission bits and strip SUID/SGID/sticky.  ONE source of truth
+ * for every create/chmod path (Tlcreate, Tmkdir, Tsetattr).
+ */
+static mode_t
+viofs_sanitize_mode(mode_t mode)
+{
+	return (mode & 07777 & ~(mode_t)(S_ISUID | S_ISGID | S_ISVTX));
+}
+
 /* ---- op handlers ---- */
 static uint32_t	cur_msize;		/* negotiated msize */
 static int	viofs_share_fd = -1;	/* share root (set by viofs_main) */
-static uint32_t	viofs_owner_uid;	/* squash identity */
-static uint32_t	viofs_owner_gid;
+static int	viofs_writable;		/* share is RW (set by viofs_main) */
+static int	viofs_credmode = VMSHARE_CRED_SQUASH;	/* M3b seam */
+static uid_t	viofs_maproot = (uid_t)-1;		/* M3b seam */
+
+/*
+ * Credential choke point (forward-compat seam, single source of truth for "who
+ * does this write act as").
+ *
+ * SQUASH (the only mode wired up in M3): NO-OP.  The subprocess already runs as
+ * the single share-owner-equivalent identity, so every mutating syscall already
+ * acts as that identity; there is nothing to set or restore.  Bracketing every
+ * write handler now means the M3b transparent mode is a two-function change, not
+ * a scatter-edit across the handlers: viofs_setcred() will setegid/seteuid to
+ * the fid's carried uid/gid (honoring viofs_maproot for guest-root) and return 0
+ * or an OpenBSD errno on failure; viofs_restorecred() will restore euid/egid to
+ * root.  The bracket must enclose EXACTLY the filesystem syscall(s) and nothing
+ * that touches the 9P wire buffers.
+ */
+static int
+viofs_setcred(struct viofs_fid *f)
+{
+	(void)f;
+	return (0);		/* SQUASH: no-op.  M3b fills this in. */
+}
+
+static void
+viofs_restorecred(void)
+{
+	/* SQUASH: no-op.  M3b restores euid/egid to root here. */
+}
 
 static void
 p9_version(struct p9_treq *req, struct p9_resp *resp)
@@ -773,6 +871,7 @@ p9_attach(struct p9_treq *req, struct p9_resp *resp)
 	}
 	qid_from(&st, &q);
 	f->fd = rootfd;
+	f->parentfd = -1;		/* the share root is never written */
 	f->qtype = q.type;
 	f->qidpath = q.path;
 	f->qidversion = q.version;
@@ -791,9 +890,10 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 	struct stat st, sym_st;
 	char names[P9_MAXWELEM][NAME_MAX + 1];
 	char sym_name[NAME_MAX + 1];
+	char last_name[NAME_MAX + 1];
 	uint32_t fid, newfid;
 	uint16_t nwname, i, nwq;
-	int curfd, basefd, sym_bound, sym_parentfd, lerr;
+	int curfd, basefd, parentfd, sym_bound, sym_parentfd, lerr;
 
 	fid = p9_get32(req);
 	newfid = p9_get32(req);
@@ -824,7 +924,7 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 
 	/* Clone (nwname == 0). */
 	if (nwname == 0) {
-		int nfd;
+		int nfd, pdup;
 
 		if (f->fd == -1) {		/* symlink FID clone */
 			if ((nf = (newfid == fid) ? f : fid_alloc(newfid))
@@ -833,7 +933,7 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 				return;
 			}
 			if (nf != f) {
-				int pdup = dup(f->parentfd);
+				pdup = dup(f->parentfd);
 
 				if (pdup == -1) {
 					fid_free_one(nf);
@@ -862,16 +962,37 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 			p9_rlerror(resp, errno_xlate(errno));
 			return;
 		}
+		/*
+		 * Carry (parentfd,name) onto the clone so it too can be reopened
+		 * RW.  The base fid keeps its own (the dup is the clone's copy).
+		 */
+		pdup = -1;
+		if (f->parentfd != -1) {
+			pdup = dup(f->parentfd);
+			if (pdup == -1) {
+				lerr = errno_xlate(errno);
+				close(nfd);
+				p9_rlerror(resp, lerr);
+				return;
+			}
+			fcntl(pdup, F_SETFD, FD_CLOEXEC);
+		}
 		if (newfid == fid) {
 			close(f->fd);
 			f->fd = nfd;
+			/* parentfd/name unchanged (same object). */
+			if (pdup != -1)
+				close(pdup);
 		} else if ((nf = fid_alloc(newfid)) == NULL) {
 			close(nfd);
+			if (pdup != -1)
+				close(pdup);
 			p9_rlerror(resp, L_EMFILE);
 			return;
 		} else {
 			nf->fd = nfd;
-			nf->parentfd = -1;
+			nf->parentfd = pdup;
+			strlcpy(nf->name, f->name, sizeof(nf->name));
 			nf->qtype = f->qtype;
 			nf->qidpath = f->qidpath;
 			nf->qidversion = f->qidversion;
@@ -885,7 +1006,9 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 
 	/*
 	 * Walk.  curfd is the directory we resolve from; it is ours to close
-	 * unless it is basefd (which belongs to f).
+	 * unless it is basefd (which belongs to f).  parentfd tracks the
+	 * immediate parent of the terminal component (a dup, ours to close on
+	 * partial walk) so a terminal regular/dir fid can be reopened RW.
 	 */
 	basefd = f->fd;
 	if (basefd == -1) {		/* can't walk into a symlink FID */
@@ -893,10 +1016,12 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 		return;
 	}
 	curfd = basefd;
+	parentfd = -1;
 	nwq = 0;
 	sym_bound = 0;
 	sym_parentfd = -1;
 	sym_name[0] = '\0';
+	last_name[0] = '\0';
 	memset(&sym_st, 0, sizeof(sym_st));
 
 	for (i = 0; i < nwname; i++) {
@@ -953,6 +1078,25 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 			}
 			break;
 		}
+		/*
+		 * Capture the parent of the terminal component: if this is the
+		 * last name, curfd is its parent dir.  dup it (curfd may be a
+		 * walk temporary we are about to close) so the bound fid owns an
+		 * independent reference for a later RW reopen.
+		 */
+		if (i + 1 == nwname) {
+			parentfd = dup(curfd);
+			if (parentfd == -1) {
+				lerr = errno_xlate(errno);
+				close(nfd);
+				if (curfd != basefd)
+					close(curfd);
+				p9_rlerror(resp, lerr);
+				return;
+			}
+			fcntl(parentfd, F_SETFD, FD_CLOEXEC);
+			strlcpy(last_name, names[i], sizeof(last_name));
+		}
 		if (curfd != basefd)
 			close(curfd);
 		curfd = nfd;
@@ -965,6 +1109,8 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 		if (sym_bound) {
 			if (curfd != basefd)
 				close(curfd);
+			if (parentfd != -1)
+				close(parentfd);
 			nf = (newfid == fid) ? f : fid_alloc(newfid);
 			if (nf == NULL) {
 				close(sym_parentfd);
@@ -995,6 +1141,8 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 			if (nf == NULL) {
 				if (curfd != basefd)
 					close(curfd);
+				if (parentfd != -1)
+					close(parentfd);
 				p9_rlerror(resp, L_EMFILE);
 				return;
 			}
@@ -1003,7 +1151,8 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 			else if (nf == f && f->parentfd != -1)
 				close(f->parentfd);
 			nf->fd = curfd;
-			nf->parentfd = -1;
+			nf->parentfd = parentfd;	/* dup of terminal parent */
+			strlcpy(nf->name, last_name, sizeof(nf->name));
 			nf->qtype = wq[nwq - 1].type;
 			nf->qidpath = wq[nwq - 1].path;
 			nf->qidversion = wq[nwq - 1].version;
@@ -1015,6 +1164,8 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 		/* Partial walk: bind nothing, drop any held fd. */
 		if (sym_parentfd != -1)
 			close(sym_parentfd);
+		if (parentfd != -1)
+			close(parentfd);
 		if (curfd != basefd)
 			close(curfd);
 	}
@@ -1084,12 +1235,41 @@ p9_getattr(struct p9_treq *req, struct p9_resp *resp)
 	p9_put64(resp, 0);		/* data_version */
 }
 
+/*
+ * Translate a Linux Tlcreate/Tlopen open-flag word into the host open(2) flag
+ * set, dropping anything we will not honor.  O_CREAT/O_EXCL are added by the
+ * caller (Tlcreate always creates); here we only carry the access mode and the
+ * truncate/append modifiers.  O_NOFOLLOW|O_CLOEXEC are forced on by the caller.
+ */
+static int
+viofs_linux_oflags(uint32_t lflags)
+{
+	int flags;
+
+	/*
+	 * Access mode: a write-intent open needs at least write access; honor
+	 * the guest's intent but guarantee write when it asked to create/write.
+	 */
+	if (lflags & L_O_RDWR)
+		flags = O_RDWR;
+	else if (lflags & L_O_WRONLY)
+		flags = O_WRONLY;
+	else
+		flags = O_RDWR;		/* create implies the creator can write */
+	if (lflags & L_O_TRUNC)
+		flags |= O_TRUNC;
+	if (lflags & L_O_APPEND)
+		flags |= O_APPEND;
+	return (flags);
+}
+
 static void
 p9_lopen(struct p9_treq *req, struct p9_resp *resp)
 {
 	struct viofs_fid *f;
 	struct p9_qid q;
 	uint32_t fid, flags;
+	int cerr;
 
 	fid = p9_get32(req);
 	flags = p9_get32(req);
@@ -1105,10 +1285,49 @@ p9_lopen(struct p9_treq *req, struct p9_resp *resp)
 		p9_rlerror(resp, L_ELOOP);
 		return;
 	}
-	if (flags & (L_O_WRONLY | L_O_RDWR | L_O_CREAT | L_O_EXCL |
-	    L_O_TRUNC | L_O_APPEND)) {
-		p9_rlerror(resp, L_EROFS);
-		return;
+	/*
+	 * A write-intent open on a RO share is refused (the original RO
+	 * behavior, now gated).  On a RW share a write-intent open of an
+	 * existing regular file must REOPEN it read-write: p9_walk opened the
+	 * fid O_RDONLY, so the held fd cannot be written.  Reopen relative to
+	 * the carried parent dir under O_NOFOLLOW so the path stays confined and
+	 * a symlink racily planted at the leaf is not followed.
+	 */
+	if (flags & L_O_WRITE_MASK) {
+		if (!viofs_writable) {
+			p9_rlerror(resp, L_EROFS);
+			return;
+		}
+		if (!f->is_dir && f->parentfd != -1 && f->name[0] != '\0') {
+			int nfd;
+
+			if ((cerr = viofs_setcred(f)) != 0) {
+				p9_rlerror(resp, errno_xlate(cerr));
+				return;
+			}
+			nfd = openat(f->parentfd, f->name,
+			    viofs_linux_oflags(flags) | O_NOFOLLOW |
+			    O_CLOEXEC);
+			if (nfd == -1) {
+				cerr = errno;
+				viofs_restorecred();
+				p9_rlerror(resp, errno_xlate(cerr));
+				return;
+			}
+			viofs_restorecred();
+			close(f->fd);
+			f->fd = nfd;
+		} else if (f->is_dir) {
+			/* directories are never opened for writing */
+			p9_rlerror(resp, L_EISDIR);
+			return;
+		}
+		/*
+		 * Else (regular file without a carried parent — e.g. the share
+		 * root can't be a regular file, so this is unreachable in
+		 * practice): fall through and open the held RDONLY fd; a write
+		 * will then fail with EBADF, an honest error.
+		 */
 	}
 	f->opened = 1;
 	if (f->is_dir)
@@ -1423,6 +1642,677 @@ done:
 	put_le32(&resp->buf[P9_HDRLEN], (uint32_t)out);
 }
 
+/* ====================================================================== *
+ * M3 write (mutating) handlers.  Each self-gates on viofs_writable and
+ * returns L_EROFS for a read-only share, so the dispatch can call them
+ * unconditionally.  Every filesystem syscall is bracketed by the credential
+ * choke point viofs_setcred()/viofs_restorecred() (no-ops in squash mode).
+ * Path safety is preserved exactly as in the RO server: name_ok() rejects
+ * "", ".", "..", "/" and over-long leaves, and every syscall is *at-relative
+ * to a fid fd transitively rooted at share_fd with O_NOFOLLOW where a leaf
+ * could be a symlink.
+ * ====================================================================== */
+
+/*
+ * Twrite fid[4] offset[8] count[4] data[count]  ->  Rwrite count[4]
+ *
+ * Mirrors p9_read: the fid must be an opened, non-dir, non-symlink regular fd.
+ * data lives in the request buffer at req->off; we pwrite it at the guest
+ * offset.  A short host write is reported faithfully (the guest retries the
+ * tail).  Symlink fids (fd == -1) and directories are rejected, matching read.
+ */
+static void
+p9_write(struct p9_treq *req, struct p9_resp *resp)
+{
+	struct viofs_fid *f;
+	const uint8_t	*src;
+	uint32_t	 fid, count;
+	uint64_t	 offset;
+	ssize_t		 n;
+	int		 cerr;
+
+	fid = p9_get32(req);
+	offset = p9_get64(req);
+	count = p9_get32(req);
+	if (req->err) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	/* The payload must be fully present in the (size-bounded) request. */
+	if (req->off + count > req->len) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	src = &req->buf[req->off];
+
+	if (!viofs_writable) {
+		p9_rlerror(resp, L_EROFS);
+		return;
+	}
+	if ((f = fid_lookup(fid)) == NULL) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (f->fd == -1) {			/* symlink fid: never written */
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (!f->opened) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (f->is_dir) {
+		p9_rlerror(resp, L_EISDIR);
+		return;
+	}
+	if (offset > (uint64_t)LLONG_MAX) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	n = pwrite(f->fd, src, count, (off_t)offset);
+	if (n == -1)
+		cerr = errno;
+	viofs_restorecred();
+	if (n == -1) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+
+	p9_resp_start(resp, P9_RWRITE);
+	p9_put32(resp, (uint32_t)n);
+}
+
+/*
+ * Tlcreate fid[4] name[s] flags[4] mode[4] gid[4]  ->  Rlcreate qid[13] iounit[4]
+ *
+ * Per 9P2000.L the fid (a directory) is REPLACED in place by the newly created
+ * regular file: we openat(dirfd, name, ...|O_CREAT) and, on success, close the
+ * directory fd and adopt the new fd into the SAME fid slot (now an opened file).
+ * The new fid carries (parentfd = dup(dirfd), name) so the just-created file is
+ * itself reopenable / renameable.  Mode is sanitized to the 12 permission bits
+ * with SUID/SGID/sticky stripped.  gid is parsed and ignored in squash mode.
+ */
+static void
+p9_lcreate(struct p9_treq *req, struct p9_resp *resp)
+{
+	struct viofs_fid *f;
+	struct p9_qid	 q;
+	struct stat	 st;
+	char		 name[NAME_MAX + 1];
+	uint32_t	 fid, lflags, mode, gid;
+	int		 oflags, newfd, pdup, cerr;
+
+	fid = p9_get32(req);
+	p9_gets(req, name, sizeof(name));
+	lflags = p9_get32(req);
+	mode = p9_get32(req);
+	gid = p9_get32(req);
+	(void)gid;				/* squash: identity via choke point */
+	if (req->err) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if (!viofs_writable) {
+		p9_rlerror(resp, L_EROFS);
+		return;
+	}
+	if (!name_ok(name)) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if ((f = fid_lookup(fid)) == NULL) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (f->fd == -1 || !f->is_dir) {	/* must be a directory fid */
+		p9_rlerror(resp, L_ENOTDIR);
+		return;
+	}
+
+	oflags = viofs_linux_oflags(lflags) |
+	    O_CREAT | O_NOFOLLOW | O_CLOEXEC;
+	if (lflags & L_O_EXCL)
+		oflags |= O_EXCL;
+
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	newfd = openat(f->fd, name, oflags, viofs_sanitize_mode((mode_t)mode));
+	if (newfd == -1) {
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	if (fstat(newfd, &st) == -1) {
+		cerr = errno;
+		viofs_restorecred();
+		close(newfd);
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	viofs_restorecred();
+
+	/*
+	 * Carry the parent dir + leaf onto the (now file) fid before we replace
+	 * the directory fd, so the new file is reopenable / renameable.  A dup
+	 * failure is non-fatal: the file still works for write via the held fd.
+	 */
+	pdup = dup(f->fd);
+	if (pdup != -1)
+		(void)fcntl(pdup, F_SETFD, FD_CLOEXEC);
+
+	/* Replace the directory fd with the new file fd, in place. */
+	qid_from(&st, &q);
+	close(f->fd);
+	if (f->parentfd != -1)
+		close(f->parentfd);
+	f->fd = newfd;
+	f->parentfd = pdup;
+	strlcpy(f->name, name, sizeof(f->name));
+	f->qtype = q.type;
+	f->qidpath = q.path;
+	f->qidversion = q.version;
+	f->is_dir = 0;
+	f->is_share_root = 0;
+	f->opened = 1;				/* Tlcreate leaves the fid open */
+	f->dir_off = 0;
+
+	p9_resp_start(resp, P9_RLCREATE);
+	p9_putqid(resp, &q);
+	p9_put32(resp, 0);			/* iounit 0 = use msize */
+}
+
+/*
+ * Tmkdir dfid[4] name[s] mode[4] gid[4]  ->  Rmkdir qid[13]
+ *
+ * dfid is the parent directory and is NOT consumed (unlike Tlcreate): the new
+ * directory gets its own qid, fetched via fstatat under O_NOFOLLOW semantics.
+ */
+static void
+p9_mkdir(struct p9_treq *req, struct p9_resp *resp)
+{
+	struct viofs_fid *f;
+	struct p9_qid	 q;
+	struct stat	 st;
+	char		 name[NAME_MAX + 1];
+	uint32_t	 dfid, mode, gid;
+	int		 cerr;
+
+	dfid = p9_get32(req);
+	p9_gets(req, name, sizeof(name));
+	mode = p9_get32(req);
+	gid = p9_get32(req);
+	(void)gid;
+	if (req->err) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if (!viofs_writable) {
+		p9_rlerror(resp, L_EROFS);
+		return;
+	}
+	if (!name_ok(name)) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if ((f = fid_lookup(dfid)) == NULL) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (f->fd == -1 || !f->is_dir) {
+		p9_rlerror(resp, L_ENOTDIR);
+		return;
+	}
+
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	if (mkdirat(f->fd, name, viofs_sanitize_mode((mode_t)mode)) == -1) {
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	/* O_NOFOLLOW: a symlink racily planted at name is not followed. */
+	if (fstatat(f->fd, name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	viofs_restorecred();
+
+	qid_from(&st, &q);
+	p9_resp_start(resp, P9_RMKDIR);
+	p9_putqid(resp, &q);
+}
+
+/*
+ * Tunlinkat dirfd[4] name[s] flags[4]  ->  Runlinkat
+ *
+ * flags carries only Linux AT_REMOVEDIR (rmdir vs unlink); we translate it to
+ * the host AT_REMOVEDIR.  No fid is created or destroyed (the victim has its own
+ * fid clunked separately by the guest).
+ */
+static void
+p9_unlinkat(struct p9_treq *req, struct p9_resp *resp)
+{
+	struct viofs_fid *f;
+	char		 name[NAME_MAX + 1];
+	uint32_t	 dfid, flags;
+	int		 atflags, cerr;
+
+	dfid = p9_get32(req);
+	p9_gets(req, name, sizeof(name));
+	flags = p9_get32(req);
+	if (req->err) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if (!viofs_writable) {
+		p9_rlerror(resp, L_EROFS);
+		return;
+	}
+	if (!name_ok(name)) {		/* forbids "", ".", "..", "/", over-long */
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if ((f = fid_lookup(dfid)) == NULL) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (f->fd == -1 || !f->is_dir) {
+		p9_rlerror(resp, L_ENOTDIR);
+		return;
+	}
+	atflags = (flags & P9_DOTL_AT_REMOVEDIR) ? AT_REMOVEDIR : 0;
+
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	if (unlinkat(f->fd, name, atflags) == -1) {
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	viofs_restorecred();
+
+	p9_resp_start(resp, P9_RUNLINKAT);
+}
+
+/*
+ * Tsetattr fid[4] valid[4] mode[4] uid[4] gid[4] size[8]
+ *          atime_sec[8] atime_nsec[8] mtime_sec[8] mtime_nsec[8]  ->  Rsetattr
+ *
+ * We honor MODE (fchmod, SUID/SGID/sticky stripped), SIZE (ftruncate), and
+ * ATIME/MTIME (futimens; UTIME_NOW when the *_SET bit is clear, else the
+ * supplied timespec).  UID/GID changes are PARSED AND IGNORED in squash mode —
+ * the credential choke point owns ownership; transparent mode (M3b) will route
+ * a chown through viofs_setcred-style logic, not by reintroducing fchown here.
+ * Symlink fids cannot be the target of fchmod/ftruncate (no fd); we reject them
+ * with EINVAL, matching the RO server's symlink stance.
+ */
+static void
+p9_setattr(struct p9_treq *req, struct p9_resp *resp)
+{
+	struct viofs_fid *f;
+	struct timespec	 times[2];
+	uint32_t	 fid, valid, mode, uid, gid;
+	uint64_t	 size;
+	uint64_t	 atime_sec, atime_nsec, mtime_sec, mtime_nsec;
+	int		 cerr, did_times;
+
+	fid = p9_get32(req);
+	valid = p9_get32(req);
+	mode = p9_get32(req);
+	uid = p9_get32(req);
+	gid = p9_get32(req);
+	size = p9_get64(req);
+	atime_sec = p9_get64(req);
+	atime_nsec = p9_get64(req);
+	mtime_sec = p9_get64(req);
+	mtime_nsec = p9_get64(req);
+	(void)uid;
+	(void)gid;				/* squash: choke point owns identity */
+	if (req->err) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if (!viofs_writable) {
+		p9_rlerror(resp, L_EROFS);
+		return;
+	}
+	if ((f = fid_lookup(fid)) == NULL) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (f->fd == -1) {		/* symlink fid: no fd to fchmod/ftruncate */
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+
+	if (valid & P9_SETATTR_MODE) {
+		if (fchmod(f->fd, viofs_sanitize_mode((mode_t)mode)) == -1) {
+			cerr = errno;
+			viofs_restorecred();
+			p9_rlerror(resp, errno_xlate(cerr));
+			return;
+		}
+	}
+	/* UID/GID deliberately not honored in squash mode (no fchown). */
+
+	if (valid & P9_SETATTR_SIZE) {
+		if (size > (uint64_t)LLONG_MAX) {
+			viofs_restorecred();
+			p9_rlerror(resp, L_EINVAL);
+			return;
+		}
+		if (ftruncate(f->fd, (off_t)size) == -1) {
+			cerr = errno;
+			viofs_restorecred();
+			p9_rlerror(resp, errno_xlate(cerr));
+			return;
+		}
+	}
+
+	did_times = 0;
+	times[0].tv_sec = 0;
+	times[0].tv_nsec = UTIME_OMIT;
+	times[1].tv_sec = 0;
+	times[1].tv_nsec = UTIME_OMIT;
+	if (valid & P9_SETATTR_ATIME) {
+		if (valid & P9_SETATTR_ATIME_SET) {
+			times[0].tv_sec = (time_t)atime_sec;
+			times[0].tv_nsec = (long)atime_nsec;
+		} else
+			times[0].tv_nsec = UTIME_NOW;
+		did_times = 1;
+	}
+	if (valid & P9_SETATTR_MTIME) {
+		if (valid & P9_SETATTR_MTIME_SET) {
+			times[1].tv_sec = (time_t)mtime_sec;
+			times[1].tv_nsec = (long)mtime_nsec;
+		} else
+			times[1].tv_nsec = UTIME_NOW;
+		did_times = 1;
+	}
+	if (did_times) {
+		if (futimens(f->fd, times) == -1) {
+			cerr = errno;
+			viofs_restorecred();
+			p9_rlerror(resp, errno_xlate(cerr));
+			return;
+		}
+	}
+
+	viofs_restorecred();
+	p9_resp_start(resp, P9_RSETATTR);
+}
+
+/*
+ * Trename fid[4] newdirfid[4] name[s]  ->  Rrename
+ *
+ * Rename the object held by `fid` into directory `newdirfid` under `name`.  Both
+ * fids are already confined under the share (every fid is transitively rooted at
+ * share_fd), so the rename is host-side renameat(oldparent, oldname, newdir,
+ * name).  Every fid now carries (parentfd,name), so the source (parentdir,leaf)
+ * is available for any fid (regular/dir/symlink); only the share-root fid lacks
+ * a parent and cannot be renamed.  The in-kernel M2 guest mainly uses Trenameat
+ * (which carries both parents + both names); Trename is supported here for the
+ * legacy single-name path.
+ */
+static void
+p9_rename(struct p9_treq *req, struct p9_resp *resp)
+{
+	struct viofs_fid *f, *nd;
+	char		 name[NAME_MAX + 1];
+	uint32_t	 fid, newdirfid;
+	int		 cerr;
+
+	fid = p9_get32(req);
+	newdirfid = p9_get32(req);
+	p9_gets(req, name, sizeof(name));
+	if (req->err) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if (!viofs_writable) {
+		p9_rlerror(resp, L_EROFS);
+		return;
+	}
+	if (!name_ok(name)) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if ((f = fid_lookup(fid)) == NULL ||
+	    (nd = fid_lookup(newdirfid)) == NULL) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (nd->fd == -1 || !nd->is_dir) {	/* destination must be a dir */
+		p9_rlerror(resp, L_ENOTDIR);
+		return;
+	}
+	/*
+	 * Need the source (parentdir,leaf).  Every walked/created fid carries it;
+	 * only the share-root fid (parentfd == -1) lacks one and cannot move.
+	 */
+	if (f->parentfd == -1 || f->name[0] == '\0') {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	if (renameat(f->parentfd, f->name, nd->fd, name) == -1) {
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	viofs_restorecred();
+
+	/* The fid now names the object at its new location. */
+	if (f->parentfd != -1)
+		close(f->parentfd);
+	f->parentfd = dup(nd->fd);
+	if (f->parentfd != -1)
+		(void)fcntl(f->parentfd, F_SETFD, FD_CLOEXEC);
+	strlcpy(f->name, name, sizeof(f->name));
+
+	p9_resp_start(resp, P9_RRENAME);
+}
+
+/*
+ * Trenameat olddirfid[4] oldname[s] newdirfid[4] newname[s]  ->  Rrenameat
+ *
+ * The general, fid-complete rename: both parents are directory fids confined
+ * under the share, both leaves are validated single components.  This is the
+ * path the in-kernel guest uses for every rename.  No fid is consumed (the moved
+ * object's own fid, if any, is the guest's to refresh).
+ */
+static void
+p9_renameat(struct p9_treq *req, struct p9_resp *resp)
+{
+	struct viofs_fid *od, *nd;
+	char		 oldname[NAME_MAX + 1], newname[NAME_MAX + 1];
+	uint32_t	 olddirfid, newdirfid;
+	int		 cerr;
+
+	olddirfid = p9_get32(req);
+	p9_gets(req, oldname, sizeof(oldname));
+	newdirfid = p9_get32(req);
+	p9_gets(req, newname, sizeof(newname));
+	if (req->err) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if (!viofs_writable) {
+		p9_rlerror(resp, L_EROFS);
+		return;
+	}
+	if (!name_ok(oldname) || !name_ok(newname)) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if ((od = fid_lookup(olddirfid)) == NULL ||
+	    (nd = fid_lookup(newdirfid)) == NULL) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (od->fd == -1 || !od->is_dir || nd->fd == -1 || !nd->is_dir) {
+		p9_rlerror(resp, L_ENOTDIR);
+		return;
+	}
+
+	if ((cerr = viofs_setcred(od)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	if (renameat(od->fd, oldname, nd->fd, newname) == -1) {
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	viofs_restorecred();
+
+	p9_resp_start(resp, P9_RRENAMEAT);
+}
+
+/*
+ * Tsymlink dfid[4] name[s] target[s] gid[4]  ->  Rsymlink qid[13]
+ *
+ * Create symlink `name` in directory `dfid` pointing at `target`.  target is
+ * stored VERBATIM (NFS model — the server never resolves it; the guest follows
+ * it in its own namespace, so a target escaping the share is harmless: it just
+ * fails to resolve on the guest, or resolves within the guest's own tree).  We
+ * never O_NOFOLLOW-open the new link; symlinkat does not follow.  We fstatat the
+ * link itself (AT_SYMLINK_NOFOLLOW) for the qid, which must be P9_QTSYMLINK.
+ */
+static void
+p9_symlink(struct p9_treq *req, struct p9_resp *resp)
+{
+	struct viofs_fid *f;
+	struct p9_qid	 q;
+	struct stat	 st;
+	char		 name[NAME_MAX + 1];
+	char		 target[PATH_MAX];
+	uint32_t	 dfid, gid;
+	int		 cerr;
+
+	dfid = p9_get32(req);
+	p9_gets(req, name, sizeof(name));
+	p9_gets(req, target, sizeof(target));
+	gid = p9_get32(req);
+	(void)gid;
+	if (req->err) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if (!viofs_writable) {
+		p9_rlerror(resp, L_EROFS);
+		return;
+	}
+	if (!name_ok(name) || target[0] == '\0') {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if ((f = fid_lookup(dfid)) == NULL) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (f->fd == -1 || !f->is_dir) {
+		p9_rlerror(resp, L_ENOTDIR);
+		return;
+	}
+
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	if (symlinkat(target, f->fd, name) == -1) {
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	if (fstatat(f->fd, name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	viofs_restorecred();
+
+	qid_from(&st, &q);		/* must be P9_QTSYMLINK */
+	p9_resp_start(resp, P9_RSYMLINK);
+	p9_putqid(resp, &q);
+}
+
+/*
+ * Tlink dfid[4] fid[4] name[s]  ->  Rlink
+ *
+ * Hard-link the object held by `fid` into directory `dfid` under `name`.
+ * linkat() needs the SOURCE as a (dirfd, pathname) pair OR an fd plus
+ * AT_EMPTY_PATH.  OpenBSD's linkat(2) does NOT implement AT_EMPTY_PATH; a fid
+ * carries (parentfd,name), but hard-linking via the carried name re-resolves the
+ * leaf and (for a symlink leaf) would need AT_SYMLINK_FOLLOW semantics OpenBSD
+ * does not offer per-fd cleanly.  Linux v9fs does not rely on Tlink, so we
+ * refuse it with L_EOPNOTSUPP — a correct, honest failure for a filesystem that
+ * cannot express fd-relative hard links.
+ */
+static void
+p9_link(struct p9_treq *req, struct p9_resp *resp)
+{
+	struct viofs_fid *nd, *f;
+	char		 name[NAME_MAX + 1];
+	uint32_t	 dfid, fid;
+
+	dfid = p9_get32(req);
+	fid = p9_get32(req);
+	p9_gets(req, name, sizeof(name));
+	if (req->err) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if (!viofs_writable) {
+		p9_rlerror(resp, L_EROFS);
+		return;
+	}
+	if (!name_ok(name)) {
+		p9_rlerror(resp, L_EINVAL);
+		return;
+	}
+	if ((nd = fid_lookup(dfid)) == NULL || (f = fid_lookup(fid)) == NULL) {
+		p9_rlerror(resp, L_EBADF);
+		return;
+	}
+	if (nd->fd == -1 || !nd->is_dir) {
+		p9_rlerror(resp, L_ENOTDIR);
+		return;
+	}
+	/* Not expressible from a fid without AT_EMPTY_PATH (OpenBSD lacks it). */
+	p9_rlerror(resp, L_EOPNOTSUPP);
+}
+
 /*
  * The single dispatch entry, callable without a vring (so the Stage-0 harness
  * frames a treq buffer and reads the rbuf directly).  Returns 0 with a built
@@ -1480,22 +2370,45 @@ viofs_handle(const uint8_t *treq, size_t treq_len,
 	case P9_TREADDIR:
 		p9_readdir(&req, &resp);
 		break;
-	/* RO refusals. */
+	/*
+	 * Mutating ops.  Each handler self-gates on viofs_writable and returns
+	 * L_EROFS for a read-only share, so the switch calls them
+	 * unconditionally; a binary with write support still serves RO shares
+	 * as strictly RO.
+	 */
 	case P9_TWRITE:
+		p9_write(&req, &resp);
+		break;
 	case P9_TLCREATE:
+		p9_lcreate(&req, &resp);
+		break;
 	case P9_TMKDIR:
-	case P9_TSYMLINK:
-	case P9_TLINK:
-	case P9_TRENAME:
-	case P9_TRENAMEAT:
+		p9_mkdir(&req, &resp);
+		break;
 	case P9_TUNLINKAT:
-	case P9_TREMOVE:
+		p9_unlinkat(&req, &resp);
+		break;
 	case P9_TSETATTR:
-	case P9_TXATTRCREATE:
+		p9_setattr(&req, &resp);
+		break;
+	case P9_TRENAME:
+		p9_rename(&req, &resp);
+		break;
+	case P9_TRENAMEAT:
+		p9_renameat(&req, &resp);
+		break;
+	case P9_TSYMLINK:
+		p9_symlink(&req, &resp);
+		break;
+	case P9_TLINK:
+		p9_link(&req, &resp);
+		break;
+	case P9_TREMOVE:		/* legacy remove+clunk: guest uses Tunlinkat */
+	case P9_TXATTRCREATE:		/* no xattr write support */
 		p9_rlerror(&resp, L_EROFS);
 		break;
 	case P9_TMKNOD:
-		p9_rlerror(&resp, L_EPERM);
+		p9_rlerror(&resp, L_EPERM);	/* no device nodes (security) */
 		break;
 	case P9_TFSYNC:
 		p9_resp_start(&resp, P9_RFSYNC);
@@ -1714,8 +2627,12 @@ viofs_main(int fd, int fd_vmm)
 	 * recvfd - device channels are passed to us.
 	 * unveil - confine to the share subtree, then drop.
 	 * rpath  - open/stat/read the (unveiled) share.
+	 * wpath cpath fattr - writable shares (M3): write/truncate, create/
+	 *   unlink/rename/mkdir/symlink, fchmod/futimens.  The narrowing pledge
+	 *   below drops them again for read-only shares.
 	 */
-	if (pledge("stdio recvfd vmm proc unveil rpath", NULL) == -1)
+	if (pledge("stdio recvfd vmm proc unveil rpath wpath cpath fattr",
+	    NULL) == -1)
 		fatal("pledge");
 
 	memset(&dev, 0, sizeof(dev));
@@ -1736,6 +2653,25 @@ viofs_main(int fd, int fd_vmm)
 	log_debug("%s: got viofs dev. tag = \"%s\", share = \"%s\"", __func__,
 	    viofs->tag, viofs->path);
 
+	viofs_writable = (viofs->flags & VMSHARE_WRITABLE) ? 1 : 0;
+	viofs_credmode = viofs->credmode;
+	viofs_maproot = viofs->maproot;
+
+	/*
+	 * SQUASH is the only credential mode wired up in M3.  A config that
+	 * requested transparent/maproot must fail loudly, never silently squash
+	 * — the privilege-drop launch below is squash-shaped and would be unsafe
+	 * to run under a transparent request.  (M3b replaces this guard with the
+	 * seteuid-per-op machinery + pledge "id".)
+	 */
+	if (viofs_credmode != VMSHARE_CRED_SQUASH) {
+		ret = EINVAL;
+		log_warnx("%s: share \"%s\": credmode %d not supported "
+		    "(M3 is squash-only)", __func__, viofs->tag,
+		    viofs_credmode);
+		goto fail;
+	}
+
 	memset(&vm, 0, sizeof(vm));
 	sz = atomicio(read, dev.sync_fd, &vm, sizeof(vm));
 	if (sz != sizeof(vm)) {
@@ -1755,11 +2691,25 @@ viofs_main(int fd, int fd_vmm)
 	}
 
 	close_fd(fd_vmm);
-	if (unveil(viofs->path, "r") == -1)
+	/*
+	 * "rwc" for a writable share (read + write + create), scoped to the
+	 * share subtree only — no "x": the server never execs share content.
+	 * The unveil lock + the O_NOFOLLOW/openat-from-share_fd containment in
+	 * every handler still bound every path to the subtree, so "rwc" cannot
+	 * escape the share.  RO shares unveil "r" exactly as before.
+	 */
+	if (unveil(viofs->path, viofs_writable ? "rwc" : "r") == -1)
 		fatal("unveil %s", viofs->path);
 	if (unveil(NULL, NULL) == -1)
 		fatal("unveil lock");
-	if (pledge("stdio recvfd rpath", NULL) == -1)
+	/*
+	 * Narrow the pledge.  RO shares end up exactly as the M1/M2 path (no
+	 * wpath/cpath/fattr).  RW shares keep wpath (pwrite/ftruncate), cpath
+	 * (openat O_CREAT, mkdirat, symlinkat, unlinkat, renameat) and fattr
+	 * (fchmod/futimens in Tsetattr).
+	 */
+	if (pledge(viofs_writable ? "stdio recvfd rpath wpath cpath fattr"
+	    : "stdio recvfd rpath", NULL) == -1)
 		fatal("pledge2");
 
 	viofs->share_fd = open(viofs->path, O_DIRECTORY | O_RDONLY);

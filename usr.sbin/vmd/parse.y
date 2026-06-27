@@ -89,7 +89,8 @@ char		*symget(const char *);
 
 ssize_t		 parse_size(char *, int64_t);
 int		 parse_disk(char *, enum vm_disk_fmt);
-int		 parse_share(char *, char *);
+int		 parse_share(char *, char *, unsigned int, unsigned int,
+		    uid_t);
 enum vm_disk_fmt parse_format(const char *);
 
 static struct vmop_create_params vmc;
@@ -99,6 +100,13 @@ static char			 vsw_type[IF_NAMESIZE];
 static int			 vmc_disable;
 static size_t			 vmc_nnics;
 static int			 errors;
+
+/* Scratch accumulator for a single `share' directive's options. */
+static struct {
+	unsigned int	flags;
+	unsigned int	credmode;
+	uid_t		maproot;
+}				 share_cfg;
 extern struct vmd		*env;
 extern const char		*vmd_descsw[];
 
@@ -126,6 +134,7 @@ typedef struct {
 %token	PATH PREFIX RDOMAIN SIZE SOCKET SWITCH UP VM VMID STAGGERED START
 %token  PARALLEL DELAY SEV SEVES
 %token	SHARE TAG
+%token	RW MAPROOT
 %token	<v.number>	NUMBER
 %token	<v.string>	STRING
 %type	<v.lladdr>	lladdr
@@ -430,7 +439,13 @@ vm_opts		: disable			{
 			vmc.vmc_flags |= VMOP_CREATE_DISK;
 		}
 		| SHARE string TAG string	{
-			if (parse_share($2, $4) != 0) {
+			/* Defaults; share_opts_o may override below. */
+			share_cfg.flags = VMSHARE_RDONLY;
+			share_cfg.credmode = VMSHARE_CRED_SQUASH;
+			share_cfg.maproot = (uid_t)-1;
+		} share_opts_o {
+			if (parse_share($2, $4, share_cfg.flags,
+			    share_cfg.credmode, share_cfg.maproot) != 0) {
 				yyerror("failed to parse share: %s", $2);
 				free($2);
 				free($4);
@@ -739,6 +754,25 @@ iface_opts	: SWITCH string			{
 		}
 		;
 
+share_opts_o	: /* empty */
+		| share_opts_l
+		;
+
+share_opts_l	: share_opts_l share_opts
+		| share_opts
+		;
+
+share_opts	: RW				{
+			share_cfg.flags &= ~VMSHARE_RDONLY;
+			share_cfg.flags |= VMSHARE_WRITABLE;
+		}
+		| MAPROOT NUMBER		{
+			/* Reserved for M3b; parsed + stored, not yet enforced. */
+			share_cfg.maproot = (uid_t)$2;
+			share_cfg.credmode = VMSHARE_CRED_TRANSPARENT;
+		}
+		;
+
 optstring	: STRING			{ $$ = $1; }
 		| /* empty */			{ $$ = NULL; }
 		;
@@ -869,6 +903,7 @@ lookup(char *s)
 		{ "lladdr",		LLADDR },
 		{ "local",		LOCAL },
 		{ "locked",		LOCKED },
+		{ "maproot",		MAPROOT },
 		{ "memory",		MEMORY },
 		{ "net",		NET },
 		{ "owner",		OWNER },
@@ -876,6 +911,7 @@ lookup(char *s)
 		{ "path",		PATH },
 		{ "prefix",		PREFIX },
 		{ "rdomain",		RDOMAIN },
+		{ "rw",			RW },
 		{ "sev",		SEV },
 		{ "seves",		SEVES },
 		{ "share",		SHARE },
@@ -1411,7 +1447,8 @@ parse_disk(char *word, enum vm_disk_fmt type)
 }
 
 int
-parse_share(char *path, char *tag)
+parse_share(char *path, char *tag, unsigned int flags, unsigned int credmode,
+    uid_t maproot)
 {
 	char	 rpath[PATH_MAX];
 
@@ -1437,7 +1474,9 @@ parse_share(char *path, char *tag)
 		log_warnx("share tag too long");
 		return (-1);
 	}
-	vmc.vmc_share_flags[vmc.vmc_nshares] = VMSHARE_RDONLY;
+	vmc.vmc_share_flags[vmc.vmc_nshares] = flags;
+	vmc.vmc_share_credmode[vmc.vmc_nshares] = credmode;
+	vmc.vmc_share_maproot[vmc.vmc_nshares] = maproot;
 
 	vmc.vmc_nshares++;
 
