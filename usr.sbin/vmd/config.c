@@ -480,6 +480,12 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		goto fail;
 	}
 
+	/*
+	 * Shares (virtio-9p / vio9p) carry only a host path + tag inside vmc,
+	 * which travels in the START_VM_REQUEST below.  The device subprocess
+	 * opens the share directory itself under unveil(2); we must not open it
+	 * here and pass the fd, because pledge "sendfd" rejects directory fds.
+	 */
 	/* Send VM information */
 	if ((kernfd = dup(vm->vm_kernel)) == -1) {
 		ret = errno;

@@ -1356,8 +1356,11 @@ remap_guest_mem(struct vmd_vm *vm, int vm_fd)
 	memset(&vsp, 0, sizeof(vsp));
 
 	/* Ask vmm(4) to enter a shared mapping to guest memory. */
-	if (ioctl(vm_fd, VMM_IOC_SHAREMEM, &vsp) == -1)
+	if (ioctl(vm_fd, VMM_IOC_SHAREMEM, &vsp) == -1) {
+		log_warnx("DBGSHM vmid=%u nmem=%zu errno=%d", vm->vm_vmid,
+		    vm->vm_params.vmc_nmemranges, errno);
 		return (errno);
+	}
 
 	/* Update with the location of the new mappings. */
 	for (i = 0; i < vm->vm_params.vmc_nmemranges; i++)

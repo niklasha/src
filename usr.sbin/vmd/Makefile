@@ -6,7 +6,7 @@ PROG=		vmd
 SRCS=		vmd.c control.c log.c priv.c proc.c config.c vmm.c vm.c
 SRCS+=		pci.c virtio.c dhcp.c packet.c parse.y atomicio.c
 SRCS+=		vioscsi.c vioraw.c vioqcow2.c vm_agentx.c vioblk.c
-SRCS+=		vionet.c
+SRCS+=		vionet.c viofs.c
 
 .if ${MACHINE} == "amd64"
 SRCS+=		i8253.c i8259.c fw_cfg.c loadfile_elf.c mc146818.c ns8250.c
