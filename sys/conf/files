@@ -632,6 +632,12 @@ file	miscfs/fuse/fuse_vfsops.c	fuse
 file	miscfs/fuse/fuse_vnops.c	fuse
 file	miscfs/fuse/fusebuf.c		fuse
 
+# virtio-9p guest VFS client (option VIO9PFS; transport is device vio9p)
+file	miscfs/vio9p/vio9p_client.c	vio9pfs
+file	miscfs/vio9p/vio9p_node.c	vio9pfs
+file	miscfs/vio9p/vio9p_vfsops.c	vio9pfs
+file	miscfs/vio9p/vio9p_vnops.c	vio9pfs
+
 pseudo-device pf: ifnet, stoeplitz
 file	net/pf.c			pf	needs-flag
 file	net/pf_norm.c			pf

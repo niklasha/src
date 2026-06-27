@@ -258,6 +258,17 @@ struct fusefs_args {
 };
 
 /*
+ * Arguments to mount vio9p (virtio-9p) filesystems
+ */
+#define VIO9P_ARGS_VERSION	1
+struct vio9p_args {
+	int	va_version;		/* == VIO9P_ARGS_VERSION */
+	int	va_unit;		/* vio9p_cd.cd_devs index (selector) */
+	char	va_tag[32];		/* mount tag (= VIO9P_TAG_MAX) */
+	int	va_rdonly;		/* RO-first: always 1 */
+};
+
+/*
  * file system statistics
  */
 
@@ -273,6 +284,7 @@ union mount_info {
 	struct msdosfs_args msdosfs_args;
 	struct ntfs_args ntfs_args;
 	struct tmpfs_args tmpfs_args;
+	struct vio9p_args vio9p_args;
 	char __align[160];	/* 64-bit alignment and room to grow */
 };
 
@@ -325,6 +337,7 @@ struct statfs {
 #define	MOUNT_UDF	"udf"		/* UDF */
 #define	MOUNT_TMPFS	"tmpfs"		/* tmpfs */
 #define	MOUNT_FUSEFS	"fuse"		/* FUSE */
+#define	MOUNT_VIO9P	"vio9p"		/* virtio-9p guest client */
 
 /*
  * Structure per mounted file system.  Each mounted file system has an
@@ -555,6 +568,7 @@ extern	const struct vfsops ntfs_vfsops;
 extern	const struct vfsops udf_vfsops;
 extern	const struct vfsops fusefs_vfsops;
 extern	const struct vfsops tmpfs_vfsops;
+extern	const struct vfsops vio9p_vfsops;
 
 #include <net/radix.h>
 #include <sys/socket.h>		/* XXX for AF_MAX */

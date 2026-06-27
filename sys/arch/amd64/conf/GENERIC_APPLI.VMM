@@ -6,3 +6,7 @@ option	HZ=2000
 
 option	ACPI_DEBUG
 option	ACPI_MEMDEBUG
+
+# M2: in-kernel virtio-9p guest client (host bind-mount share)
+vio9p*	at virtio?	# Virtio 9P transport
+option	VIO9PFS		# virtio-9p guest filesystem
