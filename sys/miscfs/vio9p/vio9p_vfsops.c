@@ -28,8 +28,12 @@
  * M2_DESIGN.md sections 5.1-5.5.
  *
  * M2b scope: mount + root vnode + statfs + getattr-root.  lookup/open/read/
- * readdir/readlink live in vio9p_vnops.c (M2c).  Every mutating vfsop is a
- * stub: the mount is forced MNT_RDONLY and MNT_UPDATE is refused.
+ * readdir/readlink live in vio9p_vnops.c (M2c).
+ *
+ * M3: the mount honors the helper's RW request (args.va_rw); a RO mount is
+ * still forced MNT_RDONLY (so the VFS write barriers engage) and MNT_UPDATE is
+ * always refused (no ro<->rw remount).  The mutating vfsops (sync, etc.) stay
+ * no-ops; the write path is entirely in the vnops layer + the host server.
  */
 
 #include <sys/param.h>
@@ -94,10 +98,8 @@ vio9p_mount(struct mount *mp, const char *path, void *data,
 	struct vio9p_softc	*sc;
 	int			 error;
 
-	if (mp->mnt_flag & MNT_UPDATE)		/* RO; no remount */
+	if (mp->mnt_flag & MNT_UPDATE)		/* no remount (incl. ro<->rw) */
 		return (EOPNOTSUPP);
-	if ((mp->mnt_flag & MNT_RDONLY) == 0)	/* force read-only */
-		return (EROFS);
 
 	/* sys_mount() already copied the args into kernel space (vfc_datasize). */
 	memcpy(&args, data, sizeof(args));
@@ -114,10 +116,20 @@ vio9p_mount(struct mount *mp, const char *path, void *data,
 	if (strncmp(sc->sc_tag, args.va_tag, VIO9P_TAG_MAX) != 0)
 		return (EINVAL);
 
+	/*
+	 * Honor the helper's RW request (args.va_rw).  The HOST server remains
+	 * the authority -- a guest RW mount over a RO share still gets EROFS per
+	 * op -- but the guest stops self-vetoing.  When the mount is RO, force
+	 * MNT_RDONLY so the VFS-layer write barriers (and vio9p_access) engage.
+	 */
 	vmp = malloc(sizeof(*vmp), M_MISCFSMNT, M_WAITOK | M_ZERO);
 	vmp->vm_mp = mp;
 	vmp->vm_sc = sc;
-	vmp->vm_rdonly = 1;
+	vmp->vm_rw = args.va_rw ? 1 : 0;
+	vmp->vm_rdonly = vmp->vm_rw ? 0 : 1;
+	if (!vmp->vm_rw)
+		mp->mnt_flag |= MNT_RDONLY;	/* belt: VFS-level RO wall */
+	vmp->vm_owner_gid = 0;			/* host owns identity (squash) */
 
 	/*
 	 * 9P session bring-up.  Unlike fuse, the server is the host (not the
@@ -128,6 +140,7 @@ vio9p_mount(struct mount *mp, const char *path, void *data,
 		goto bad;
 	vmp->vm_msize = sc->sc_msize;
 	vmp->vm_iomax = sc->sc_msize - P9_READ_IOHDRSZ;
+	vmp->vm_womax = sc->sc_msize - P9_WRITE_IOHDRSZ;
 	vmp->vm_rootfid = VIO9P_FID_ROOT;
 
 	error = p9c_attach(sc, vmp->vm_rootfid, &vmp->vm_rootqid);

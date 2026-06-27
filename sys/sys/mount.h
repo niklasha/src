@@ -265,7 +265,8 @@ struct vio9p_args {
 	int	va_version;		/* == VIO9P_ARGS_VERSION */
 	int	va_unit;		/* vio9p_cd.cd_devs index (selector) */
 	char	va_tag[32];		/* mount tag (= VIO9P_TAG_MAX) */
-	int	va_rdonly;		/* RO-first: always 1 */
+	int	va_rdonly;		/* legacy RO flag (still honored) */
+	int	va_rw;			/* M3: allow write ops (default 0 = RO) */
 };
 
 /*

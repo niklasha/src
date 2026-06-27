@@ -1407,6 +1407,8 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 			dev->vm_fd = vm->vm_fd;
 			dev->viofs.share_fd = -1;
 			dev->viofs.flags = vmc->vmc_share_flags[i];
+			dev->viofs.credmode = vmc->vmc_share_credmode[i];
+			dev->viofs.maproot = vmc->vmc_share_maproot[i];
 			dev->viofs.idx = i;
 			(void)strlcpy(dev->viofs.path, vmc->vmc_shares[i],
 			    sizeof(dev->viofs.path));

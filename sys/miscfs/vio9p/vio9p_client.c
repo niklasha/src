@@ -29,6 +29,12 @@
  *
  * M2c scope: version, attach, clunk, getattr, statfs (M2b) plus the file-I/O
  * path -- walk, lopen, read, readdir and readlink.
+ *
+ * M3 scope: the write/mutate RPCs -- write, lcreate, mkdir, unlinkat, setattr,
+ * renameat, symlink and link.  Each is the exact inverse of a host p9_* write
+ * handler and reuses the same encode/decode/p9c_rpc machinery, so a hostile or
+ * truncated reply still yields EIO, never an OOB.  The host (not the guest) is
+ * the security boundary: it re-checks viofs_writable and per-op identity.
  */
 
 #include <sys/param.h>
@@ -942,6 +948,322 @@ p9c_readlink(struct vio9p_softc *sc, uint32_t fid, char *buf, size_t bufsz,
 	if (lenp != NULL)
 		*lenp = strlen(buf);
 out:
+	rw_exit_write(&p9c_lock);
+	return (error);
+}
+
+/*
+ * Twrite: write up to len bytes at byte offset off from buf.  count is clamped
+ * to the negotiated payload budget so the request fits the static scratch
+ * buffer (the Twrite header beyond P9_HDRLEN is fid[4] offset[8] count[4] = 16
+ * bytes, so the budget is msize - P9_WRITE_HDR).  The caller loops for a larger
+ * request.  *put receives bytes accepted; a short write is normal (the vnops
+ * layer re-issues from the new offset).  The server refuses a dir fid
+ * (L_EISDIR), a symlink fid (L_ELOOP), an unopened/!writable fid (L_EBADF/
+ * L_EROFS), and a RO share (L_EROFS).
+ *   Twrite[fid[4] offset[8] count[4] data[count]] -> Rwrite[count[4]].
+ */
+#define P9_WRITE_HDR	(P9_HDRLEN + 4 + 8 + 4)	/* hdr+fid+offset+count = 23 */
+int
+p9c_write(struct vio9p_softc *sc, uint32_t fid, uint64_t off, const void *buf,
+    uint32_t len, uint32_t *put)
+{
+	struct p9c_enc enc;
+	struct p9c_dec dec;
+	size_t rxlen = 0;
+	uint32_t count, n;
+	int error;
+
+	*put = 0;
+
+	count = len;
+	if (count > sc->sc_msize - P9_WRITE_HDR)
+		count = sc->sc_msize - P9_WRITE_HDR;
+
+	rw_enter_write(&p9c_lock);
+
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TWRITE);
+	p9c_put32(&enc, fid);
+	p9c_put64(&enc, off);
+	p9c_put32(&enc, count);
+	/* Append the data bytes; bounds-check against the encoder cap. */
+	if (!enc.err && enc.len + count <= enc.cap) {
+		if (count > 0)
+			memcpy(&enc.buf[enc.len], buf, count);
+		enc.len += count;
+	} else
+		enc.err = 1;
+
+	error = p9c_rpc(sc, &enc, P9_RWRITE, p9c_rxbuf, sizeof(p9c_rxbuf),
+	    &rxlen);
+	if (error != 0)
+		goto out;
+
+	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	n = p9c_get32(&dec);
+	if (dec.err || n > count) {	/* server must not claim more than asked */
+		error = EIO;
+		goto out;
+	}
+	*put = n;
+out:
+	rw_exit_write(&p9c_lock);
+	return (error);
+}
+
+/*
+ * Tlcreate: create a regular file `name` in the directory `fid` and OPEN it.
+ * Per 9P2000.L the server REPLACES `fid` (the dir fid) with the new, opened
+ * file fid -- so the caller MUST pass a freshly Twalk-cloned, dir-derived fid
+ * it is willing to convert into the file fid (vop_create owns that contract).
+ * flags are Linux O_* (the caller passes L_O_WRONLY|L_O_CREAT|L_O_EXCL etc.;
+ * the server adds O_CREAT|O_NOFOLLOW|O_CLOEXEC and masks SUID/SGID/sticky from
+ * mode).  *qid receives the new file's qid; *iounit the transfer hint (0 ==
+ * use msize -- the caller falls back to vm_iomax).
+ *
+ * Fid disposition on ERROR (host_handlers.c p9_lcreate): an openat() failure
+ * leaves the directory fid STILL BOUND server-side (the slot's fd/is_dir are
+ * untouched), so the caller MUST p9c_clunk(fid) before returning it to the
+ * pool -- it is not implicitly freed (FIX D4).
+ *   Tlcreate[fid[4] name[s] flags[4] mode[4] gid[4]] -> Rlcreate[qid[13] iounit[4]].
+ */
+int
+p9c_lcreate(struct vio9p_softc *sc, uint32_t fid, const char *name,
+    uint32_t flags, uint32_t mode, uint32_t gid, struct p9_qid *qid,
+    uint32_t *iounit)
+{
+	struct p9c_enc enc;
+	struct p9c_dec dec;
+	size_t rxlen = 0;
+	uint32_t iu;
+	int error;
+
+	rw_enter_write(&p9c_lock);
+
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLCREATE);
+	p9c_put32(&enc, fid);
+	p9c_puts(&enc, name, strlen(name));
+	p9c_put32(&enc, flags);
+	p9c_put32(&enc, mode);
+	p9c_put32(&enc, gid);
+
+	error = p9c_rpc(sc, &enc, P9_RLCREATE, p9c_rxbuf, sizeof(p9c_rxbuf),
+	    &rxlen);
+	if (error != 0)
+		goto out;
+
+	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_getqid(&dec, qid);
+	iu = p9c_get32(&dec);
+	if (dec.err) {
+		error = EIO;
+		goto out;
+	}
+	if (iounit != NULL)
+		*iounit = iu;
+out:
+	rw_exit_write(&p9c_lock);
+	return (error);
+}
+
+/*
+ * Tmkdir: create directory `name` in dir `dfid` (mode masked server-side).
+ * Unlike Tlcreate the fid is NOT replaced; only the new qid comes back.  The
+ * caller then Twalk-clones a fresh fid for the child vnode (lookup-after-create).
+ *   Tmkdir[dfid[4] name[s] mode[4] gid[4]] -> Rmkdir[qid[13]].
+ */
+int
+p9c_mkdir(struct vio9p_softc *sc, uint32_t dfid, const char *name,
+    uint32_t mode, uint32_t gid, struct p9_qid *qid)
+{
+	struct p9c_enc enc;
+	struct p9c_dec dec;
+	size_t rxlen = 0;
+	int error;
+
+	rw_enter_write(&p9c_lock);
+
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TMKDIR);
+	p9c_put32(&enc, dfid);
+	p9c_puts(&enc, name, strlen(name));
+	p9c_put32(&enc, mode);
+	p9c_put32(&enc, gid);
+
+	error = p9c_rpc(sc, &enc, P9_RMKDIR, p9c_rxbuf, sizeof(p9c_rxbuf),
+	    &rxlen);
+	if (error != 0)
+		goto out;
+
+	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_getqid(&dec, qid);
+	if (dec.err)
+		error = EIO;
+out:
+	rw_exit_write(&p9c_lock);
+	return (error);
+}
+
+/*
+ * Tunlinkat: remove `name` from dir `dfid`.  flags carries P9_AT_REMOVEDIR for
+ * rmdir, 0 for unlink (the vnops layer sets it by op).  Runlinkat is header-only.
+ *   Tunlinkat[dfid[4] name[s] flags[4]] -> Runlinkat[].
+ */
+int
+p9c_unlinkat(struct vio9p_softc *sc, uint32_t dfid, const char *name,
+    uint32_t flags)
+{
+	struct p9c_enc enc;
+	size_t rxlen = 0;
+	int error;
+
+	rw_enter_write(&p9c_lock);
+
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TUNLINKAT);
+	p9c_put32(&enc, dfid);
+	p9c_puts(&enc, name, strlen(name));
+	p9c_put32(&enc, flags);
+
+	error = p9c_rpc(sc, &enc, P9_RUNLINKAT, p9c_rxbuf, sizeof(p9c_rxbuf),
+	    &rxlen);
+
+	rw_exit_write(&p9c_lock);
+	return (error);
+}
+
+/*
+ * Tsetattr: apply the attributes selected by `valid` to `fid`.  In squash mode
+ * the caller never sets P9_SETATTR_UID/GID, but the wire fields are always sent
+ * (the server ignores uid/gid in squash).  Rsetattr is header-only.
+ *   Tsetattr[fid[4] valid[4] mode[4] uid[4] gid[4] size[8]
+ *            atime_sec[8] atime_nsec[8] mtime_sec[8] mtime_nsec[8]] -> Rsetattr[].
+ */
+int
+p9c_setattr(struct vio9p_softc *sc, uint32_t fid, uint32_t valid, uint32_t mode,
+    uint32_t uid, uint32_t gid, uint64_t size, int64_t atime_sec,
+    int64_t atime_nsec, int64_t mtime_sec, int64_t mtime_nsec)
+{
+	struct p9c_enc enc;
+	size_t rxlen = 0;
+	int error;
+
+	rw_enter_write(&p9c_lock);
+
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSETATTR);
+	p9c_put32(&enc, fid);
+	p9c_put32(&enc, valid);
+	p9c_put32(&enc, mode);
+	p9c_put32(&enc, uid);
+	p9c_put32(&enc, gid);
+	p9c_put64(&enc, size);
+	p9c_put64(&enc, (uint64_t)atime_sec);
+	p9c_put64(&enc, (uint64_t)atime_nsec);
+	p9c_put64(&enc, (uint64_t)mtime_sec);
+	p9c_put64(&enc, (uint64_t)mtime_nsec);
+
+	error = p9c_rpc(sc, &enc, P9_RSETATTR, p9c_rxbuf, sizeof(p9c_rxbuf),
+	    &rxlen);
+
+	rw_exit_write(&p9c_lock);
+	return (error);
+}
+
+/*
+ * Trenameat: rename `oldname` in directory `olddirfid` to `newname` in
+ * directory `newdirfid` -- the general, fid-complete rename that carries BOTH
+ * parents and BOTH leaf names.  This is the ONLY rename shape the in-kernel
+ * guest emits: the host refuses the legacy Trename for a non-symlink fid
+ * (it has only a host fd to the object, not a (parentdir,leaf) it can
+ * renameat() from), so vop_rename always uses Trenameat (FIX D1).  Both dir
+ * fids are already bound under the share; the server confines the operation and
+ * blocks cross-mount before the RPC.  Rrenameat is header-only; no fid is
+ * consumed (the moved object's own fid stays valid host-side, POSIX-unlink
+ * style).
+ *   Trenameat[olddirfid[4] oldname[s] newdirfid[4] newname[s]] -> Rrenameat[].
+ */
+int
+p9c_renameat(struct vio9p_softc *sc, uint32_t olddirfid, const char *oldname,
+    uint32_t newdirfid, const char *newname)
+{
+	struct p9c_enc enc;
+	size_t rxlen = 0;
+	int error;
+
+	rw_enter_write(&p9c_lock);
+
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TRENAMEAT);
+	p9c_put32(&enc, olddirfid);
+	p9c_puts(&enc, oldname, strlen(oldname));
+	p9c_put32(&enc, newdirfid);
+	p9c_puts(&enc, newname, strlen(newname));
+
+	error = p9c_rpc(sc, &enc, P9_RRENAMEAT, p9c_rxbuf, sizeof(p9c_rxbuf),
+	    &rxlen);
+
+	rw_exit_write(&p9c_lock);
+	return (error);
+}
+
+/*
+ * Tsymlink: create symlink `name` in dir `dfid` with body `target` (stored
+ * verbatim -- NFS model, the guest resolves on read).  *qid receives the new
+ * link's qid.  The caller Twalk-clones a fresh fid for the child afterward.
+ *   Tsymlink[dfid[4] name[s] target[s] gid[4]] -> Rsymlink[qid[13]].
+ */
+int
+p9c_symlink(struct vio9p_softc *sc, uint32_t dfid, const char *name,
+    const char *target, uint32_t gid, struct p9_qid *qid)
+{
+	struct p9c_enc enc;
+	struct p9c_dec dec;
+	size_t rxlen = 0;
+	int error;
+
+	rw_enter_write(&p9c_lock);
+
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSYMLINK);
+	p9c_put32(&enc, dfid);
+	p9c_puts(&enc, name, strlen(name));
+	p9c_puts(&enc, target, strlen(target));
+	p9c_put32(&enc, gid);
+
+	error = p9c_rpc(sc, &enc, P9_RSYMLINK, p9c_rxbuf, sizeof(p9c_rxbuf),
+	    &rxlen);
+	if (error != 0)
+		goto out;
+
+	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_getqid(&dec, qid);
+	if (dec.err)
+		error = EIO;
+out:
+	rw_exit_write(&p9c_lock);
+	return (error);
+}
+
+/*
+ * Tlink: create hard link `name` in dir `dfid` to the existing object `fid`.
+ * Rlink is header-only.  NOTE: OpenBSD's linkat(2) has no AT_EMPTY_PATH, so the
+ * host may not be able to express link-by-fid and may reply L_EOPNOTSUPP; the
+ * guest surfaces that to the caller unchanged.
+ *   Tlink[dfid[4] fid[4] name[s]] -> Rlink[].
+ */
+int
+p9c_link(struct vio9p_softc *sc, uint32_t dfid, uint32_t fid, const char *name)
+{
+	struct p9c_enc enc;
+	size_t rxlen = 0;
+	int error;
+
+	rw_enter_write(&p9c_lock);
+
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLINK);
+	p9c_put32(&enc, dfid);
+	p9c_put32(&enc, fid);
+	p9c_puts(&enc, name, strlen(name));
+
+	error = p9c_rpc(sc, &enc, P9_RLINK, p9c_rxbuf, sizeof(p9c_rxbuf),
+	    &rxlen);
+
 	rw_exit_write(&p9c_lock);
 	return (error);
 }

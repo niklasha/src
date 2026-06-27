@@ -17,14 +17,19 @@
  */
 
 /*
- * mount_vio9p -- mount(8) helper for the in-kernel read-only vio9p
- * 9P2000.L guest VFS client.
+ * mount_vio9p -- mount(8) helper for the in-kernel vio9p 9P2000.L guest VFS
+ * client.
  *
  * Unlike mount_tmpfs, the first non-option argument is a 9P mount tag
  * (matched against the vio9p(4) device's exported tag), NOT a path: it
  * is never resolved with realpath().  Only the mountpoint is adjusted.
  * The helper does not open a device fd; the kernel vio9p driver already
- * owns the device.  vio9p is read-only in M2, so MNT_RDONLY is forced.
+ * owns the device.
+ *
+ * The mount defaults to read-only (MNT_RDONLY set before getmntopts); an
+ * explicit `-o rw` clears MNT_RDONLY (MOPT_STDOPTS handles the ro/rw keywords)
+ * and is reported to the kernel via args.va_rw.  The HOST viofs server remains
+ * the authority on whether the share is actually writable.
  */
 
 #include <sys/types.h>
@@ -66,7 +71,8 @@ main(int argc, char *argv[])
 	memset(&args, 0, sizeof(args));
 	args.va_version = VIO9P_ARGS_VERSION;
 	args.va_rdonly = 1;
-	mntflags = 0;
+	args.va_rw = 0;
+	mntflags = MNT_RDONLY;			/* RO unless -o rw clears it */
 	unit = 0;
 
 	while ((ch = getopt(argc, argv, "o:u:")) != -1) {
@@ -97,8 +103,18 @@ main(int argc, char *argv[])
 
 	pathadj(argv[1], canon_dir);
 
-	/* Read-only first: vio9p exports the host share RO in M2. */
-	mntflags |= MNT_RDONLY;
+	/*
+	 * Default read-only.  `-o rw` cleared MNT_RDONLY via MOPT_STDOPTS;
+	 * honor that and tell the kernel via va_rw.  The host server still
+	 * enforces whether the share is actually writable.
+	 */
+	if (mntflags & MNT_RDONLY) {
+		args.va_rw = 0;
+		args.va_rdonly = 1;
+	} else {
+		args.va_rw = 1;
+		args.va_rdonly = 0;
+	}
 
 	if (mount(MOUNT_VIO9P, canon_dir, mntflags, &args) == -1)
 		err(1, "%s on %s", args.va_tag, canon_dir);
@@ -114,7 +130,8 @@ usage(void)
 	extern char *__progname;
 
 	(void)fprintf(stderr,
-	    "usage: %s [-o options] [-u unit] tag mount_point\n",
+	    "usage: %s [-o options] [-u unit] tag mount_point\n"
+	    "       (default read-only; use -o rw for a writable mount)\n",
 	    __progname);
 	exit(1);
 }
