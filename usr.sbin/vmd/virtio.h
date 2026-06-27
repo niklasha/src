@@ -340,7 +340,9 @@ struct viofs_dev {
 	int		share_fd;	/* O_DIRECTORY share root [r] */
 	char		path[PATH_MAX];	/* share root path, for unveil() */
 	char		tag[VIO9P_TAG_MAX];	/* virtio-9p mount tag */
-	unsigned int	flags;		/* VMSHARE_RDONLY */
+	unsigned int	flags;		/* VMSHARE_RDONLY | VMSHARE_WRITABLE */
+	unsigned int	credmode;	/* VMSHARE_CRED_* (M3b; SQUASH now) */
+	uid_t		maproot;	/* M3b: uid that maps to share owner */
 	uint32_t	msize;		/* negotiated 9P msize */
 	unsigned int	idx;
 };
