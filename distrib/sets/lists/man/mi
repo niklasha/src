@@ -2753,6 +2753,7 @@
 ./usr/share/man/man8/mount_ntfs.8
 ./usr/share/man/man8/mount_tmpfs.8
 ./usr/share/man/man8/mount_udf.8
+./usr/share/man/man8/mount_vio9p.8
 ./usr/share/man/man8/mount_vnd.8
 ./usr/share/man/man8/mountd.8
 ./usr/share/man/man8/mrinfo.8

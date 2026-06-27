@@ -693,6 +693,8 @@
 ./usr/include/dev/pv/ndis.h
 ./usr/include/dev/pv/pvreg.h
 ./usr/include/dev/pv/pvvar.h
+./usr/include/dev/pv/vio9preg.h
+./usr/include/dev/pv/vio9pvar.h
 ./usr/include/dev/pv/vioblkreg.h
 ./usr/include/dev/pv/viogpu.h
 ./usr/include/dev/pv/vioscsireg.h
@@ -968,6 +970,8 @@
 ./usr/include/miscfs/fuse
 ./usr/include/miscfs/fuse/fusefs.h
 ./usr/include/miscfs/fuse/fusefs_node.h
+./usr/include/miscfs/vio9p
+./usr/include/miscfs/vio9p/vio9p.h
 ./usr/include/msdosfs
 ./usr/include/msdosfs/bootsect.h
 ./usr/include/msdosfs/bpb.h
