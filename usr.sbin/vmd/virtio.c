@@ -33,6 +33,7 @@
 
 #include <errno.h>
 #include <event.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -86,6 +87,8 @@ SLIST_HEAD(virtio_dev_head, virtio_dev) virtio_devs;
 static void virtio_dev_init(struct vmd_vm *, struct virtio_dev *, uint8_t,
     uint16_t, uint16_t, uint64_t);
 static int virtio_dev_launch(struct vmd_vm *, struct virtio_dev *);
+static int virtio_dev_launch_await_parent(struct vmd_vm *, struct virtio_dev *,
+    int, int);
 static void virtio_dispatch_dev(int, short, void *);
 static int handle_dev_msg(struct viodev_msg *, struct virtio_dev *);
 static int virtio_dev_closefds(struct virtio_dev *);
@@ -1379,6 +1382,22 @@ virtio_shutdown(struct vmd_vm *vm)
 	 * iterating over known child devices and waiting for them to die.
 	 */
 	SLIST_FOREACH_SAFE(dev, &virtio_devs, dev_next, tmp) {
+		/*
+		 * M3b Phase B: the transparent viofs was fork+exec'd by
+		 * PROC_PARENT (so it could keep root), not by this VM process.
+		 * It is therefore NOT our child -- waitpid() here would return
+		 * ECHILD.  The orderly writeback flush already happened above
+		 * over the VM-owned sync channel (VIODEV_MSG_SHUTDOWN); PARENT
+		 * reaps the orphan when PROC_VMM notifies it on VM death.  Skip
+		 * the local waitpid() for these, and tolerate ECHILD if a future
+		 * change ever routes one here.
+		 */
+		if (dev->dev_parent_launched) {
+			log_debug("%s: device pid %d is PARENT-launched; "
+			    "PARENT will reap", __func__, dev->dev_pid);
+			free(dev);
+			continue;
+		}
 		log_debug("%s: waiting on device pid %d", __func__,
 		    dev->dev_pid);
 		do {
@@ -1387,6 +1406,9 @@ virtio_shutdown(struct vmd_vm *vm)
 		if (pid == dev->dev_pid)
 			log_debug("%s: device for pid %d is stopped",
 			    __func__, pid);
+		else if (pid == -1 && errno == ECHILD)
+			log_debug("%s: device pid %d already reaped", __func__,
+			    dev->dev_pid);
 		else
 			log_warnx("%s: unexpected pid %d", __func__, pid);
 		free(dev);
@@ -1550,13 +1572,14 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 {
 	char *nargv[12], num[32], vmm_fd[32], vm_name[VM_NAME_MAX], t[2];
 	pid_t dev_pid;
-	int sync_fds[2], async_fds[2], ret = 0;
+	int sync_fds[2], async_fds[2], ret = 0, launch_via_parent;
 	size_t i, sz = 0;
 	struct viodev_msg msg;
 	struct virtio_dev *dev_entry, dev_copy;
 	struct imsg imsg;
 	struct imsgev *iev = &dev->sync_iev;
 	struct vmd_vm vm_copy;
+	struct vmop_dev_launch vdl;
 
 	switch (dev->dev_type) {
 	case VMD_DEVTYPE_NET:
@@ -1592,6 +1615,121 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 		return (errno);
 	}
 
+	/*
+	 * M3b Phase B: the transparent-credmode viofs must run as root so its
+	 * per-op seteuid()/setegid() works.  This per-VM process is _vmd, so we
+	 * cannot fork+exec a root child here.  Instead PROC_PARENT (the last
+	 * root process) forks+execs it on our behalf.  Everything else -- squash
+	 * viofs, vioblk, vionet, vioscsi -- is still fork+exec'd locally below,
+	 * exactly as before.  Only WHO calls fork()+exec() changes; this process
+	 * keeps the [0] runtime channels and drives the dev_copy/vm_copy
+	 * handshake unchanged in both cases.
+	 */
+	launch_via_parent = (dev->dev_type == VMD_DEVTYPE_VIOFS &&
+	    dev->viofs.credmode == VMSHARE_CRED_TRANSPARENT);
+
+	if (launch_via_parent) {
+		/*
+		 * libevent's SIGPIPE handler is not armed yet (we run during
+		 * init_emulated_hw(), before event_dispatch()); ignore SIGPIPE
+		 * so a write to vm_iev after PROC_VMM dies surfaces as EPIPE
+		 * from imsgbuf_flush() instead of killing this process.
+		 */
+		signal(SIGPIPE, SIG_IGN);
+		/*
+		 * Ask PROC_PARENT to fork+exec the root viofs.  We send the two
+		 * CHILD-end socketpair fds (sync_fds[1], async_fds[1]) up; the
+		 * PARENT-launched child inherits them, so the runtime data path
+		 * never traverses PROC_PARENT.  imsg carries exactly one fd per
+		 * message, so this is two consecutive single-fd imsgs correlated
+		 * by peerid == vm->vm_vmid (mirrors the N-disk-fd pattern).  The
+		 * VM child's only imsg channel up is vm->vm_iev (-> PROC_VMM).
+		 */
+		memset(&vdl, 0, sizeof(vdl));
+		vdl.vdl_vmid = vm->vm_vmid;
+		vdl.vdl_sync_fd_no = sync_fds[1];
+		vdl.vdl_async_fd_no = async_fds[1];
+		vdl.vdl_status = 0;
+		vdl.vdl_devtype = dev->dev_type;
+		/*
+		 * M3b remediation: tell the root side WHICH share this is so it
+		 * can re-derive the trusted policy from config.  We send only the
+		 * index; PARENT validates it against this VM's own vmc_nshares
+		 * and ignores any policy fields we might set.
+		 */
+		vdl.vdl_share_idx = dev->viofs.idx;
+		strlcpy(vdl.vdl_vmname, vm->vm_params.vmc_name,
+		    sizeof(vdl.vdl_vmname));
+
+		/*
+		 * Plain imsg_compose (no libevent arming) + a manual flush per
+		 * message: the event loop is not running yet (we are in
+		 * init_emulated_hw(), before event_dispatch()), and imsg carries
+		 * exactly one fd per message, so the two child-end fds go up as
+		 * two separate flushed messages.
+		 */
+		if (imsg_compose(&vm->vm_iev.ibuf,
+		    IMSG_VMDOP_DEV_LAUNCH_REQUEST, vm->vm_vmid, getpid(),
+		    sync_fds[1], &vdl, sizeof(vdl)) == -1) {
+			log_warn("%s: failed to compose dev launch request",
+			    __func__);
+			ret = errno;
+			goto err;
+		}
+		if (imsgbuf_flush(&vm->vm_iev.ibuf) == -1) {
+			log_warn("%s: failed to flush dev launch request",
+			    __func__);
+			ret = errno;
+			goto err;
+		}
+		if (imsg_compose(&vm->vm_iev.ibuf,
+		    IMSG_VMDOP_DEV_LAUNCH_FD_ASYNC, vm->vm_vmid, getpid(),
+		    async_fds[1], &vdl, sizeof(vdl)) == -1) {
+			log_warn("%s: failed to compose dev launch async fd",
+			    __func__);
+			ret = errno;
+			goto err;
+		}
+		if (imsgbuf_flush(&vm->vm_iev.ibuf) == -1) {
+			log_warn("%s: failed to flush dev launch async fd",
+			    __func__);
+			ret = errno;
+			goto err;
+		}
+
+		/*
+		 * PARENT now owns the child-end fds via inheritance; drop our
+		 * copies (mirror of the parent branch's close_fd below).  We do
+		 * NOT clear the sync_fds[1]/async_fds[1] integers: the converge
+		 * path below serializes those exact numbers into dev_copy so the
+		 * PARENT-launched child (which inherited them) reads valid fds.
+		 */
+		close_fd(sync_fds[1]);
+		close_fd(async_fds[1]);
+
+		/*
+		 * Block for PARENT's IMSG_VMDOP_DEV_LAUNCH_RESPONSE before
+		 * driving the handshake.  On failure the device-launch fails
+		 * exactly like a local fork() failure today.  On success
+		 * dev->dev_parent_launched is set (and dev->dev_pid left as a
+		 * sentinel 0) so virtio_shutdown() does not try to waitpid() a
+		 * child that is not ours -- the device pid lives in PARENT.
+		 */
+		if (virtio_dev_launch_await_parent(vm, dev, sync_fds[0],
+		    async_fds[0]) == -1) {
+			/* await_parent closed [0] on failure; nothing to do. */
+			return (-1);
+		}
+
+		/*
+		 * Converge with the local-fork parent path.  The child reads the
+		 * fd integers we wrote into dev_copy (sync_fds[1]/async_fds[1]);
+		 * PARENT dup2()'d the inherited fds to those exact numbers, so
+		 * they are valid in the child.
+		 */
+		goto parent_ready;
+	}
+
 	/* Fork... */
 	dev_pid = fork();
 	if (dev_pid == -1) {
@@ -1608,6 +1746,7 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 		/* Save the child's pid to help with cleanup. */
 		dev->dev_pid = dev_pid;
 
+ parent_ready:
 		/* Set the channel fds to the child's before sending. */
 		dev->sync_fd = sync_fds[1];
 		pthread_mutex_init(&dev->sync_mtx, NULL);
@@ -1763,6 +1902,110 @@ err:
 	close_fd(async_fds[0]);
 	close_fd(async_fds[1]);
 	return (ret);
+}
+
+/*
+ * Block until PROC_PARENT reports the result of forking+exec'ing the
+ * transparent viofs device (M3b Phase B).  Returns 0 on success with
+ * dev->dev_parent_launched set (the device pid lives in PARENT, so dev->dev_pid
+ * is left as a sentinel 0 and must never be waitpid()'d here); returns -1 on
+ * failure, having closed the caller's [0] channel ends.
+ *
+ * This is a bounded, synchronous read on the VM child's vm_iev channel.  It is
+ * called from virtio_dev_launch() -> init_emulated_hw(), i.e. BEFORE run_vm()
+ * starts the libevent loop, so there is no concurrent reader on vm->vm_iev and
+ * no deadlock with vm_dispatch_vmm().  Each iteration poll()s with a timeout so
+ * a dead PARENT cannot wedge the VM; any unrelated imsg (none are expected
+ * pre-vcpu) is skipped defensively.
+ */
+#define VIO_DEV_LAUNCH_TMO_MS	(30 * 1000)	/* PARENT launch reply wait */
+static int
+virtio_dev_launch_await_parent(struct vmd_vm *vm, struct virtio_dev *dev,
+    int sync0, int async0)
+{
+	struct imsgbuf		*ibuf = &vm->vm_iev.ibuf;
+	struct imsg		 imsg;
+	struct vmop_dev_launch	 vdl;
+	struct pollfd		 pfd;
+	uint32_t		 type, peerid;
+	int			 ret;
+
+	for (;;) {
+		/*
+		 * Bound the wait so a PROC_PARENT that dies after taking our
+		 * REQUEST (and thus never sends a RESPONSE) cannot wedge this
+		 * VM forever in init_emulated_hw().  PARENT replies promptly on
+		 * both success and failure, so a timeout means PARENT is gone.
+		 */
+		pfd.fd = ibuf->fd;
+		pfd.events = POLLIN;
+		ret = poll(&pfd, 1, VIO_DEV_LAUNCH_TMO_MS);
+		if (ret == -1) {
+			if (errno == EINTR)
+				continue;
+			log_warn("%s: poll", __func__);
+			goto fail;
+		}
+		if (ret == 0) {
+			log_warnx("%s: timed out awaiting dev launch response",
+			    __func__);
+			goto fail;
+		}
+
+		ret = imsgbuf_read_one(ibuf, &imsg);
+		if (ret == -1) {
+			log_warn("%s: imsgbuf_read_one", __func__);
+			goto fail;
+		}
+		if (ret == 0) {
+			log_warnx("%s: vmm channel closed awaiting dev launch",
+			    __func__);
+			goto fail;
+		}
+
+		type = imsg_get_type(&imsg);
+		peerid = imsg_get_id(&imsg);
+		if (type != IMSG_VMDOP_DEV_LAUNCH_RESPONSE ||
+		    peerid != vm->vm_vmid) {
+			/* Not ours; ignore and keep waiting (defensive). */
+			log_warnx("%s: ignoring imsg type %u peerid %u while "
+			    "awaiting dev launch", __func__, type, peerid);
+			imsg_free(&imsg);
+			continue;
+		}
+
+		if (imsg_get_data(&imsg, &vdl, sizeof(vdl))) {
+			log_warnx("%s: malformed dev launch response", __func__);
+			imsg_free(&imsg);
+			goto fail;
+		}
+		imsg_free(&imsg);
+
+		if (vdl.vdl_status != 0) {
+			log_warnx("%s: PARENT failed to launch '%c' device: %s",
+			    __func__, dev->dev_type,
+			    strerror(vdl.vdl_status));
+			goto fail;
+		}
+
+		/*
+		 * The device pid lives in PROC_PARENT now; this VM process is
+		 * NOT its parent and must not waitpid() it (virtio_shutdown()
+		 * honors dev_parent_launched).  We keep a sentinel so the pid is
+		 * never used as a local waitpid() target here.
+		 */
+		dev->dev_pid = 0;
+		dev->dev_parent_launched = 1;
+
+		log_debug("%s: PARENT launched '%c' device for vm %u",
+		    __func__, dev->dev_type, vm->vm_vmid);
+		return (0);
+	}
+
+ fail:
+	close_fd(sync0);
+	close_fd(async0);
+	return (-1);
 }
 
 /*

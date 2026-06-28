@@ -113,6 +113,7 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct vmop_id		 vid;
 	struct vmop_result	 vmr;
 	struct vmop_addr_result  var;
+	struct vmop_dev_launch	 vdl;
 	uint32_t		 id = 0, vm_id, type, generation = 0;
 	pid_t			 pid, vm_pid = 0;
 	unsigned int		 mode, flags;
@@ -355,6 +356,27 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 			fatalx("already received psp fd");
 		env->vmd_psp_fd = imsg_get_fd(imsg);
 		break;
+	case IMSG_VMDOP_DEV_LAUNCH_RESPONSE:
+		/*
+		 * M3b Phase B: PROC_PARENT reports the result of forking+exec'ing
+		 * the transparent viofs.  Forward it DOWN to the requesting VM
+		 * child, which is blocked in virtio_dev_launch_await_parent().
+		 * The VM is identified by peerid == vm_vmid; no fd is attached.
+		 */
+		if (imsg_get_data(imsg, &vdl, sizeof(vdl))) {
+			log_warnx("%s: malformed dev launch response", __func__);
+			break;
+		}
+		if ((vm = vm_getbyvmid(vm_id)) == NULL) {
+			log_warnx("%s: dev launch response for unknown vmid %u",
+			    __func__, vm_id);
+			break;
+		}
+		if (imsg_compose_event(&vm->vm_iev,
+		    IMSG_VMDOP_DEV_LAUNCH_RESPONSE, vm_id, pid, -1,
+		    &vdl, sizeof(vdl)) == -1)
+			return (-1);
+		break;
 	default:
 		return (-1);
 	}
@@ -413,6 +435,7 @@ vmm_sighdlr(int sig, short event, void *arg)
 	int status, ret = 0;
 	pid_t pid;
 	struct vmop_result vmr;
+	struct vmop_dev_launch vdl;
 	struct vmd_vm *vm;
 	struct vm_terminate_params vtp;
 
@@ -485,6 +508,23 @@ vmm_sighdlr(int sig, short event, void *arg)
 					log_warnx("could not signal "
 					    "termination of VM %u to "
 					    "parent", vm->vm_vmid);
+
+				/*
+				 * M3b Phase B: a transparent viofs for this VM
+				 * (if any) was fork+exec'd by PROC_PARENT, not by
+				 * the now-dead VM process.  Tell PARENT the VM is
+				 * gone so it can reap that orphaned root device.
+				 * Keyed by vmid (peerid + payload); harmless if
+				 * the VM had no PARENT-launched device.
+				 */
+				memset(&vdl, 0, sizeof(vdl));
+				vdl.vdl_vmid = vm->vm_vmid;
+				if (proc_compose_imsg(ps, PROC_PARENT,
+				    IMSG_VMDOP_DEV_REAP_REQUEST,
+				    vm->vm_vmid, -1, &vdl, sizeof(vdl)) == -1)
+					log_warnx("%s: could not request dev "
+					    "reap for VM %u", __func__,
+					    vm->vm_vmid);
 
 				vm_remove(vm, __func__);
 			} else
@@ -617,6 +657,26 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 				if (procs[i].p_id == PROC_PARENT) {
 					proc_forward_imsg(procs[i].p_ps,
 					    &imsg, PROC_PARENT, -1);
+					break;
+				}
+			}
+			break;
+
+		case IMSG_VMDOP_DEV_LAUNCH_REQUEST:
+		case IMSG_VMDOP_DEV_LAUNCH_FD_ASYNC:
+			/*
+			 * M3b remediation: the VM child asks the root side to
+			 * launch its transparent viofs.  STAMP the authenticated
+			 * vm->vm_vmid as the relayed peerid (do NOT preserve the
+			 * VM-chosen one): PROC_PARENT keys re-derivation, the
+			 * pending entry, and the response on it, so one VM can
+			 * neither impersonate nor misroute a launch to another.
+			 * The attached device-end socketpair fd rides along.
+			 */
+			for (i = 0; i < nitems(procs); i++) {
+				if (procs[i].p_id == PROC_PARENT) {
+					proc_forward_imsg(procs[i].p_ps,
+					    &imsg, PROC_PARENT, vm->vm_vmid);
 					break;
 				}
 			}

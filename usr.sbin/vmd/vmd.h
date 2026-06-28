@@ -172,6 +172,25 @@ enum imsg_type {
 	 * it, so no vmctl rebuild is required.
 	 */
 	IMSG_VMDOP_VM_TERMINATE,
+	/*
+	 * M3b Phase B: launch the transparent viofs device as root from
+	 * PROC_PARENT (the last runtime-root process).  The per-VM process
+	 * still owns the runtime sync/async channels ([0] ends) and drives
+	 * the dev_copy/vm_copy handshake; only the fork()+execvp() is moved
+	 * to PARENT so the device child inherits uid 0 for per-op seteuid().
+	 *
+	 * Routing is VM-child -> PROC_VMM -> PROC_PARENT (request + the two
+	 * device-end socketpair fds, one fd per imsg) and back PARENT ->
+	 * PROC_VMM -> VM-child (status).  Correlation is by imsg peerid =
+	 * vm->vm_vmid on every message.  Appended at the END of the enum so
+	 * no existing wire value shifts (the IMSG_VMDOP_* values are on the
+	 * vmctl<->vmd wire; these are internal-only and vmctl never sends
+	 * them, so no vmctl rebuild is required).
+	 */
+	IMSG_VMDOP_DEV_LAUNCH_REQUEST,	/* VM->VMM->PARENT, + 1 fd (sync) */
+	IMSG_VMDOP_DEV_LAUNCH_FD_ASYNC,	/* VM->VMM->PARENT, + 1 fd (async) */
+	IMSG_VMDOP_DEV_LAUNCH_RESPONSE,	/* PARENT->VMM->VM, status only */
+	IMSG_VMDOP_DEV_REAP_REQUEST,	/* VMM->PARENT, reap a vm's dev pid */
 };
 
 struct vmop_result {
@@ -228,6 +247,47 @@ struct vmop_addr_result {
 struct vmop_owner {
 	uid_t			 uid;
 	int64_t			 gid;
+};
+
+/*
+ * M3b Phase B device-launch request (VM-child -> PROC_VMM -> PROC_PARENT).
+ *
+ * The requesting VM process creates both device socketpairs, keeps the [0]
+ * ends, and sends the two [1] (device-end) fds up to PARENT via two
+ * single-fd imsgs (imsg carries one fd each).  PARENT dup2()s the received
+ * sync fd to vdl_sync_fd_no and the async fd to vdl_async_fd_no -- the EXACT
+ * fd numbers the VM serialized into dev_copy/vm_copy -- so the re-exec'd
+ * viofs reads valid fd integers out of the serialized structs.  PARENT then
+ * fork()+execvp()s the device as root (no setresuid -> inherits uid 0).
+ *
+ * Correlation: imsg peerid carries vdl_vmid on every message; the REQUEST
+ * imsg fd is sync_fds[1], the FD_ASYNC imsg fd is async_fds[1].
+ */
+struct vmop_dev_launch {
+	uint32_t		 vdl_vmid;	/* = vm->vm_vmid; also peerid */
+	int			 vdl_sync_fd_no; /* dup2 target = sync_fds[1] */
+	int			 vdl_async_fd_no; /* dup2 target = async_fds[1] */
+	int			 vdl_status;	/* RESPONSE: 0 ok, else errno */
+	char			 vdl_devtype;	/* VMD_DEVTYPE_VIOFS */
+	char			 vdl_vmname[VM_NAME_MAX];
+	/*
+	 * M3b remediation: VM-supplied share selector.  PROC_PARENT validates
+	 * it against the VM's OWN parsed config before re-deriving policy; the
+	 * VM cannot select another VM's share (peerid is VMM-authenticated).
+	 */
+	uint32_t		 vdl_share_idx;
+	/*
+	 * M3b remediation: TRUSTED policy, re-derived by PROC_PARENT from the
+	 * parsed vmd.conf (NEVER from the _vmd VM process); carried only on the
+	 * PROC_PARENT -> PROC_VIOFS hop and applied by the launched viofs so a
+	 * compromised VM process cannot redirect path/credential/owner.
+	 */
+	char			 vdl_path[PATH_MAX];
+	uint32_t		 vdl_credmode;
+	uint32_t		 vdl_flags;
+	uid_t			 vdl_maproot;
+	uid_t			 vdl_owner_uid;
+	gid_t			 vdl_owner_gid;
 };
 
 enum vm_disk_fmt {
@@ -458,6 +518,22 @@ struct vmd {
 	int			 vmd_fd6;
 	int			 vmd_ptmfd;
 	int			 vmd_psp_fd;
+
+	/*
+	 * M3b remediation: when a transparent viofs device is re-exec'd by the
+	 * root PROC_VIOFS launcher, the launcher passes the TRUSTED share policy
+	 * (re-derived by PROC_PARENT from vmd.conf) via argv (-R/-K).  The device
+	 * process parses it here and OVERRIDES the _vmd-supplied copies, so a
+	 * compromised VM process can never redirect path/credential/owner.
+	 * Meaningful only in a re-exec'd viofs device process.
+	 */
+	int			 vmd_dev_launched;	/* -R given */
+	char			 vmd_dev_path[PATH_MAX];
+	unsigned int		 vmd_dev_credmode;
+	unsigned int		 vmd_dev_flags;
+	uid_t			 vmd_dev_maproot;
+	uid_t			 vmd_dev_owner_uid;
+	gid_t			 vmd_dev_owner_gid;
 };
 
 struct vm_dev_pipe {
@@ -545,6 +621,7 @@ void	 vmop_ifreq_read(struct imsg *, struct vmop_ifreq *);
 void	 vmop_addr_req_read(struct imsg *, struct vmop_addr_req *);
 void	 vmop_addr_result_read(struct imsg *, struct vmop_addr_result *);
 void	 vmop_owner_read(struct imsg *, struct vmop_owner *);
+void	 vmop_dev_launch_read(struct imsg *, struct vmop_dev_launch *);
 void	 vmop_create_params_read(struct imsg *, struct vmop_create_params *);
 void	 vmop_config_read(struct imsg *, struct vmd_config *);
 

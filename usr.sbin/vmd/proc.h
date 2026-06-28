@@ -73,6 +73,7 @@ enum privsep_procid {
 	PROC_AGENTX,
 	PROC_VMM,
 	PROC_PRIV,
+	PROC_VIOFS,
 	PROC_MAX,
 };
 extern enum privsep_procid privsep_process;

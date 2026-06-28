@@ -187,10 +187,12 @@ vio9p_getattr(void *v)
 	struct vattr *vap = ap->a_vap;
 	struct vio9p_node *np = VTON(vp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
+	struct ucred *cred = ap->a_cred;
 	struct p9_attr a;
 	int error;
 
-	error = p9c_getattr(vmp->vm_sc, np->n_fid, &a);
+	error = p9c_getattr(vmp->vm_sc, np->n_fid, cred->cr_uid, cred->cr_gid,
+	    &a);
 	if (error)
 		return (error);
 
@@ -390,7 +392,8 @@ vio9p_lookup(void *v)
 	if (cfid == VIO9P_NOFID)
 		return (EMFILE);
 
-	error = p9c_walk(sc, dnp->n_fid, cfid, name, &q, &nwq);
+	error = p9c_walk(sc, dnp->n_fid, cfid, name, cred->cr_uid,
+	    cred->cr_gid, &q, &nwq);
 	if (error == 0 && nwq < 1)
 		error = ENOENT;			/* short walk: server bound nothing */
 	if (error) {
@@ -467,11 +470,13 @@ vio9p_lookup(void *v)
 /*
  * vop_open: lazily Tlopen the vnode's owned fid.  The server flips f->opened in
  * place on the FIRST Tlopen (viofs.c -- no second fid), so a vnode owns at most
- * one fid for its whole life and we cannot widen the access of an already-open
- * fid.  Therefore the first open requests the WIDEST access this vnode may need:
- * on a RW mount a regular file opens RDWR (so a later FWRITE needs no re-open);
- * directories, symlinks, and everything on a RO mount open RDONLY.  A write open
- * on a RO mount is refused before any RPC.  Idempotent: a second open is a no-op.
+ * one fid for its whole life.  We open with LEAST privilege -- the access the
+ * caller actually requested -- not the widest: under transparent credentials a
+ * gratuitous RDWR open would fail (EACCES) on a file the caller may read but not
+ * write (e.g. a world-readable 0644 file owned by someone else).  A later first
+ * write lazily reopens the fid RDWR (vio9p_write), which the host p9_lopen
+ * honors via openat(parentfd, name, ...).  A write open on a RO mount is refused
+ * before any RPC.  Idempotent: a second open is a no-op.
  */
 int
 vio9p_open(void *v)
@@ -480,6 +485,7 @@ vio9p_open(void *v)
 	struct vnode *vp = ap->a_vp;
 	struct vio9p_node *np = VTON(vp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
+	struct ucred *cred = ap->a_cred;
 	uint32_t iounit, oflags;
 	int error;
 
@@ -490,16 +496,28 @@ vio9p_open(void *v)
 	if (np->n_fid_opened)
 		return (0);
 
-	if (vmp->vm_rw && vp->v_type == VREG)
+	/*
+	 * Open with the ACCESS ACTUALLY REQUESTED, not "widest" -- a read-only
+	 * open of a regular file uses L_O_RDONLY even on a RW mount.  Opening it
+	 * RDWR would, under TRANSPARENT credentials, fail for any file the caller
+	 * cannot write (e.g. a world-readable 0644 file owned by someone else):
+	 * the host reopen would request O_RDWR as the caller's euid and get
+	 * EACCES.  A later first write lazily reopens the fid RDWR (vio9p_write),
+	 * which the host p9_lopen honors via openat(parentfd, name, ...).
+	 */
+	if (vmp->vm_rw && vp->v_type == VREG && (ap->a_mode & FWRITE))
 		oflags = L_O_RDWR;
 	else
 		oflags = L_O_RDONLY;
 
-	error = p9c_lopen(vmp->vm_sc, np->n_fid, oflags, &iounit);
+	error = p9c_lopen(vmp->vm_sc, np->n_fid, oflags, cred->cr_uid,
+	    cred->cr_gid, &iounit);
 	if (error)
 		return (error);
 
 	np->n_fid_opened = 1;
+	if (oflags == L_O_RDWR)
+		np->n_fid_write = 1;
 	if (vp->v_type == VDIR)
 		np->n_dir_off = 0;
 
@@ -530,6 +548,7 @@ vio9p_read(void *v)
 	struct vio9p_node *np = VTON(vp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
 	struct vio9p_softc *sc = vmp->vm_sc;
+	struct ucred *cred = ap->a_cred;
 	uint8_t *buf;
 	uint32_t want, got;
 	int error = 0;
@@ -545,7 +564,8 @@ vio9p_read(void *v)
 
 	/* Lazily open the fid for reading. */
 	if (!np->n_fid_opened) {
-		error = p9c_lopen(sc, np->n_fid, L_O_RDONLY, &got);
+		error = p9c_lopen(sc, np->n_fid, L_O_RDONLY, cred->cr_uid,
+		    cred->cr_gid, &got);
 		if (error)
 			return (error);
 		np->n_fid_opened = 1;
@@ -557,7 +577,7 @@ vio9p_read(void *v)
 		want = (uint32_t)ulmin((size_t)uio->uio_resid, vmp->vm_iomax);
 
 		error = p9c_read(sc, np->n_fid, (uint64_t)uio->uio_offset,
-		    buf, want, &got);
+		    buf, want, cred->cr_uid, cred->cr_gid, &got);
 		if (error)
 			break;
 		if (got == 0)			/* EOF */
@@ -594,6 +614,7 @@ vio9p_write(void *v)
 	struct vio9p_node *np = VTON(vp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
 	struct vio9p_softc *sc = vmp->vm_sc;
+	struct ucred *cred = ap->a_cred;
 	int ioflag = ap->a_ioflag;
 	uint8_t *buf;
 	uint32_t want, put;
@@ -615,12 +636,20 @@ vio9p_write(void *v)
 	if (uio->uio_offset < 0)
 		return (EINVAL);
 
-	/* Lazily open the fid for writing (RDWR so reads on it still work). */
-	if (!np->n_fid_opened) {
-		error = p9c_lopen(sc, np->n_fid, L_O_RDWR, &put);
+	/*
+	 * Ensure the fid is open RDWR.  If never opened, or opened RDONLY (the
+	 * common read-then-write case now that vio9p_open opens least-privilege),
+	 * issue an L_O_RDWR Tlopen -- the host p9_lopen REOPENS the held fd RDWR
+	 * via openat(parentfd, name) (as the caller's euid in transparent mode),
+	 * so a write to a file the caller cannot write correctly fails here.
+	 */
+	if (!np->n_fid_opened || !np->n_fid_write) {
+		error = p9c_lopen(sc, np->n_fid, L_O_RDWR, cred->cr_uid,
+		    cred->cr_gid, &put);
 		if (error)
 			return (error);
 		np->n_fid_opened = 1;
+		np->n_fid_write = 1;
 	}
 
 	buf = malloc(vmp->vm_womax, M_MISCFSMNT, M_WAITOK);
@@ -647,7 +676,7 @@ vio9p_write(void *v)
 			break;
 
 		error = p9c_write(sc, np->n_fid, (uint64_t)off,
-		    buf, want, &put);
+		    buf, want, cred->cr_uid, cred->cr_gid, &put);
 		if (error)
 			break;
 		if (put == 0) {		/* server accepted nothing: avoid spin */
@@ -713,6 +742,7 @@ vio9p_create(void *v)
 	struct vio9p_node *dnp = VTON(dvp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
 	struct vio9p_softc *sc = vmp->vm_sc;
+	struct ucred *cred = cnp->cn_cred;
 	struct vnode *tdp;
 	struct p9_qid q;
 	char name[NAME_MAX + 1];
@@ -750,7 +780,8 @@ vio9p_create(void *v)
 		VOP_ABORTOP(dvp, cnp);
 		return (EMFILE);
 	}
-	error = p9c_walk(sc, dnp->n_fid, cfid, NULL, &q, &nwq);
+	error = p9c_walk(sc, dnp->n_fid, cfid, NULL, cred->cr_uid,
+	    cred->cr_gid, &q, &nwq);
 	if (error) {
 		vio9p_fid_free(vmp, cfid);	/* clone never bound */
 		VOP_ABORTOP(dvp, cnp);
@@ -772,13 +803,13 @@ vio9p_create(void *v)
 	 */
 	error = p9c_lcreate(sc, cfid, name,
 	    L_O_RDWR | L_O_CREAT | L_O_EXCL, mode, vmp->vm_owner_gid,
-	    &q, &iounit);
+	    cred->cr_uid, cred->cr_gid, &q, &iounit);
 	if (error) {
 		/*
 		 * FIX D4: the host left the cloned DIR fid bound on the error
 		 * path, so clunk it before returning the slot to the pool.
 		 */
-		p9c_clunk(sc, cfid);
+		p9c_clunk(sc, cfid, cred->cr_uid, cred->cr_gid);
 		vio9p_fid_free(vmp, cfid);
 		VOP_ABORTOP(dvp, cnp);
 		return (error);
@@ -791,8 +822,9 @@ vio9p_create(void *v)
 		return (error);
 	}
 
-	/* The fid is already opened (Tlcreate opened it) -> mark it. */
+	/* The fid is already opened RDWR (Tlcreate opened it) -> mark it. */
 	VTON(tdp)->n_fid_opened = 1;
+	VTON(tdp)->n_fid_write = 1;
 	VTON(tdp)->n_parentpath = dnp->n_qidpath;
 	VTON(tdp)->n_size = 0;
 
@@ -818,6 +850,7 @@ vio9p_mkdir(void *v)
 	struct vio9p_node *dnp = VTON(dvp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
 	struct vio9p_softc *sc = vmp->vm_sc;
+	struct ucred *cred = cnp->cn_cred;
 	struct vnode *tdp;
 	struct p9_qid q, wq;
 	char name[NAME_MAX + 1];
@@ -838,7 +871,8 @@ vio9p_mkdir(void *v)
 	name[cnp->cn_namelen] = '\0';
 	mode = MAKEIMODE(vap->va_type, vap->va_mode) & 0777;
 
-	error = p9c_mkdir(sc, dnp->n_fid, name, mode, vmp->vm_owner_gid, &q);
+	error = p9c_mkdir(sc, dnp->n_fid, name, mode, vmp->vm_owner_gid,
+	    cred->cr_uid, cred->cr_gid, &q);
 	if (error)
 		goto bad;
 
@@ -848,7 +882,8 @@ vio9p_mkdir(void *v)
 		error = EMFILE;
 		goto bad;
 	}
-	error = p9c_walk(sc, dnp->n_fid, cfid, name, &wq, &nwq);
+	error = p9c_walk(sc, dnp->n_fid, cfid, name, cred->cr_uid,
+	    cred->cr_gid, &wq, &nwq);
 	if (error == 0 && nwq < 1)
 		error = ENOENT;
 	if (error) {
@@ -885,6 +920,7 @@ vio9p_remove(void *v)
 	struct componentname *cnp = ap->a_cnp;
 	struct vio9p_node *dnp = VTON(dvp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
+	struct ucred *cred = cnp->cn_cred;
 	char name[NAME_MAX + 1];
 	int error;
 
@@ -899,7 +935,8 @@ vio9p_remove(void *v)
 	memcpy(name, cnp->cn_nameptr, cnp->cn_namelen);
 	name[cnp->cn_namelen] = '\0';
 
-	error = p9c_unlinkat(vmp->vm_sc, dnp->n_fid, name, 0);
+	error = p9c_unlinkat(vmp->vm_sc, dnp->n_fid, name, 0, cred->cr_uid,
+	    cred->cr_gid);
 	if (error == 0) {
 		VN_KNOTE(vp, NOTE_DELETE);
 		VN_KNOTE(dvp, NOTE_WRITE);
@@ -934,6 +971,7 @@ vio9p_rmdir(void *v)
 	struct componentname *cnp = ap->a_cnp;
 	struct vio9p_node *dnp = VTON(dvp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
+	struct ucred *cred = cnp->cn_cred;
 	char name[NAME_MAX + 1];
 	int error;
 
@@ -954,7 +992,8 @@ vio9p_rmdir(void *v)
 	memcpy(name, cnp->cn_nameptr, cnp->cn_namelen);
 	name[cnp->cn_namelen] = '\0';
 
-	error = p9c_unlinkat(vmp->vm_sc, dnp->n_fid, name, P9_AT_REMOVEDIR);
+	error = p9c_unlinkat(vmp->vm_sc, dnp->n_fid, name, P9_AT_REMOVEDIR,
+	    cred->cr_uid, cred->cr_gid);
 	if (error == 0) {
 		VN_KNOTE(dvp, NOTE_WRITE | NOTE_LINK);
 		VN_KNOTE(vp, NOTE_DELETE);
@@ -981,6 +1020,7 @@ vio9p_setattr(void *v)
 	struct vattr *vap = ap->a_vap;
 	struct vio9p_node *np = VTON(vp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
+	struct ucred *cred = ap->a_cred;
 	uint32_t valid = 0, mode = 0;
 	uint64_t size = 0;
 	int64_t at_s = 0, at_ns = 0, mt_s = 0, mt_ns = 0;
@@ -1028,7 +1068,7 @@ vio9p_setattr(void *v)
 		return (0);		/* nothing to do */
 
 	error = p9c_setattr(vmp->vm_sc, np->n_fid, valid, mode, 0, 0, size,
-	    at_s, at_ns, mt_s, mt_ns);
+	    at_s, at_ns, mt_s, mt_ns, cred->cr_uid, cred->cr_gid);
 	if (error)
 		return (error);
 
@@ -1064,6 +1104,7 @@ vio9p_rename(void *v)
 	struct vio9p_mnt *vmp = VFSTOVIO9P(fdvp->v_mount);
 	struct vio9p_node *fdnp = VTON(fdvp);
 	struct vio9p_node *tdnp = VTON(tdvp);
+	struct ucred *cred = fcnp->cn_cred;
 	char fromname[NAME_MAX + 1];
 	char toname[NAME_MAX + 1];
 	int error = 0;
@@ -1126,7 +1167,7 @@ abortit:
 	 * fds).  This works for every fid type, unlike legacy Trename.
 	 */
 	error = p9c_renameat(vmp->vm_sc, fdnp->n_fid, fromname, tdnp->n_fid,
-	    toname);
+	    toname, cred->cr_uid, cred->cr_gid);
 
 	if (error == 0) {
 		VN_KNOTE(fvp, NOTE_RENAME);
@@ -1175,6 +1216,7 @@ vio9p_symlink(void *v)
 	struct vio9p_node *dnp = VTON(dvp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
 	struct vio9p_softc *sc = vmp->vm_sc;
+	struct ucred *cred = cnp->cn_cred;
 	struct vnode *tdp;
 	struct p9_qid q, wq;
 	char name[NAME_MAX + 1];
@@ -1195,7 +1237,7 @@ vio9p_symlink(void *v)
 	name[cnp->cn_namelen] = '\0';
 
 	error = p9c_symlink(sc, dnp->n_fid, name, target, vmp->vm_owner_gid,
-	    &q);
+	    cred->cr_uid, cred->cr_gid, &q);
 	if (error)
 		goto bad;
 
@@ -1204,7 +1246,8 @@ vio9p_symlink(void *v)
 		error = EMFILE;
 		goto bad;
 	}
-	error = p9c_walk(sc, dnp->n_fid, cfid, name, &wq, &nwq);
+	error = p9c_walk(sc, dnp->n_fid, cfid, name, cred->cr_uid,
+	    cred->cr_gid, &wq, &nwq);
 	if (error == 0 && nwq < 1)
 		error = ENOENT;
 	if (error) {
@@ -1250,6 +1293,7 @@ vio9p_link(void *v)
 	struct componentname *cnp = ap->a_cnp;
 	struct vio9p_node *dnp = VTON(dvp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(dvp->v_mount);
+	struct ucred *cred = cnp->cn_cred;
 	char name[NAME_MAX + 1];
 	int error = 0;
 
@@ -1275,7 +1319,8 @@ vio9p_link(void *v)
 	memcpy(name, cnp->cn_nameptr, cnp->cn_namelen);
 	name[cnp->cn_namelen] = '\0';
 
-	error = p9c_link(vmp->vm_sc, dnp->n_fid, VTON(vp)->n_fid, name);
+	error = p9c_link(vmp->vm_sc, dnp->n_fid, VTON(vp)->n_fid, name,
+	    cred->cr_uid, cred->cr_gid);
 	if (error == 0) {
 		VN_KNOTE(vp, NOTE_LINK);
 		VN_KNOTE(dvp, NOTE_WRITE);
@@ -1312,6 +1357,7 @@ vio9p_readdir(void *v)
 	struct vio9p_node *np = VTON(vp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
 	struct vio9p_softc *sc = vmp->vm_sc;
+	struct ucred *cred = ap->a_cred;
 	struct dirent dent;
 	uint8_t *raw;
 	uint64_t cookie;
@@ -1329,7 +1375,8 @@ vio9p_readdir(void *v)
 
 	/* Lazily open the dir fid (idempotent for the vnode's lifetime). */
 	if (!np->n_fid_opened) {
-		error = p9c_lopen(sc, np->n_fid, L_O_RDONLY, &junk);
+		error = p9c_lopen(sc, np->n_fid, L_O_RDONLY, cred->cr_uid,
+		    cred->cr_gid, &junk);
 		if (error)
 			return (error);
 		np->n_fid_opened = 1;
@@ -1341,7 +1388,7 @@ vio9p_readdir(void *v)
 
 	while (uio->uio_resid > 0) {
 		error = p9c_readdir(sc, np->n_fid, cookie, raw, vmp->vm_iomax,
-		    &got);
+		    cred->cr_uid, cred->cr_gid, &got);
 		if (error)
 			break;
 		if (got == 0) {			/* server EOF */
@@ -1437,6 +1484,7 @@ vio9p_readlink(void *v)
 	struct uio *uio = ap->a_uio;
 	struct vio9p_node *np = VTON(vp);
 	struct vio9p_mnt *vmp = VFSTOVIO9P(vp->v_mount);
+	struct ucred *cred = ap->a_cred;
 	char target[PATH_MAX];
 	size_t len = 0;
 	int error;
@@ -1448,8 +1496,8 @@ vio9p_readlink(void *v)
 	if (uio->uio_offset < 0)
 		return (EINVAL);
 
-	error = p9c_readlink(vmp->vm_sc, np->n_fid, target, sizeof(target),
-	    &len);
+	error = p9c_readlink(vmp->vm_sc, np->n_fid, cred->cr_uid, cred->cr_gid,
+	    target, sizeof(target), &len);
 	if (error)
 		return (error);
 
@@ -1490,7 +1538,9 @@ vio9p_reclaim(void *v)
 	struct vio9p_mnt *vmp = np->n_mnt;
 
 	if (np->n_fid != VIO9P_NOFID && !(vp->v_flag & VROOT)) {
-		p9c_clunk(vmp->vm_sc, np->n_fid);
+		/* Cred-less clunk -> the mount-owner sentinel identity (M3b). */
+		p9c_clunk(vmp->vm_sc, np->n_fid, vmp->vm_owner_uid,
+		    vmp->vm_owner_gid);
 		vio9p_fid_free(np->n_mnt, np->n_fid);
 		np->n_fid = VIO9P_NOFID;
 	}

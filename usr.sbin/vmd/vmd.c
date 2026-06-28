@@ -23,6 +23,7 @@
 #include <sys/tty.h>
 #include <sys/ttycom.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,7 @@ int	 vmd_dispatch_control(int, struct privsep_proc *, struct imsg *);
 int	 vmd_dispatch_vmm(int, struct privsep_proc *, struct imsg *);
 int	 vmd_dispatch_agentx(int, struct privsep_proc *, struct imsg *);
 int	 vmd_dispatch_priv(int, struct privsep_proc *, struct imsg *);
+int	 vmd_dispatch_viofs(int, struct privsep_proc *, struct imsg *);
 
 int	 vm_instance(struct privsep *, struct vmd_vm **,
 	    struct vmop_create_params *, uid_t);
@@ -61,6 +63,27 @@ int	 vm_claimid(const char *, int, uint32_t *);
 void	 start_vm_batch(int, short, void*);
 
 static inline void vm_terminate(struct vmd_vm *, const char *);
+
+/*
+ * M3b: the dedicated root launcher PROC_VIOFS.  PROC_PARENT no longer
+ * fork+execs devices: it authenticates the vmid and re-derives the TRUSTED
+ * share policy from config, then relays the launch to PROC_VIOFS, the ONLY
+ * process that fork+execs the transparent (root) viofs.  parent_launch_viofs()
+ * and the pending/track/reap/sighdlr helpers below run in PROC_VIOFS.
+ */
+void		 viofs_proc(struct privsep *, struct privsep_proc *);
+void		 viofs_run(struct privsep *, struct privsep_proc *, void *);
+void		 viofs_shutdown(void);
+int		 viofs_dispatch_parent(int, struct privsep_proc *,
+		    struct imsg *);
+static pid_t	 parent_launch_viofs(struct vmop_dev_launch *, int, int,
+		    int *);
+static int	 parent_dev_track(uint32_t, pid_t);
+static void	 parent_dev_untrack_pid(pid_t);
+static void	 parent_dev_reap_vmid(uint32_t);
+static struct dev_launch_pending *
+		 dev_launch_find(uint32_t);
+static void	 parent_sighdlr(int, short, void *);
 
 struct vmd	*env;
 
@@ -71,7 +94,14 @@ static struct privsep_proc procs[] = {
 	{ "vmm",	PROC_VMM,	vmd_dispatch_vmm, vmm,
 	  vmm_shutdown, "/" },
 	{ "agentx", 	PROC_AGENTX,	vmd_dispatch_agentx, vm_agentx,
-	  vm_agentx_shutdown, "/" }
+	  vm_agentx_shutdown, "/" },
+	{ "viofs",	PROC_VIOFS,	vmd_dispatch_viofs, viofs_proc,
+	  viofs_shutdown, "/" }
+};
+
+/* PROC_VIOFS talks only to PROC_PARENT (which relays to/from PROC_VMM). */
+static struct privsep_proc viofs_peers[] = {
+	{ "parent",	PROC_PARENT,	viofs_dispatch_parent }
 };
 
 enum privsep_procid privsep_process;
@@ -81,7 +111,45 @@ struct event staggered_start_timer;
 /* For the privileged process */
 static struct privsep_proc *proc_priv = &procs[0];
 static struct passwd proc_privpw;
+/* M3b: the viofs launcher stays root (all-zero pw), chroot "/" (procs[]). */
+static struct privsep_proc *proc_viofs = &procs[4];
+static struct passwd proc_viofspw;
 static const uint8_t zero_mac[ETHER_ADDR_LEN];
+
+/*
+ * M3b Phase B PROC_PARENT bookkeeping.
+ *
+ * A transparent-viofs launch arrives as TWO consecutive single-fd imsgs
+ * (REQUEST carries sync_fds[1] + the vmop_dev_launch payload, FD_ASYNC carries
+ * async_fds[1]).  PARENT must hold the first fd until the second arrives.  The
+ * pending list, keyed by vmid (imsg peerid), bridges that gap; VMs can start
+ * concurrently so a list (not a single slot) is required.
+ */
+struct dev_launch_pending {
+	uint32_t			 vmid;
+	struct vmop_dev_launch		 vdl;
+	int				 sync_fd;
+	int				 async_fd;
+	SLIST_ENTRY(dev_launch_pending)	 entry;
+};
+static SLIST_HEAD(, dev_launch_pending) dev_launch_pending =
+    SLIST_HEAD_INITIALIZER(dev_launch_pending);
+
+/* M3b: bound concurrent transparent-viofs launches in flight (anti-DoS, H2). */
+#define DEV_LAUNCH_PENDING_MAX	64
+
+/*
+ * Once launched, the device pid is tracked here so the PARENT SIGCHLD reaper
+ * can recognise (and only reap) its own viofs children -- never the four
+ * long-lived privsep children, which proc_kill() reaps at daemon teardown.
+ */
+struct dev_track {
+	uint32_t		 vmid;
+	pid_t			 pid;
+	SLIST_ENTRY(dev_track)	 entry;
+};
+static SLIST_HEAD(, dev_track) dev_track_list =
+    SLIST_HEAD_INITIALIZER(dev_track_list);
 
 const char		 default_conffile[] = VMD_CONF;
 const char		*conffile = default_conffile;
@@ -493,10 +561,578 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		    peer_id == IMSG_AGENTX_PEERID ? PROC_AGENTX : PROC_CONTROL,
 		    -1);
 		break;
+	case IMSG_VMDOP_DEV_LAUNCH_REQUEST: {
+		/*
+		 * M3b: PROC_PARENT is the trust authority for transparent-viofs
+		 * launches.  The peerid was stamped by PROC_VMM with the
+		 * AUTHENTICATED vmid; re-derive ALL security policy from THIS vm's
+		 * own parsed config (never from the _vmd-supplied payload), accept
+		 * only transparent shares (squash is fork+exec'd by the _vmd VM
+		 * process and never arrives here), then RELAY the request + the
+		 * sync fd to the dedicated root launcher PROC_VIOFS, which is the
+		 * only process that fork+execs the device.
+		 */
+		struct vmop_dev_launch	 vdl;
+		struct vmd_vm		*dvm;
+		unsigned int		 idx;
+		int			 reqfd;
+
+		reqfd = imsg_get_fd(imsg);
+		vmop_dev_launch_read(imsg, &vdl);
+		if (vdl.vdl_devtype != VMD_DEVTYPE_VIOFS) {
+			log_warnx("%s: refusing dev launch type '%c'", __func__,
+			    vdl.vdl_devtype);
+			goto dev_launch_reject;
+		}
+		if ((dvm = vm_getbyvmid(peer_id)) == NULL) {
+			log_warnx("%s: dev launch for unknown vmid %u",
+			    __func__, peer_id);
+			goto dev_launch_reject;
+		}
+		idx = vdl.vdl_share_idx;
+		if (idx >= dvm->vm_params.vmc_nshares) {
+			log_warnx("%s: vm %u dev launch bad share idx %u",
+			    __func__, peer_id, idx);
+			goto dev_launch_reject;
+		}
+		if (dvm->vm_params.vmc_share_credmode[idx] !=
+		    VMSHARE_CRED_TRANSPARENT) {
+			log_warnx("%s: vm %u share %u is not transparent",
+			    __func__, peer_id, idx);
+			goto dev_launch_reject;
+		}
+		/* Overwrite every security field with the TRUSTED config value. */
+		vdl.vdl_vmid = peer_id;
+		vdl.vdl_share_idx = idx;
+		vdl.vdl_credmode = VMSHARE_CRED_TRANSPARENT;
+		vdl.vdl_flags = dvm->vm_params.vmc_share_flags[idx];
+		vdl.vdl_maproot = dvm->vm_params.vmc_share_maproot[idx];
+		vdl.vdl_owner_uid = dvm->vm_params.vmc_owner.uid;
+		vdl.vdl_owner_gid = dvm->vm_params.vmc_owner.gid;
+		if (strlcpy(vdl.vdl_path, dvm->vm_params.vmc_shares[idx],
+		    sizeof(vdl.vdl_path)) >= sizeof(vdl.vdl_path)) {
+			log_warnx("%s: vm %u share %u path too long",
+			    __func__, peer_id, idx);
+			goto dev_launch_reject;
+		}
+		if (proc_compose_imsg(ps, PROC_VIOFS,
+		    IMSG_VMDOP_DEV_LAUNCH_REQUEST, peer_id, reqfd, &vdl,
+		    sizeof(vdl)) == -1) {
+			log_warn("%s: relay dev launch request", __func__);
+			goto dev_launch_reject;
+		}
+		break;
+ dev_launch_reject:
+		close_fd(reqfd);
+		/* Fail the waiting VM fast instead of letting it time out. */
+		vdl.vdl_status = EPERM;
+		(void)proc_compose_imsg(ps, PROC_VMM,
+		    IMSG_VMDOP_DEV_LAUNCH_RESPONSE, peer_id, -1, &vdl,
+		    sizeof(vdl));
+		break;
+	}
+	case IMSG_VMDOP_DEV_LAUNCH_FD_ASYNC: {
+		/* Relay the async fd to PROC_VIOFS; it correlates by vmid. */
+		struct vmop_dev_launch	vdl;
+		int			afd;
+
+		afd = imsg_get_fd(imsg);
+		vmop_dev_launch_read(imsg, &vdl);
+		if (proc_compose_imsg(ps, PROC_VIOFS,
+		    IMSG_VMDOP_DEV_LAUNCH_FD_ASYNC, peer_id, afd, &vdl,
+		    sizeof(vdl)) == -1) {
+			log_warn("%s: relay dev launch async fd", __func__);
+			close_fd(afd);
+		}
+		break;
+	}
+	case IMSG_VMDOP_DEV_REAP_REQUEST: {
+		/* Relay VM-death to PROC_VIOFS so it reaps that vm's device. */
+		struct vmop_dev_launch	vdl;
+
+		vmop_dev_launch_read(imsg, &vdl);
+		(void)proc_compose_imsg(ps, PROC_VIOFS,
+		    IMSG_VMDOP_DEV_REAP_REQUEST, peer_id, -1, &vdl,
+		    sizeof(vdl));
+		break;
+	}
 	default:
 		return (-1);
 	}
 
+	return (0);
+}
+
+/*
+ * M3b Phase B: find the pending launch for a vmid (the REQUEST half stashed it;
+ * the FD_ASYNC half completes it).  Keyed by vmid == imsg peerid.
+ */
+static struct dev_launch_pending *
+dev_launch_find(uint32_t vmid)
+{
+	struct dev_launch_pending	*pend;
+
+	SLIST_FOREACH(pend, &dev_launch_pending, entry)
+		if (pend->vmid == vmid)
+			return (pend);
+	return (NULL);
+}
+
+/*
+ * M3b Phase B: record a PARENT-launched device pid so the SIGCHLD reaper only
+ * ever reaps its own viofs children (never the long-lived privsep children).
+ */
+static int
+parent_dev_track(uint32_t vmid, pid_t pid)
+{
+	struct dev_track	*dt;
+
+	if ((dt = calloc(1, sizeof(*dt))) == NULL)
+		return (-1);
+	dt->vmid = vmid;
+	dt->pid = pid;
+	SLIST_INSERT_HEAD(&dev_track_list, dt, entry);
+	return (0);
+}
+
+/* Drop a tracked device pid from the table (after it has been reaped). */
+static void
+parent_dev_untrack_pid(pid_t pid)
+{
+	struct dev_track	*dt;
+
+	SLIST_FOREACH(dt, &dev_track_list, entry) {
+		if (dt->pid == pid) {
+			SLIST_REMOVE(&dev_track_list, dt, dev_track, entry);
+			free(dt);
+			return;
+		}
+	}
+}
+
+/*
+ * M3b Phase B: a VM died.  Reap that vm's tracked device pid if the SIGCHLD
+ * reaper has not already collected it.  waitpid() on an already-reaped pid
+ * returns ECHILD, which we ignore (double-reap is benign; the track table is
+ * the single source of truth).  We deliberately do NOT kill() here: when the
+ * VM process exits, the device's sync/async channels see EOF and the device
+ * exits on its own; we only mop up the zombie.
+ */
+static void
+parent_dev_reap_vmid(uint32_t vmid)
+{
+	struct dev_track		*dt, *tmp;
+	struct dev_launch_pending	*pend, *ptmp;
+	int				 status;
+
+	/*
+	 * Purge any half-finished launch for this vmid: a VM that sent the
+	 * REQUEST but died before the FD_ASYNC leaves a pending entry holding
+	 * the sync fd, which would otherwise leak for the life of the daemon.
+	 */
+	SLIST_FOREACH_SAFE(pend, &dev_launch_pending, entry, ptmp) {
+		if (pend->vmid != vmid)
+			continue;
+		close_fd(pend->sync_fd);
+		close_fd(pend->async_fd);
+		SLIST_REMOVE(&dev_launch_pending, pend, dev_launch_pending,
+		    entry);
+		free(pend);
+	}
+
+	SLIST_FOREACH_SAFE(dt, &dev_track_list, entry, tmp) {
+		if (dt->vmid != vmid)
+			continue;
+		if (waitpid(dt->pid, &status, WNOHANG) == 0) {
+			/*
+			 * Still alive: the channels' EOF will make it exit
+			 * shortly; the SIGCHLD reaper collects it then.  Leave
+			 * the entry; do not block here.
+			 */
+			log_debug("%s: dev pid %d (vm %u) not yet exited",
+			    __func__, dt->pid, vmid);
+			continue;
+		}
+		/* Reaped now, or already gone (ECHILD); drop the entry. */
+		SLIST_REMOVE(&dev_track_list, dt, dev_track, entry);
+		free(dt);
+	}
+}
+
+/*
+ * M3b Phase B PROC_PARENT runtime SIGCHLD reaper.
+ *
+ * PROC_PARENT historically ignores SIGCHLD at runtime (proc_sig_handler in
+ * proc.c reaps only at full-daemon teardown via proc_kill).  Now that PARENT
+ * fork+execs transparent viofs devices, those children must be reaped promptly
+ * (including a crash while the VM is still alive) to avoid zombies.  This
+ * handler reaps with WNOHANG and removes ONLY tracked device pids; any pid not
+ * in the track table is one of the four long-lived privsep children -- it is
+ * left for proc_kill()'s blocking waitpid(WAIT_ANY) at teardown, exactly as
+ * before, so this reaper never disturbs the privsep lifecycle.
+ */
+static void
+parent_sighdlr(int sig, short event, void *arg)
+{
+	pid_t	 pid;
+	int	 status, save_errno;
+
+	/* Runs in PROC_VIOFS: reaps the transparent viofs devices it forks. */
+	if (privsep_process != PROC_VIOFS)
+		return;
+	if (sig != SIGCHLD)
+		return;
+
+	save_errno = errno;
+	for (;;) {
+		pid = waitpid(WAIT_ANY, &status, WNOHANG);
+		if (pid <= 0)
+			break;
+		/*
+		 * Only our viofs device pids are in the track table.  If the
+		 * reaped pid is not tracked, it is a long-lived privsep child;
+		 * proc_kill() owns its reaping at teardown, so swallow it here
+		 * (it has already been collected, no-op for the table) without
+		 * disturbing that lifecycle.
+		 */
+		if (WIFEXITED(status) || WIFSIGNALED(status))
+			parent_dev_untrack_pid(pid);
+	}
+	errno = save_errno;
+}
+
+/*
+ * M3b Phase B: fork+exec the transparent viofs device as root from
+ * PROC_PARENT.  PARENT never dropped privileges, so the child inherits uid 0,
+ * which transparent credmode needs for its per-op seteuid()/setegid().
+ *
+ * sync_fd/async_fd are the device-end socketpair fds PARENT received over imsg
+ * (the VM kept the [0] ends and drives the runtime data path; PARENT never
+ * touches that traffic).  They are dup2()'d to the EXACT fd numbers the VM
+ * serialized into dev_copy/vm_copy (vdl_sync_fd_no/vdl_async_fd_no) so the
+ * re-exec'd viofs reads valid integers out of those structs.  /dev/vmm comes
+ * from PARENT's own env->vmd_fd (opened O_CLOEXEC at startup) dup2()'d to a
+ * fresh number and passed via -i; the device needs it only transiently for
+ * VMM_IOC_SHAREMEM (the kernel vmid arrives inside vm_copy over the VM-owned
+ * sync channel, so PARENT's fd is the same kernel node and is correct).
+ *
+ * On success returns the child pid and *status = 0; on fork failure returns
+ * -1 and *status = errno.  The caller closes its sync/async fd copies on BOTH
+ * paths so a failed launch never leaks.
+ */
+static pid_t
+parent_launch_viofs(struct vmop_dev_launch *vdl, int sync_fd, int async_fd,
+    int *status)
+{
+	char	*nargv[16], num[32], vmm_fd[32], vm_name[VM_NAME_MAX], t[2];
+	char	 kbuf[80];
+	pid_t	 pid;
+	int	 vmmfd_no, vmm_src, i;
+
+	/* Defense in depth: only transparent viofs is ever PARENT-launched. */
+	if (vdl->vdl_devtype != VMD_DEVTYPE_VIOFS) {
+		log_warnx("%s: refusing non-viofs dev type '%c'", __func__,
+		    vdl->vdl_devtype);
+		*status = EINVAL;
+		return (-1);
+	}
+
+	/* Validate the VM-supplied dup2 target fd numbers before using them. */
+	if (vdl->vdl_sync_fd_no < 0 || vdl->vdl_sync_fd_no > 128 ||
+	    vdl->vdl_async_fd_no < 0 || vdl->vdl_async_fd_no > 128 ||
+	    vdl->vdl_sync_fd_no == vdl->vdl_async_fd_no ||
+	    vdl->vdl_sync_fd_no <= STDERR_FILENO ||
+	    vdl->vdl_async_fd_no <= STDERR_FILENO) {
+		log_warnx("%s: invalid dev fd numbers (sync %d async %d)",
+		    __func__, vdl->vdl_sync_fd_no, vdl->vdl_async_fd_no);
+		*status = EINVAL;
+		return (-1);
+	}
+
+	/*
+	 * Pick a /dev/vmm target number that does not collide with the two
+	 * device fd targets, std{in,out,err}, or PROC_PARENT_SOCK_FILENO.
+	 * 128 is the cap accepted by the re-exec getopt (-i strtonum 0..128).
+	 */
+	for (vmmfd_no = STDERR_FILENO + 1; vmmfd_no < 128; vmmfd_no++) {
+		if (vmmfd_no != vdl->vdl_sync_fd_no &&
+		    vmmfd_no != vdl->vdl_async_fd_no &&
+		    vmmfd_no != env->vmd_fd &&
+		    vmmfd_no != PROC_PARENT_SOCK_FILENO)
+			break;
+	}
+
+	pid = fork();
+	if (pid == -1) {
+		*status = errno;
+		log_warn("%s: fork", __func__);
+		return (-1);
+	}
+
+	if (pid == 0) {
+		/*
+		 * CHILD (still root).  Place the three inherited fds at the exact
+		 * numbers the consumer expects.  dup2(x,y) clears CLOEXEC on y so
+		 * it survives execvp; but dup2(x,x) is a no-op that does NOT clear
+		 * CLOEXEC, so for an fd already on its target clear CLOEXEC
+		 * explicitly (M3: the env->vmd_fd==vmmfd_no case previously
+		 * dropped /dev/vmm at exec -- vmmfd_no is now chosen clear of it).
+		 * Relocate /dev/vmm if it sits on a device target first, so no
+		 * dup2 clobbers a still-needed source.  Targets are validated
+		 * <= 128, so everything stays inside RLIMIT_NOFILE.
+		 */
+		vmm_src = env->vmd_fd;
+		if (vmm_src == vdl->vdl_sync_fd_no ||
+		    vmm_src == vdl->vdl_async_fd_no) {
+			vmm_src = dup(vmm_src);		/* dup() clears CLOEXEC */
+			if (vmm_src == -1)
+				_exit(errno);
+		}
+		if (sync_fd == vdl->vdl_sync_fd_no) {
+			if (fcntl(sync_fd, F_SETFD, 0) == -1)
+				_exit(errno);
+		} else if (dup2(sync_fd, vdl->vdl_sync_fd_no) == -1)
+			_exit(errno);
+		if (async_fd == vdl->vdl_async_fd_no) {
+			if (fcntl(async_fd, F_SETFD, 0) == -1)
+				_exit(errno);
+		} else if (dup2(async_fd, vdl->vdl_async_fd_no) == -1)
+			_exit(errno);
+		if (vmm_src == vmmfd_no) {
+			if (fcntl(vmm_src, F_SETFD, 0) == -1)
+				_exit(errno);
+		} else if (dup2(vmm_src, vmmfd_no) == -1)
+			_exit(errno);
+
+		memset(num, 0, sizeof(num));
+		snprintf(num, sizeof(num), "%d", vdl->vdl_sync_fd_no);
+		memset(vmm_fd, 0, sizeof(vmm_fd));
+		snprintf(vmm_fd, sizeof(vmm_fd), "%d", vmmfd_no);
+		memset(vm_name, 0, sizeof(vm_name));
+		snprintf(vm_name, sizeof(vm_name), "%s", vdl->vdl_vmname);
+		/*
+		 * TRUSTED policy (re-derived by PROC_PARENT from vmd.conf) passed
+		 * by argv so the device overrides the _vmd-supplied copies:
+		 * -R <path>  -K <credmode>:<flags>:<maproot>:<owner_uid>:<owner_gid>
+		 */
+		snprintf(kbuf, sizeof(kbuf), "%u:%u:%u:%u:%u",
+		    vdl->vdl_credmode, vdl->vdl_flags,
+		    (unsigned int)vdl->vdl_maproot,
+		    (unsigned int)vdl->vdl_owner_uid,
+		    (unsigned int)vdl->vdl_owner_gid);
+
+		t[0] = vdl->vdl_devtype;
+		t[1] = '\0';
+
+		/*
+		 * Identical argv shape to the VM-launched form (virtio.c);
+		 * only the launcher and the inherited uid differ.  Control
+		 * resumes in vmd.c main() -> viofs_main().  PARENT hard-codes
+		 * env->argv0 and the argv shape; the VM cannot inject argv.
+		 */
+		i = 0;
+		nargv[i++] = env->argv0;
+		nargv[i++] = "-X";
+		nargv[i++] = num;
+		nargv[i++] = "-t";
+		nargv[i++] = t;
+		nargv[i++] = "-i";
+		nargv[i++] = vmm_fd;
+		nargv[i++] = "-p";
+		nargv[i++] = vm_name;
+		nargv[i++] = "-R";
+		nargv[i++] = vdl->vdl_path;
+		nargv[i++] = "-K";
+		nargv[i++] = kbuf;
+		if (env->vmd_debug)
+			nargv[i++] = "-d";
+		if (env->vmd_verbose == 1)
+			nargv[i++] = "-v";
+		else if (env->vmd_verbose > 1)
+			nargv[i++] = "-vv";
+		nargv[i++] = NULL;
+		if (i > (int)(sizeof(nargv) / sizeof(nargv[0])))
+			fatalx("%s: nargv overflow", __func__);
+
+		execvp(env->argv0, nargv);
+
+		/* execvp failed; nothing left to do but exit. */
+		_exit(errno);
+		/* NOTREACHED */
+	}
+
+	/* PROC_VIOFS: track the pid for the SIGCHLD reaper / reap-request. */
+	if (parent_dev_track(vdl->vdl_vmid, pid) == -1)
+		log_warnx("%s: could not track dev pid %d (vm %u)", __func__,
+		    pid, vdl->vdl_vmid);
+
+	*status = 0;
+	return (pid);
+}
+
+/*
+ * PROC_PARENT side: the launcher reports a launch result; relay it down to the
+ * requesting VM via PROC_VMM (peerid = the authenticated vmid).
+ */
+int
+vmd_dispatch_viofs(int fd, struct privsep_proc *p, struct imsg *imsg)
+{
+	struct privsep		*ps = p->p_ps;
+	struct vmop_dev_launch	 vdl;
+	uint32_t		 peer_id, type;
+
+	peer_id = imsg_get_id(imsg);
+	type = imsg_get_type(imsg);
+
+	switch (type) {
+	case IMSG_VMDOP_DEV_LAUNCH_RESPONSE:
+		vmop_dev_launch_read(imsg, &vdl);
+		(void)proc_compose_imsg(ps, PROC_VMM,
+		    IMSG_VMDOP_DEV_LAUNCH_RESPONSE, peer_id, -1, &vdl,
+		    sizeof(vdl));
+		break;
+	default:
+		return (-1);
+	}
+	return (0);
+}
+
+/*
+ * PROC_VIOFS: the dedicated root launcher.  It holds pledge "exec" (PROC_PARENT
+ * no longer does), opened /dev/vmm in main(), and fork+execs each transparent
+ * viofs from the TRUSTED policy PROC_PARENT relayed.  It correlates the two
+ * device-end fds (REQUEST=sync, FD_ASYNC=async) and reaps its own children.
+ */
+void
+viofs_proc(struct privsep *ps, struct privsep_proc *p)
+{
+	proc_run(ps, p, viofs_peers, nitems(viofs_peers), viofs_run, NULL);
+}
+
+void
+viofs_run(struct privsep *ps, struct privsep_proc *p, void *arg)
+{
+	/*
+	 * proc_run installed proc_sig_handler for SIGCHLD (which ignores it);
+	 * replace it so we reap the viofs devices we fork+exec.  This proc has
+	 * no other children, so WAIT_ANY in parent_sighdlr is correct here.
+	 */
+	signal_del(&ps->ps_evsigchld);
+	signal_set(&ps->ps_evsigchld, SIGCHLD, parent_sighdlr, ps);
+	signal_add(&ps->ps_evsigchld, NULL);
+
+	/*
+	 * stdio - logging + imsg.  proc/exec - fork+execvp the device.
+	 * recvfd - the device-end socketpair fds arrive over imsg.  No "id":
+	 * the launcher never changes identity (the child re-pledges after
+	 * exec).  /dev/vmm was opened in main() before this pledge.
+	 */
+	if (pledge("stdio proc exec recvfd", NULL) == -1)
+		fatal("pledge");
+}
+
+void
+viofs_shutdown(void)
+{
+	struct dev_track	*dt;
+
+	/*
+	 * Terminate our launched devices so PROC_PARENT's proc_kill() blocking
+	 * waitpid() cannot wedge on a viofs whose VM has not closed its
+	 * channels, and so we exit promptly at teardown (M3b M5 finding).
+	 */
+	SLIST_FOREACH(dt, &dev_track_list, entry)
+		(void)kill(dt->pid, SIGTERM);
+}
+
+/*
+ * PROC_VIOFS side: handle the launch relay from PROC_PARENT.  All security
+ * policy in the payload was re-derived by PARENT from trusted config.
+ */
+int
+viofs_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
+{
+	struct privsep			*ps = p->p_ps;
+	struct dev_launch_pending	*pend;
+	uint32_t			 peer_id, type;
+
+	peer_id = imsg_get_id(imsg);
+	type = imsg_get_type(imsg);
+
+	switch (type) {
+	case IMSG_VMDOP_DEV_LAUNCH_REQUEST: {
+		unsigned int	npend = 0;
+		int		dup = 0;
+
+		/* One in-flight launch per vmid; bound the table (anti-DoS). */
+		SLIST_FOREACH(pend, &dev_launch_pending, entry) {
+			if (pend->vmid == peer_id)
+				dup = 1;
+			npend++;
+		}
+		if (dup || npend >= DEV_LAUNCH_PENDING_MAX) {
+			log_warnx("%s: vm %u launch refused (dup=%d n=%u)",
+			    __func__, peer_id, dup, npend);
+			close_fd(imsg_get_fd(imsg));
+			break;
+		}
+		if ((pend = calloc(1, sizeof(*pend))) == NULL) {
+			log_warn("%s: calloc", __func__);
+			close_fd(imsg_get_fd(imsg));
+			break;
+		}
+		vmop_dev_launch_read(imsg, &pend->vdl);
+		pend->vmid = peer_id;
+		pend->sync_fd = imsg_get_fd(imsg);	/* sync_fds[1] */
+		pend->async_fd = -1;
+		SLIST_INSERT_HEAD(&dev_launch_pending, pend, entry);
+		break;
+	}
+	case IMSG_VMDOP_DEV_LAUNCH_FD_ASYNC: {
+		struct vmop_dev_launch	resp;
+		pid_t			dev_pid;
+		int			status = 0;
+
+		pend = dev_launch_find(peer_id);
+		if (pend == NULL) {
+			log_warnx("%s: async fd for unknown launch vmid %u",
+			    __func__, peer_id);
+			close_fd(imsg_get_fd(imsg));
+			break;
+		}
+		pend->async_fd = imsg_get_fd(imsg);	/* async_fds[1] */
+
+		dev_pid = parent_launch_viofs(&pend->vdl, pend->sync_fd,
+		    pend->async_fd, &status);
+
+		resp = pend->vdl;
+		resp.vdl_status = status;
+		if (proc_compose_imsg(ps, PROC_PARENT,
+		    IMSG_VMDOP_DEV_LAUNCH_RESPONSE, peer_id, -1, &resp,
+		    sizeof(resp)) == -1)
+			log_warn("%s: reply dev launch response", __func__);
+
+		close_fd(pend->sync_fd);
+		close_fd(pend->async_fd);
+		SLIST_REMOVE(&dev_launch_pending, pend, dev_launch_pending,
+		    entry);
+		free(pend);
+
+		if (status == 0)
+			log_debug("%s: launched transparent viofs pid %d vm %u",
+			    __func__, dev_pid, peer_id);
+		break;
+	}
+	case IMSG_VMDOP_DEV_REAP_REQUEST:
+		parent_dev_reap_vmid(peer_id);
+		break;
+	case IMSG_VMDOP_CONFIG:
+		/* Broadcast at config load to every proc; consume (unused). */
+		config_getconfig(ps->ps_env, imsg);
+		break;
+	default:
+		return (-1);
+	}
 	return (0);
 }
 
@@ -595,7 +1231,7 @@ main(int argc, char **argv)
 	env->vmd_fd = -1;
 	env->vmd_fd6 = -1;
 
-	while ((ch = getopt(argc, argv, "D:P:V:X:df:i:j:nt:vp:")) != -1) {
+	while ((ch = getopt(argc, argv, "D:P:V:X:df:i:j:nt:vp:R:K:")) != -1) {
 		switch (ch) {
 		case 'D':
 			if (cmdline_symset(optarg) < 0)
@@ -659,6 +1295,33 @@ main(int argc, char **argv)
 			if (errp)
 				fatalx("invalid psp fd");
 			break;
+		case 'R':
+			/*
+			 * M3b: TRUSTED transparent-viofs share path, passed by
+			 * the root launcher (PROC_PARENT re-derived it from
+			 * vmd.conf).  Its presence marks a launcher-launched
+			 * device that overrides the _vmd-supplied policy.
+			 */
+			if (strlcpy(env->vmd_dev_path, optarg,
+			    sizeof(env->vmd_dev_path)) >=
+			    sizeof(env->vmd_dev_path))
+				fatalx("device share path too long");
+			env->vmd_dev_launched = 1;
+			break;
+		case 'K': {
+			/* M3b: TRUSTED credmode:flags:maproot:ouid:ogid. */
+			unsigned int	cm, fl, mr, ou, og;
+
+			if (sscanf(optarg, "%u:%u:%u:%u:%u", &cm, &fl, &mr,
+			    &ou, &og) != 5)
+				fatalx("malformed device policy");
+			env->vmd_dev_credmode = cm;
+			env->vmd_dev_flags = fl;
+			env->vmd_dev_maproot = (uid_t)mr;
+			env->vmd_dev_owner_uid = (uid_t)ou;
+			env->vmd_dev_owner_gid = (gid_t)og;
+			break;
+		}
 		default:
 			usage();
 		}
@@ -700,6 +1363,13 @@ main(int argc, char **argv)
 	proc_priv->p_chroot = ps->ps_pw->pw_dir; /* from VMD_USER */
 
 	/*
+	 * M3b: the viofs launcher stays root (all-zero pw) so the transparent
+	 * viofs it fork+execs inherits uid 0; chroot "/" (procs[]) keeps the
+	 * host share paths and env->argv0 reachable for execvp.
+	 */
+	proc_viofs->p_pw = &proc_viofspw;
+
+	/*
 	 * If we're launching a new vm or its device, we short out here.
 	 */
 	if (vm_launch == VMD_LAUNCH_VM) {
@@ -727,7 +1397,10 @@ main(int argc, char **argv)
 	}
 
 	/* Open /dev/vmm early. */
-	if (env->vmd_noaction == 0 && proc_id == PROC_PARENT) {
+	if (env->vmd_noaction == 0 &&
+	    (proc_id == PROC_PARENT || proc_id == PROC_VIOFS)) {
+		/* PROC_VIOFS needs its own /dev/vmm to hand to launched devices
+		 * (re-exec'd privsep children do not inherit PARENT's CLOEXEC fd). */
 		env->vmd_fd = open(VMM_NODE, O_RDWR | O_CLOEXEC);
 		if (env->vmd_fd == -1)
 			fatal("%s", VMM_NODE);
@@ -759,6 +1432,11 @@ main(int argc, char **argv)
 	signal_set(&ps->ps_evsighup, SIGHUP, vmd_sighdlr, ps);
 	signal_set(&ps->ps_evsigpipe, SIGPIPE, vmd_sighdlr, ps);
 	signal_set(&ps->ps_evsigusr1, SIGUSR1, vmd_sighdlr, ps);
+	/*
+	 * M3b: PROC_PARENT does NOT fork+exec devices anymore (PROC_VIOFS does)
+	 * and, as before M3b, takes no runtime SIGCHLD handler: proc_kill()
+	 * reaps the privsep children at teardown.
+	 */
 
 	signal_add(&ps->ps_evsigint, NULL);
 	signal_add(&ps->ps_evsigterm, NULL);
@@ -848,9 +1526,21 @@ vmd_configure(void)
 		exit(0);
 	}
 
-	/* Send VMM device fd to vmm proc. */
-	proc_compose_imsg(&env->vmd_ps, PROC_VMM,
-	    IMSG_VMDOP_RECEIVE_VMM_FD, -1, env->vmd_fd, NULL, 0);
+	/*
+	 * Send VMM device fd to vmm proc.  Send a DUP, not env->vmd_fd itself:
+	 * imsg fd-passing CLOSES the sender's fd after the send, and M3b needs
+	 * PROC_PARENT to retain a live /dev/vmm so it can hand one to a
+	 * PARENT-launched transparent viofs (parent_launch_viofs).  Without this
+	 * env->vmd_fd is stale and the launched device's VMM_IOC_SHAREMEM fails.
+	 */
+	{
+		int vmmfd_send = dup(env->vmd_fd);
+
+		if (vmmfd_send == -1)
+			fatal("dup vmd_fd for vmm");
+		proc_compose_imsg(&env->vmd_ps, PROC_VMM,
+		    IMSG_VMDOP_RECEIVE_VMM_FD, -1, vmmfd_send, NULL, 0);
+	}
 
 	/* Send PSP device fd to vmm proc. */
 	if (env->vmd_psp_fd != -1) {
@@ -966,7 +1656,7 @@ vmd_reload(unsigned int reset, const char *filename)
 void
 vmd_shutdown(void)
 {
-	struct vmd_vm *vm, *vm_next;
+	struct vmd_vm	*vm, *vm_next;
 
 	log_debug("%s: performing shutdown", __func__);
 
@@ -1908,6 +2598,15 @@ vmop_owner_read(struct imsg *imsg, struct vmop_owner *vo)
 {
 	if (imsg_get_data(imsg, vo, sizeof(*vo)))
 		fatal("%s", __func__);
+}
+
+void
+vmop_dev_launch_read(struct imsg *imsg, struct vmop_dev_launch *vdl)
+{
+	if (imsg_get_data(imsg, vdl, sizeof(*vdl)))
+		fatal("%s", __func__);
+
+	vdl->vdl_vmname[sizeof(vdl->vdl_vmname) - 1] = '\0';
 }
 
 void

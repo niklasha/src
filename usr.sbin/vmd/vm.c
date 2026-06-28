@@ -121,8 +121,13 @@ vm_main(int fd, int fd_vmm)
 	 * stdio - for malloc and basic I/O including events.
 	 * vmm - for the vmm ioctls and operations.
 	 * proc exec - fork/exec for launching devices.
+	 * sendfd - M3b: a transparent-credmode viofs is launched by PROC_PARENT,
+	 *   so this process passes the device-end socketpair fds up to PROC_VMM
+	 *   (imsg SCM_RIGHTS) during init_emulated_hw().  Without sendfd that
+	 *   sendmsg is a pledge violation (SIGABRT).  The narrowed pledge below
+	 *   (after device setup) drops it again.
 	 */
-	if (pledge("stdio vmm proc exec", NULL) == -1)
+	if (pledge("stdio vmm sendfd proc exec", NULL) == -1)
 		fatal("pledge");
 
 	/* Receive our vm configuration. */

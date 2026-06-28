@@ -387,6 +387,13 @@ struct virtio_dev {
 	uint32_t	vmm_id;			/* vmm(4) vm identifier [r] */
 	pid_t		dev_pid;		/* pid of emulator process */
 	char		dev_type;		/* device type (as char) */
+	/*
+	 * M3b Phase B: set when this device was fork+exec'd by PROC_PARENT
+	 * (root) on the VM process's behalf -- only the transparent viofs.
+	 * The VM process is NOT this child's parent, so virtio_shutdown() must
+	 * not waitpid() it; PROC_PARENT reaps it on VM death.
+	 */
+	int		dev_parent_launched;
 	SLIST_ENTRY(virtio_dev) dev_next;
 };
 

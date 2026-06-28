@@ -70,6 +70,7 @@
 #include "vmd.h"
 
 extern struct vmd_vm *current_vm;
+extern struct vmd *env;		/* M3b: trusted launcher policy (vmd_dev_*) */
 #endif /* !VIOFS_STAGE0 */
 
 /* 9P2000.L message types. */
@@ -214,6 +215,17 @@ extern struct vmd_vm *current_vm;
 #define VIOFS_MSIZE_MIN	512
 #define VIOFS_MSIZE_MAX	(64 * 1024)
 #define VIOFS_VERSION	"9P2000.L"
+/*
+ * M3b extended dialect.  When the guest proposes this version string in
+ * Tversion the host echoes it and turns on viofs_extended: every later
+ * T-message (except Tversion) then carries an 8-byte uid[4]/gid[4] prefix
+ * immediately after the 7-byte 9P header, conveying the guest caller's
+ * identity for the transparent credential mode.  A guest that proposes the
+ * plain base string gets the base string back and the prefix is never used,
+ * so an unmodified 9P2000.L client (and the M3 squash path) is unchanged.
+ */
+#define VIOFS_VERSION_EXT	"9P2000.L.appli"
+#define P9_CRED_PREFIX	8		/* uid[4] gid[4] after the 9P header */
 
 /* Treaddir: each wire dirent = qid[13] off[8] type[1] namelen[2] + name. */
 #define P9_READDIR_FIXED	24
@@ -771,30 +783,104 @@ static int	viofs_credmode = VMSHARE_CRED_SQUASH;	/* M3b seam */
 static uid_t	viofs_maproot = (uid_t)-1;		/* M3b seam */
 
 /*
- * Credential choke point (forward-compat seam, single source of truth for "who
- * does this write act as").
+ * M3b transparent-credential state.
  *
- * SQUASH (the only mode wired up in M3): NO-OP.  The subprocess already runs as
- * the single share-owner-equivalent identity, so every mutating syscall already
- * acts as that identity; there is nothing to set or restore.  Bracketing every
- * write handler now means the M3b transparent mode is a two-function change, not
- * a scatter-edit across the handlers: viofs_setcred() will setegid/seteuid to
- * the fid's carried uid/gid (honoring viofs_maproot for guest-root) and return 0
- * or an OpenBSD errno on failure; viofs_restorecred() will restore euid/egid to
- * root.  The bracket must enclose EXACTLY the filesystem syscall(s) and nothing
+ * viofs_extended is set in p9_version iff the guest proposed VIOFS_VERSION_EXT;
+ * it is the single switch that (a) enables the per-message uid[4]/gid[4] wire
+ * prefix and (b) authorizes per-op identity switching.  req_uid/req_gid hold the
+ * caller identity decoded from the current request's prefix (or the squash owner
+ * when no prefix is present).  viofs_root_groups[] is the supplementary group
+ * set captured once at startup (while still root) so restorecred() can put it
+ * back verbatim.
+ */
+static int	viofs_extended;			/* guest negotiated the prefix */
+static uint32_t	req_uid;			/* this request's caller uid */
+static uint32_t	req_gid;			/* this request's caller gid */
+static gid_t	viofs_root_groups[NGROUPS_MAX];	/* startup (root) group set */
+static int	viofs_root_ngroups;		/* count in viofs_root_groups */
+
+static void	viofs_restorecred(void);	/* setcred's fail path uses it */
+
+/*
+ * Credential choke point (single source of truth for "who does this op act
+ * as").  The bracket must enclose EXACTLY the filesystem syscall(s) and nothing
  * that touches the 9P wire buffers.
+ *
+ * SQUASH: NO-OP.  The subprocess already runs as the single share-owner
+ * identity (viofs_main dropped to it explicitly), so every syscall already acts
+ * as that identity; there is nothing to set or restore.  This keeps squash
+ * byte-identical to M3.
+ *
+ * TRANSPARENT: the subprocess stays root and switches its effective identity
+ * per op from req_uid/req_gid (decoded from the wire prefix):
+ *   guest uid N != 0  -> euid N, egid = guest gid (req_gid);
+ *   guest uid 0       -> euid = (viofs_maproot != -1 ? viofs_maproot
+ *                                                     : viofs_owner_uid),
+ *                        egid = owner gid.
+ * setcred sets the group identity BEFORE the uid (so it is still privileged to
+ * call setgroups/setegid), then drops euid; on ANY failure it restores root and
+ * returns the (OpenBSD) errno.  restorecred unconditionally climbs back to root.
+ * The fid argument is unused: identity is a property of the request, not the
+ * (caller-shared) fid.
  */
 static int
 viofs_setcred(struct viofs_fid *f)
 {
-	(void)f;
-	return (0);		/* SQUASH: no-op.  M3b fills this in. */
+	uid_t	target_uid;
+	gid_t	target_gid;
+
+	(void)f;			/* identity is per-request, not per-fid */
+
+	if (viofs_credmode == VMSHARE_CRED_SQUASH)
+		return (0);		/* SQUASH: no-op. */
+
+	if (req_uid == 0) {
+		target_uid = (viofs_maproot != (uid_t)-1) ?
+		    viofs_maproot : (uid_t)viofs_owner_uid;
+		target_gid = (gid_t)viofs_owner_gid;
+	} else {
+		/*
+		 * (uid_t)-1/(gid_t)-1 are not real identities (the "no change"
+		 * sentinel for some set*id calls, and a nonsense owner); refuse.
+		 * gid 0 (wheel) is privileged on the host and is never handed to
+		 * a guest caller: squash it to the share owner's gid, mirroring
+		 * the uid-0 -> maproot rule (maproot governs the uid only).
+		 */
+		if (req_uid == (uint32_t)-1 || req_gid == (uint32_t)-1)
+			return (EINVAL);
+		target_uid = (uid_t)req_uid;
+		target_gid = (req_gid == 0) ?
+		    (gid_t)viofs_owner_gid : (gid_t)req_gid;
+	}
+
+	/* gid/groups BEFORE uid: we must still be root to set them. */
+	if (setgroups(1, &target_gid) == -1)
+		goto fail;
+	if (setegid(target_gid) == -1)
+		goto fail;
+	if (seteuid(target_uid) == -1)
+		goto fail;
+	return (0);
+
+fail:
+	{
+		int saved = errno;
+
+		viofs_restorecred();	/* never leave a partial identity */
+		return (saved);
+	}
 }
 
 static void
 viofs_restorecred(void)
 {
-	/* SQUASH: no-op.  M3b restores euid/egid to root here. */
+	if (viofs_credmode == VMSHARE_CRED_SQUASH)
+		return;			/* SQUASH: no-op. */
+
+	/* uid first so we regain the privilege to reset gid/groups. */
+	(void)seteuid(0);
+	(void)setegid(0);
+	(void)setgroups(viofs_root_ngroups, viofs_root_groups);
 }
 
 static void
@@ -818,12 +904,31 @@ p9_version(struct p9_treq *req, struct p9_resp *resp)
 	/* A new Tversion orphans every prior fid. */
 	fid_reset_all();
 
+	/*
+	 * Re-negotiate the dialect from scratch on every Tversion.  If the guest
+	 * proposes the M3b extended string AND this share runs a non-squash
+	 * credential mode, echo the extended string and turn on the uid/gid wire
+	 * prefix; a base-string proposal (or a squash share) falls back to plain
+	 * 9P2000.L with no prefix.  An unknown proposal echoes "unknown".  The
+	 * extended compare must precede the base compare: the two share a prefix.
+	 */
+	viofs_extended = 0;
 	p9_resp_start(resp, P9_RVERSION);
 	p9_put32(resp, msize);
-	if (strncmp(ver, VIOFS_VERSION, sizeof(VIOFS_VERSION)) == 0)
+	if (strncmp(ver, VIOFS_VERSION_EXT, sizeof(VIOFS_VERSION_EXT)) == 0) {
+		if (viofs_credmode != VMSHARE_CRED_SQUASH) {
+			viofs_extended = 1;
+			p9_puts(resp, VIOFS_VERSION_EXT,
+			    strlen(VIOFS_VERSION_EXT));
+		} else {
+			/* Squash ignores caller identity: stay on the base. */
+			p9_puts(resp, VIOFS_VERSION, strlen(VIOFS_VERSION));
+		}
+	} else if (strncmp(ver, VIOFS_VERSION, sizeof(VIOFS_VERSION)) == 0) {
 		p9_puts(resp, VIOFS_VERSION, strlen(VIOFS_VERSION));
-	else
+	} else {
 		p9_puts(resp, "unknown", strlen("unknown"));
+	}
 }
 
 static void
@@ -834,7 +939,7 @@ p9_attach(struct p9_treq *req, struct p9_resp *resp)
 	struct stat st;
 	char uname[64], aname[256];
 	uint32_t fid, afid;
-	int rootfd;
+	int rootfd, cerr;
 
 	fid = p9_get32(req);
 	afid = p9_get32(req);
@@ -853,17 +958,31 @@ p9_attach(struct p9_treq *req, struct p9_resp *resp)
 		p9_rlerror(resp, L_EINVAL);
 		return;
 	}
+	/*
+	 * Resolve the share root AS THE CALLER (transparent mode): a guest that
+	 * cannot search/read the share root must get EACCES at attach, like every
+	 * other handler.  squash: viofs_setcred/restorecred are no-ops.
+	 */
+	if ((cerr = viofs_setcred(NULL)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
 	rootfd = openat(viofs_share_fd, ".",
 	    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	if (rootfd == -1) {
-		p9_rlerror(resp, errno_xlate(errno));
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
 		return;
 	}
 	if (fstat(rootfd, &st) == -1) {
-		p9_rlerror(resp, errno_xlate(errno));
+		cerr = errno;
+		viofs_restorecred();
 		close(rootfd);
+		p9_rlerror(resp, errno_xlate(cerr));
 		return;
 	}
+	viofs_restorecred();
 	if ((f = fid_alloc(fid)) == NULL) {
 		close(rootfd);
 		p9_rlerror(resp, L_EMFILE);
@@ -953,14 +1072,31 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 			p9_put16(resp, 0);
 			return;
 		}
-		if (f->is_dir)
+		/*
+		 * Cloning a directory fid re-opens it ("." search check), so do
+		 * that as the caller; cloning a file is a pure fd dup (identity-
+		 * neutral) and needs no bracket.
+		 */
+		if (f->is_dir) {
+			if ((lerr = viofs_setcred(f)) != 0) {
+				p9_rlerror(resp, errno_xlate(lerr));
+				return;
+			}
 			nfd = openat(f->fd, ".",
 			    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-		else
+			if (nfd == -1)
+				lerr = errno;
+			viofs_restorecred();
+			if (nfd == -1) {
+				p9_rlerror(resp, errno_xlate(lerr));
+				return;
+			}
+		} else {
 			nfd = fcntl(f->fd, F_DUPFD_CLOEXEC, 0);
-		if (nfd == -1) {
-			p9_rlerror(resp, errno_xlate(errno));
-			return;
+			if (nfd == -1) {
+				p9_rlerror(resp, errno_xlate(errno));
+				return;
+			}
 		}
 		/*
 		 * Carry (parentfd,name) onto the clone so it too can be reopened
@@ -1024,11 +1160,26 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 	last_name[0] = '\0';
 	memset(&sym_st, 0, sizeof(sym_st));
 
+	/*
+	 * The per-component resolution (fstatat + openat) must run as the caller
+	 * so directory search permission is checked per uid in transparent mode.
+	 * One bracket spans the whole loop; every return inside it restorecred()s
+	 * first, and the loop fall-through (normal completion / a break) is
+	 * followed by a restorecred() before the bookkeeping that binds newfid.
+	 * dup/close/fcntl/fid_alloc are identity-neutral (handles we already own)
+	 * and are intentionally left to run as root after the loop.
+	 */
+	if ((lerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(lerr));
+		return;
+	}
+
 	for (i = 0; i < nwname; i++) {
 		int nfd, flags;
 
 		if (!name_ok(names[i])) {
 			if (i == 0) {
+				viofs_restorecred();
 				if (curfd != basefd)
 					close(curfd);
 				p9_rlerror(resp, L_ENOENT);
@@ -1039,6 +1190,7 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 		if (fstatat(curfd, names[i], &st, AT_SYMLINK_NOFOLLOW) == -1) {
 			if (i == 0) {
 				lerr = errno_xlate(errno);
+				viofs_restorecred();
 				if (curfd != basefd)
 					close(curfd);
 				p9_rlerror(resp, lerr);
@@ -1053,6 +1205,7 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 				sym_parentfd = dup(curfd);
 				if (sym_parentfd == -1) {
 					lerr = errno_xlate(errno);
+					viofs_restorecred();
 					if (curfd != basefd)
 						close(curfd);
 					p9_rlerror(resp, lerr);
@@ -1071,6 +1224,7 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 		if (nfd == -1) {
 			if (i == 0) {
 				lerr = errno_xlate(errno);
+				viofs_restorecred();
 				if (curfd != basefd)
 					close(curfd);
 				p9_rlerror(resp, lerr);
@@ -1088,6 +1242,7 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 			parentfd = dup(curfd);
 			if (parentfd == -1) {
 				lerr = errno_xlate(errno);
+				viofs_restorecred();
 				close(nfd);
 				if (curfd != basefd)
 					close(curfd);
@@ -1103,6 +1258,7 @@ p9_walk(struct p9_treq *req, struct p9_resp *resp)
 		qid_from(&st, &wq[nwq]);
 		nwq++;
 	}
+	viofs_restorecred();	/* loop done (completion or break): back to root */
 
 	/* Bind newfid only on a full walk. */
 	if (nwq == nwname) {
@@ -1185,6 +1341,7 @@ p9_getattr(struct p9_treq *req, struct p9_resp *resp)
 	uint32_t fid;
 	uint64_t valid;
 	uint32_t mode;
+	int	 cerr, rc;
 
 	fid = p9_get32(req);
 	valid = p9_get64(req);		/* request_mask */
@@ -1196,14 +1353,19 @@ p9_getattr(struct p9_treq *req, struct p9_resp *resp)
 		p9_rlerror(resp, L_EBADF);
 		return;
 	}
-	if (f->fd == -1) {		/* symlink FID */
-		if (fstatat(f->parentfd, f->name, &st, AT_SYMLINK_NOFOLLOW)
-		    == -1) {
-			p9_rlerror(resp, errno_xlate(errno));
-			return;
-		}
-	} else if (fstat(f->fd, &st) == -1) {
-		p9_rlerror(resp, errno_xlate(errno));
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	if (f->fd == -1)		/* symlink FID */
+		rc = fstatat(f->parentfd, f->name, &st, AT_SYMLINK_NOFOLLOW);
+	else
+		rc = fstat(f->fd, &st);
+	if (rc == -1)
+		cerr = errno;
+	viofs_restorecred();
+	if (rc == -1) {
+		p9_rlerror(resp, errno_xlate(cerr));
 		return;
 	}
 	qid_from(&st, &q);
@@ -1216,8 +1378,22 @@ p9_getattr(struct p9_treq *req, struct p9_resp *resp)
 	p9_put64(resp, valid);
 	p9_putqid(resp, &q);
 	p9_put32(resp, mode);
-	p9_put32(resp, viofs_owner_uid);
-	p9_put32(resp, viofs_owner_gid);
+	/*
+	 * Ownership reporting.  SQUASH: report the single share-owner identity
+	 * (M3 behavior).  TRANSPARENT: report the REAL on-disk st_uid/st_gid so
+	 * the guest's own VOP_ACCESS checks (vio9p_access) gate against the true
+	 * owner -- non-root guest uids map 1:1, so a file written by guest uid N
+	 * is host-owned N and the guest correctly sees N.  (Files created by
+	 * guest-root are host-owned by the maproot target; the guest then sees
+	 * that uid rather than 0, an accepted fidelity limit of squashed root.)
+	 */
+	if (viofs_credmode == VMSHARE_CRED_SQUASH) {
+		p9_put32(resp, viofs_owner_uid);
+		p9_put32(resp, viofs_owner_gid);
+	} else {
+		p9_put32(resp, (uint32_t)st.st_uid);
+		p9_put32(resp, (uint32_t)st.st_gid);
+	}
 	p9_put64(resp, (uint64_t)st.st_nlink);
 	p9_put64(resp, (uint64_t)st.st_rdev);
 	p9_put64(resp, (uint64_t)st.st_size);
@@ -1350,6 +1526,7 @@ p9_read(struct p9_treq *req, struct p9_resp *resp)
 	size_t avail;
 	ssize_t n;
 	uint8_t *dst;
+	int	 cerr;
 
 	fid = p9_get32(req);
 	offset = p9_get64(req);
@@ -1390,9 +1567,16 @@ p9_read(struct p9_treq *req, struct p9_resp *resp)
 	p9_resp_start(resp, P9_RREAD);
 	p9_put32(resp, 0);		/* count placeholder at resp->buf+7 */
 	dst = &resp->buf[resp->len];
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
 	n = pread(f->fd, dst, count, (off_t)offset);
+	if (n == -1)
+		cerr = errno;
+	viofs_restorecred();
 	if (n == -1) {
-		p9_rlerror(resp, errno_xlate(errno));
+		p9_rlerror(resp, errno_xlate(cerr));
 		return;
 	}
 	resp->len += (size_t)n;
@@ -1406,6 +1590,7 @@ p9_readlink(struct p9_treq *req, struct p9_resp *resp)
 	char target[PATH_MAX];
 	uint32_t fid;
 	ssize_t n;
+	int	 cerr;
 
 	fid = p9_get32(req);
 	if (req->err) {
@@ -1420,9 +1605,16 @@ p9_readlink(struct p9_treq *req, struct p9_resp *resp)
 		p9_rlerror(resp, L_EINVAL);	/* not a symlink */
 		return;
 	}
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
 	n = readlinkat(f->parentfd, f->name, target, sizeof(target));
+	if (n == -1)
+		cerr = errno;
+	viofs_restorecred();
 	if (n == -1) {
-		p9_rlerror(resp, errno_xlate(errno));
+		p9_rlerror(resp, errno_xlate(cerr));
 		return;
 	}
 	/* Returned verbatim; never resolved. */
@@ -1437,6 +1629,7 @@ p9_statfs(struct p9_treq *req, struct p9_resp *resp)
 	struct statfs sfs;
 	uint32_t fid;
 	int64_t bavail;
+	int	 cerr, rc;
 
 	fid = p9_get32(req);
 	if (req->err) {
@@ -1447,8 +1640,16 @@ p9_statfs(struct p9_treq *req, struct p9_resp *resp)
 		p9_rlerror(resp, L_EBADF);
 		return;
 	}
-	if (fstatfs(f->fd, &sfs) == -1) {
-		p9_rlerror(resp, errno_xlate(errno));
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+	rc = fstatfs(f->fd, &sfs);
+	if (rc == -1)
+		cerr = errno;
+	viofs_restorecred();
+	if (rc == -1) {
+		p9_rlerror(resp, errno_xlate(cerr));
 		return;
 	}
 	bavail = sfs.f_bavail < 0 ? 0 : sfs.f_bavail;
@@ -1547,7 +1748,7 @@ p9_readdir(struct p9_treq *req, struct p9_resp *resp)
 	uint32_t		 fid, count;
 	uint64_t		 offset;
 	size_t			 budget, avail, out, need;
-	int			 n, bpos;
+	int			 n, bpos, cerr;
 
 	fid = p9_get32(req);
 	offset = p9_get64(req);
@@ -1584,21 +1785,41 @@ p9_readdir(struct p9_treq *req, struct p9_resp *resp)
 	p9_put32(resp, 0);			/* count placeholder at buf[P9_HDRLEN] */
 	out = 0;
 
+	/*
+	 * One bracket covers lseek + getdents + the per-entry fstatat done by
+	 * readdir_qid_type(), so the whole listing reads as the caller identity.
+	 * Every exit below (error or the "done" tail) restorecred()s first; the
+	 * response-builder calls only touch the in-memory response buffer, never
+	 * the filesystem, so they are safe to run inside the bracket.
+	 */
+	if ((cerr = viofs_setcred(f)) != 0) {
+		p9_rlerror(resp, errno_xlate(cerr));
+		return;
+	}
+
 	if (lseek(f->fd, (off_t)offset, SEEK_SET) == -1) {
-		p9_rlerror(resp, errno_xlate(errno));
+		cerr = errno;
+		viofs_restorecred();
+		p9_rlerror(resp, errno_xlate(cerr));
 		return;
 	}
 
 	for (;;) {
 		n = getdents(f->fd, dbuf, sizeof(dbuf));
 		if (n == -1) {
-			if (errno == EINVAL)	/* garbage cookie -> clean stop */
-				break;
-			p9_rlerror(resp, errno_xlate(errno));
+			if (errno == EINVAL) {	/* garbage cookie -> clean stop */
+				viofs_restorecred();
+				goto done_norestore;
+			}
+			cerr = errno;
+			viofs_restorecred();
+			p9_rlerror(resp, errno_xlate(cerr));
 			return;
 		}
-		if (n == 0)
-			break;			/* host EOF */
+		if (n == 0) {
+			viofs_restorecred();	/* host EOF */
+			goto done_norestore;
+		}
 
 		bpos = 0;
 		while (bpos < n) {
@@ -1623,6 +1844,7 @@ p9_readdir(struct p9_treq *req, struct p9_resp *resp)
 				if (out == 0) {
 					/* one record can't fit even an empty
 					 * reply: refuse rather than false-EOF. */
+					viofs_restorecred();
 					p9_rlerror(resp, L_EINVAL);
 					return;
 				}
@@ -1639,6 +1861,8 @@ p9_readdir(struct p9_treq *req, struct p9_resp *resp)
 		}
 	}
 done:
+	viofs_restorecred();
+done_norestore:
 	put_le32(&resp->buf[P9_HDRLEN], (uint32_t)out);
 }
 
@@ -2336,6 +2560,30 @@ viofs_handle(const uint8_t *treq, size_t treq_len,
 		return (-1);		/* malformed header -> reset */
 	resp.tag = req.tag;
 
+	/*
+	 * M3b credential prefix.  When the extended dialect is negotiated, every
+	 * T-message except Tversion carries uid[4]/gid[4] immediately after the
+	 * 7-byte header and before the type-specific body.  Consume it HERE, in
+	 * the one dispatch point, so the per-op handlers stay byte-for-byte
+	 * oblivious: req.off already sits at P9_HDRLEN, so after these two reads
+	 * the cursor points at the handler's first body field exactly as before.
+	 * Outside the extended dialect (and for Tversion, which precedes
+	 * negotiation), the caller identity is the squash owner.
+	 */
+	if (viofs_extended && req.type != P9_TVERSION) {
+		req_uid = p9_get32(&req);
+		req_gid = p9_get32(&req);
+		if (req.err) {
+			p9_rlerror(&resp, L_EINVAL);
+			p9_resp_finish(&resp);
+			*rlen = resp.len;
+			return (0);
+		}
+	} else {
+		req_uid = viofs_owner_uid;
+		req_gid = viofs_owner_gid;
+	}
+
 	switch (req.type) {
 	case P9_TVERSION:
 		p9_version(&req, &resp);
@@ -2630,8 +2878,12 @@ viofs_main(int fd, int fd_vmm)
 	 * wpath cpath fattr - writable shares (M3): write/truncate, create/
 	 *   unlink/rename/mkdir/symlink, fchmod/futimens.  The narrowing pledge
 	 *   below drops them again for read-only shares.
+	 * id     - transparent (M3b) shares seteuid/setegid/setgroups per op;
+	 *   it must be in the initial set so the narrowing pledge can keep it
+	 *   (pledge only narrows).  The narrowing pledge below drops it for
+	 *   squash and read-only shares.
 	 */
-	if (pledge("stdio recvfd vmm proc unveil rpath wpath cpath fattr",
+	if (pledge("stdio recvfd vmm proc unveil rpath wpath cpath fattr id",
 	    NULL) == -1)
 		fatal("pledge");
 
@@ -2650,6 +2902,23 @@ viofs_main(int fd, int fd_vmm)
 	dev.sync_fd = fd;
 	viofs = &dev.viofs;
 
+	/*
+	 * M3b remediation: a transparent viofs is re-exec'd by the root launcher,
+	 * which passed the TRUSTED policy (re-derived by PROC_PARENT from
+	 * vmd.conf) via -R/-K.  Override the _vmd-supplied copies so a compromised
+	 * VM process cannot redirect the share path, widen access, or change the
+	 * credential/owner mapping.  vmd_dev_launched is set only when -R was
+	 * given, i.e. by the launcher -- never by the VM-forked (squash) path.
+	 */
+	if (env->vmd_dev_launched) {
+		if (strlcpy(viofs->path, env->vmd_dev_path,
+		    sizeof(viofs->path)) >= sizeof(viofs->path))
+			fatalx("%s: launcher share path too long", __func__);
+		viofs->credmode = env->vmd_dev_credmode;
+		viofs->flags = env->vmd_dev_flags;
+		viofs->maproot = env->vmd_dev_maproot;
+	}
+
 	log_debug("%s: got viofs dev. tag = \"%s\", share = \"%s\"", __func__,
 	    viofs->tag, viofs->path);
 
@@ -2658,17 +2927,27 @@ viofs_main(int fd, int fd_vmm)
 	viofs_maproot = viofs->maproot;
 
 	/*
-	 * SQUASH is the only credential mode wired up in M3.  A config that
-	 * requested transparent/maproot must fail loudly, never silently squash
-	 * — the privilege-drop launch below is squash-shaped and would be unsafe
-	 * to run under a transparent request.  (M3b replaces this guard with the
-	 * seteuid-per-op machinery + pledge "id".)
+	 * A transparent credential mode is only meaningful on a writable share
+	 * (it governs the identity that performs mutations); reject the nonsense
+	 * combination loudly rather than silently behaving as squash.
 	 */
-	if (viofs_credmode != VMSHARE_CRED_SQUASH) {
+	if (viofs_credmode != VMSHARE_CRED_SQUASH && !viofs_writable) {
 		ret = EINVAL;
-		log_warnx("%s: share \"%s\": credmode %d not supported "
-		    "(M3 is squash-only)", __func__, viofs->tag,
-		    viofs_credmode);
+		log_warnx("%s: share \"%s\": credmode %d requires a writable "
+		    "share", __func__, viofs->tag, viofs_credmode);
+		goto fail;
+	}
+	/*
+	 * A transparent share MUST carry an explicit maproot: guest uid 0 maps
+	 * to it (viofs_setcred).  Without one, viofs_setcred would fall back to
+	 * the share owner uid -- which is 0 for a root-owned VM, silently giving
+	 * guest-root host-root.  Refuse rather than serve that.
+	 */
+	if (viofs_credmode != VMSHARE_CRED_SQUASH &&
+	    viofs_maproot == (uid_t)-1) {
+		ret = EINVAL;
+		log_warnx("%s: share \"%s\": transparent credmode requires "
+		    "maproot", __func__, viofs->tag);
 		goto fail;
 	}
 
@@ -2680,6 +2959,13 @@ viofs_main(int fd, int fd_vmm)
 		goto fail;
 	}
 	current_vm = &vm;
+	viofs_owner_uid = current_vm->vm_params.vmc_owner.uid;
+	viofs_owner_gid = (uint32_t)current_vm->vm_params.vmc_owner.gid;
+	/* M3b remediation: trusted owner from the launcher (see above). */
+	if (env->vmd_dev_launched) {
+		viofs_owner_uid = env->vmd_dev_owner_uid;
+		viofs_owner_gid = (uint32_t)env->vmd_dev_owner_gid;
+	}
 
 	setproctitle("%s/vio9p%u", vm.vm_params.vmc_name, viofs->idx);
 	log_procinit("vm/%s/vio9p%u", vm.vm_params.vmc_name, viofs->idx);
@@ -2691,6 +2977,51 @@ viofs_main(int fd, int fd_vmm)
 	}
 
 	close_fd(fd_vmm);
+
+	/*
+	 * Privilege gate (M3b Phase B, production).  Identity is now set by the
+	 * launch path, not by this process; the gate only asserts the posture
+	 * each credmode requires and pledges accordingly, BEFORE unveil/pledge-
+	 * narrow:
+	 *
+	 *   SQUASH: run every op as the INHERITED identity.  In production the
+	 *   squash viofs is fork+exec'd by the per-VM (_vmd) process, so it is
+	 *   already _vmd; do NOT setresuid/setgroups to the share owner — a _vmd
+	 *   process cannot setresuid to an owner != _vmd (EPERM -> fatal), and
+	 *   squash never needs root.  viofs_setcred()/viofs_restorecred() are
+	 *   no-ops in squash mode, so every op simply runs as the inherited
+	 *   identity.  pledge WITHOUT "id": the process can never change identity.
+	 *
+	 *   TRANSPARENT: this process MUST be root.  PROC_PARENT (the last root
+	 *   process) launches the transparent viofs retaining uid 0 so the per-op
+	 *   viofs_setcred() can seteuid/setegid to each caller.  If we are NOT
+	 *   root here the launch wiring is broken: fatalx loudly rather than
+	 *   silently run every op as the inherited (_vmd) identity.  Snapshot
+	 *   root's supplementary group set once (for restorecred), then pledge
+	 *   WITH "id".
+	 */
+	if (viofs_credmode == VMSHARE_CRED_SQUASH) {
+		/*
+		 * No identity change: inherit the launching (_vmd) identity.
+		 * But a squash viofs must NEVER be root: squash viofs_setcred()
+		 * is a no-op, so a root euid would silently run every guest op
+		 * as root.  Squash is always fork+exec'd by the _vmd VM process,
+		 * so euid 0 means the launch wiring is broken -- fatalx rather
+		 * than serve the share with root authority.
+		 */
+		if (geteuid() == 0)
+			fatalx("%s: share \"%s\": squash viofs must not run as "
+			    "root", __func__, viofs->tag);
+	} else {
+		if (geteuid() != 0)
+			fatalx("%s: share \"%s\": transparent credmode needs a "
+			    "root viofs (got euid %u)", __func__, viofs->tag,
+			    (unsigned)geteuid());
+		viofs_root_ngroups = getgroups(NGROUPS_MAX, viofs_root_groups);
+		if (viofs_root_ngroups == -1)
+			fatal("getgroups");
+	}
+
 	/*
 	 * "rwc" for a writable share (read + write + create), scoped to the
 	 * share subtree only — no "x": the server never execs share content.
@@ -2706,9 +3037,14 @@ viofs_main(int fd, int fd_vmm)
 	 * Narrow the pledge.  RO shares end up exactly as the M1/M2 path (no
 	 * wpath/cpath/fattr).  RW shares keep wpath (pwrite/ftruncate), cpath
 	 * (openat O_CREAT, mkdirat, symlinkat, unlinkat, renameat) and fattr
-	 * (fchmod/futimens in Tsetattr).
+	 * (fchmod/futimens in Tsetattr).  A transparent (root) RW share also
+	 * keeps "id" for the per-op seteuid/setegid/setgroups; squash drops it.
 	 */
-	if (pledge(viofs_writable ? "stdio recvfd rpath wpath cpath fattr"
+	if (viofs_credmode != VMSHARE_CRED_SQUASH) {
+		if (pledge("stdio recvfd rpath wpath cpath fattr id",
+		    NULL) == -1)
+			fatal("pledge2");
+	} else if (pledge(viofs_writable ? "stdio recvfd rpath wpath cpath fattr"
 	    : "stdio recvfd rpath", NULL) == -1)
 		fatal("pledge2");
 
@@ -2719,15 +3055,14 @@ viofs_main(int fd, int fd_vmm)
 		goto fail;
 	}
 	viofs_share_fd = viofs->share_fd;
-	viofs_owner_uid = current_vm->vm_params.vmc_owner.uid;
-	viofs_owner_gid = (uint32_t)current_vm->vm_params.vmc_owner.gid;
 
 	/*
 	 * Bound the FID table to the host fd budget so a flood plateaus at the
 	 * cap (and the kernel's existing RLIMIT_NOFILE is the hard backstop).
-	 * Only getrlimit() is used — setrlimit needs pledge "proc"/"id", which
-	 * we deliberately do not hold; lowering the limit is unnecessary since
-	 * the table cap already keeps us under it.
+	 * Only getrlimit() is used.  A squash viofs holds neither "proc" nor
+	 * "id" so it could not setrlimit anyway; a transparent viofs retains
+	 * "id" (for the per-op seteuid/setegid) and could, but we deliberately
+	 * do not lower the limit — the table cap already keeps us under it.
 	 */
 	maxfids = VIOFS_MAX_FIDS;
 	if (getrlimit(RLIMIT_NOFILE, &rlim) == 0 &&
