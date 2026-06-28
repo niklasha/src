@@ -193,9 +193,28 @@ p9c_puts(struct p9c_enc *e, const char *s, size_t n)
 /*
  * Begin a T-message: reserve the header (size placeholder, type, tag).  The
  * size[0..3] field is patched at submit time once the body length is known.
+ *
+ * M3b extended dialect: when `extended` is set AND this is not Tversion, the
+ * caller identity uid[4] gid[4] is written IMMEDIATELY after the 7-byte header
+ * and BEFORE any type-specific body, so every wrapper that follows simply
+ * appends its body as before.  size[4] is patched from the final encoder
+ * length, so it automatically covers the 8 prefix bytes.  Tversion is sent
+ * before negotiation and never carries the prefix; when `extended` is clear the
+ * layout is byte-identical to M3.
+ *
+ * Wire layout (extended, non-Tversion):
+ *   off 0  size[4]   (patched in p9c_rpc)
+ *   off 4  type[1]
+ *   off 5  tag[2]
+ *   off 7  uid[4]    <-- M3b prefix
+ *   off 11 gid[4]    <-- M3b prefix
+ *   off 15 ... type-specific body ...
+ * Wire layout (plain, or any Tversion):
+ *   off 0  size[4] type[1] tag[2] then body at off 7 (M3-identical).
  */
 static void
-p9c_enc_start(struct p9c_enc *e, uint8_t *buf, size_t cap, uint8_t ttype)
+p9c_enc_start(struct p9c_enc *e, uint8_t *buf, size_t cap, uint8_t ttype,
+    int extended, uint32_t uid, uint32_t gid)
 {
 	e->buf = buf;
 	e->cap = cap;
@@ -204,6 +223,10 @@ p9c_enc_start(struct p9c_enc *e, uint8_t *buf, size_t cap, uint8_t ttype)
 	p9c_put32(e, 0);		/* size placeholder */
 	p9c_put8(e, ttype);
 	p9c_put16(e, P9C_TAG);
+	if (extended && ttype != P9_TVERSION) {
+		p9c_put32(e, uid);	/* M3b caller-identity prefix */
+		p9c_put32(e, gid);
+	}
 }
 
 /* ---- reply cursor (bounds-checked, mirrors viofs.c struct p9_treq) ---- */
@@ -450,13 +473,23 @@ p9c_rpc(struct vio9p_softc *sc, struct p9c_enc *enc, uint8_t rtype,
 }
 
 /*
- * Tversion: propose msize=VIO9P_MSIZE_MAX and version "9P2000.L"; store the
- * server's returned (clamped) msize in sc->sc_msize.  Sent once at mount,
- * before any fid exists (a new Tversion orphans every server fid).
+ * Tversion: propose msize=VIO9P_MSIZE_MAX and the EXTENDED version string
+ * "9P2000.L.appli"; store the server's returned (clamped) msize in
+ * sc->sc_msize.  Sent once at mount, before any fid exists (a new Tversion
+ * orphans every server fid).
  * Tversion[msize[4] version[s]] -> Rversion[msize[4] version[s]].
+ *
+ * M3b negotiation: we propose the extended string.  If the host echoes it
+ * EXACTLY we set sc->sc_extended = 1 and every later T-message carries the
+ * uid[4] gid[4] prefix.  If the host echoes the plain base string "9P2000.L"
+ * we clear sc->sc_extended and behave byte-identically to M3 (squash, no
+ * prefix).  Any other echo is a protocol error (EINVAL).  Tversion itself never
+ * carries the prefix (sc->sc_extended is still 0 here AND p9c_enc_start gates
+ * on type != P9_TVERSION), so the proposal is unprefixed regardless.  uid/gid
+ * are accepted for signature uniformity (the mount-owner sentinel) but unused.
  */
 int
-p9c_version(struct vio9p_softc *sc)
+p9c_version(struct vio9p_softc *sc, uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -467,14 +500,18 @@ p9c_version(struct vio9p_softc *sc)
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TVERSION);
+	/* Renegotiating: drop any stale extended state before proposing. */
+	sc->sc_extended = 0;
+
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TVERSION, 0, uid,
+	    gid);
 	/*
 	 * The proposal must fit the static scratch buffers; the negotiated
 	 * msize bounds every later RPC.  Tversion itself uses NOTAG, but the
 	 * server echoes whatever tag it receives, so P9C_TAG is consistent.
 	 */
 	p9c_put32(&enc, VIO9P_MSIZE_MAX);
-	p9c_puts(&enc, VIO9P_VERSION_STR, strlen(VIO9P_VERSION_STR));
+	p9c_puts(&enc, VIO9P_VERSION_EXT, strlen(VIO9P_VERSION_EXT));
 
 	/*
 	 * sc_msize is the transport's max (VIO9P_MSIZE_MAX) until we lower it
@@ -496,7 +533,18 @@ p9c_version(struct vio9p_softc *sc)
 		error = EIO;
 		goto out;
 	}
-	if (strncmp(ver, VIO9P_VERSION_STR, sizeof(VIO9P_VERSION_STR)) != 0) {
+	/*
+	 * Compare the WHOLE echoed string (strcmp, not strncmp): the extended
+	 * string has the base string as a prefix, so a length-limited compare
+	 * against the base would falsely accept the extended echo as base.
+	 * Extended echo -> extended dialect; base echo -> M3 squash; anything
+	 * else -> EINVAL.
+	 */
+	if (strcmp(ver, VIO9P_VERSION_EXT) == 0)
+		sc->sc_extended = 1;
+	else if (strcmp(ver, VIO9P_VERSION_STR) == 0)
+		sc->sc_extended = 0;
+	else {
 		error = EINVAL;
 		goto out;
 	}
@@ -512,7 +560,8 @@ out:
  * Tattach[fid[4] afid[4] uname[s] aname[s] n_uname[4]] -> Rattach[qid[13]].
  */
 int
-p9c_attach(struct vio9p_softc *sc, uint32_t fid, struct p9_qid *root_qid)
+p9c_attach(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
+    struct p9_qid *root_qid)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -521,7 +570,8 @@ p9c_attach(struct vio9p_softc *sc, uint32_t fid, struct p9_qid *root_qid)
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TATTACH);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TATTACH,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put32(&enc, P9_NOFID);		/* afid: no auth */
 	p9c_puts(&enc, "", 0);			/* uname (squashed) */
@@ -548,7 +598,7 @@ out:
  * Tclunk[fid[4]] -> Rclunk[] (header only).
  */
 int
-p9c_clunk(struct vio9p_softc *sc, uint32_t fid)
+p9c_clunk(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
 	size_t rxlen = 0;
@@ -556,7 +606,8 @@ p9c_clunk(struct vio9p_softc *sc, uint32_t fid)
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TCLUNK);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TCLUNK,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 
 	error = p9c_rpc(sc, &enc, P9_RCLUNK, p9c_rxbuf, sizeof(p9c_rxbuf),
@@ -577,7 +628,8 @@ p9c_clunk(struct vio9p_softc *sc, uint32_t fid)
  *            btime_nsec[8] gen[8] data_version[8]].
  */
 int
-p9c_getattr(struct vio9p_softc *sc, uint32_t fid, struct p9_attr *a)
+p9c_getattr(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
+    struct p9_attr *a)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -586,7 +638,8 @@ p9c_getattr(struct vio9p_softc *sc, uint32_t fid, struct p9_attr *a)
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TGETATTR);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TGETATTR,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put64(&enc, P9_GETATTR_BASIC);	/* request_mask */
 
@@ -629,7 +682,8 @@ out:
  *           fsid[8] namelen[4]].
  */
 int
-p9c_statfs(struct vio9p_softc *sc, uint32_t fid, struct p9_statfs *s)
+p9c_statfs(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
+    struct p9_statfs *s)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -638,7 +692,8 @@ p9c_statfs(struct vio9p_softc *sc, uint32_t fid, struct p9_statfs *s)
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSTATFS);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSTATFS,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 
 	error = p9c_rpc(sc, &enc, P9_RSTATFS, p9c_rxbuf, sizeof(p9c_rxbuf),
@@ -692,7 +747,8 @@ out:
  */
 int
 p9c_walk(struct vio9p_softc *sc, uint32_t fid, uint32_t newfid,
-    const char *name, struct p9_qid *wqid, int *nwqid)
+    const char *name, uint32_t uid, uint32_t gid, struct p9_qid *wqid,
+    int *nwqid)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -706,7 +762,8 @@ p9c_walk(struct vio9p_softc *sc, uint32_t fid, uint32_t newfid,
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TWALK);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TWALK,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put32(&enc, newfid);
 	p9c_put16(&enc, nwname);
@@ -762,8 +819,8 @@ out:
  * "use msize" (viofs.c:1122) -- the caller falls back to vm_iomax.
  */
 int
-p9c_lopen(struct vio9p_softc *sc, uint32_t fid, uint32_t flags,
-    uint32_t *iounit)
+p9c_lopen(struct vio9p_softc *sc, uint32_t fid, uint32_t flags, uint32_t uid,
+    uint32_t gid, uint32_t *iounit)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -774,7 +831,8 @@ p9c_lopen(struct vio9p_softc *sc, uint32_t fid, uint32_t flags,
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLOPEN);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLOPEN,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put32(&enc, flags);
 
@@ -808,7 +866,7 @@ out:
  */
 int
 p9c_read(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
-    uint32_t len, uint32_t *got)
+    uint32_t len, uint32_t uid, uint32_t gid, uint32_t *got)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -818,13 +876,20 @@ p9c_read(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
 
 	*got = 0;
 
+	/*
+	 * count bounds the REPLY (Rread count[4] data[count]); the reply never
+	 * carries the M3b prefix, so the read budget is unchanged by extended
+	 * mode.  The 8-byte prefix only grows the (tiny) Tread request, which
+	 * stays far below msize.
+	 */
 	count = len;
 	if (count > sc->sc_msize - P9_READ_IOHDRSZ)
 		count = sc->sc_msize - P9_READ_IOHDRSZ;
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TREAD);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TREAD,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put64(&enc, off);
 	p9c_put32(&enc, count);
@@ -864,7 +929,7 @@ out:
  */
 int
 p9c_readdir(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
-    uint32_t len, uint32_t *got)
+    uint32_t len, uint32_t uid, uint32_t gid, uint32_t *got)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -874,13 +939,15 @@ p9c_readdir(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
 
 	*got = 0;
 
+	/* As p9c_read: the reply carries no prefix, so the budget is unchanged. */
 	count = len;
 	if (count > sc->sc_msize - P9_READ_IOHDRSZ)
 		count = sc->sc_msize - P9_READ_IOHDRSZ;
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TREADDIR);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TREADDIR,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put64(&enc, off);
 	p9c_put32(&enc, count);
@@ -918,8 +985,8 @@ out:
  *   Treadlink[fid[4]] -> Rreadlink[target[s]].
  */
 int
-p9c_readlink(struct vio9p_softc *sc, uint32_t fid, char *buf, size_t bufsz,
-    size_t *lenp)
+p9c_readlink(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
+    char *buf, size_t bufsz, size_t *lenp)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -931,7 +998,8 @@ p9c_readlink(struct vio9p_softc *sc, uint32_t fid, char *buf, size_t bufsz,
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TREADLINK);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TREADLINK,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 
 	error = p9c_rpc(sc, &enc, P9_RREADLINK, p9c_rxbuf, sizeof(p9c_rxbuf),
@@ -964,25 +1032,42 @@ out:
  *   Twrite[fid[4] offset[8] count[4] data[count]] -> Rwrite[count[4]].
  */
 #define P9_WRITE_HDR	(P9_HDRLEN + 4 + 8 + 4)	/* hdr+fid+offset+count = 23 */
+/* M3b: the uid[4] gid[4] prefix sits between the header and the body. */
+#define P9_EXT_PREFIX	(4 + 4)			/* uid+gid = 8 */
 int
 p9c_write(struct vio9p_softc *sc, uint32_t fid, uint64_t off, const void *buf,
-    uint32_t len, uint32_t *put)
+    uint32_t len, uint32_t uid, uint32_t gid, uint32_t *put)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
-	uint32_t count, n;
+	uint32_t count, n, hdr;
 	int error;
 
 	*put = 0;
 
+	/*
+	 * The Twrite REQUEST carries the data, so unlike Tread its budget must
+	 * account for the M3b prefix: in extended mode the header before the
+	 * data is P9_WRITE_HDR + 8, so the writable payload is msize - 31.  The
+	 * vnops layer already sizes its chunks by vm_womax, which vio9p_mount
+	 * lowered by P9_EXT_PREFIX on an extended mount, so `want` never exceeds
+	 * this clamp and put == want holds (the single-write-caller contract cp
+	 * relies on is preserved).  This clamp is therefore defensive: it also
+	 * guarantees the framed message never exceeds msize even if a caller
+	 * over-asks.
+	 */
+	hdr = P9_WRITE_HDR;
+	if (sc->sc_extended)
+		hdr += P9_EXT_PREFIX;
 	count = len;
-	if (count > sc->sc_msize - P9_WRITE_HDR)
-		count = sc->sc_msize - P9_WRITE_HDR;
+	if (count > sc->sc_msize - hdr)
+		count = sc->sc_msize - hdr;
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TWRITE);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TWRITE,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put64(&enc, off);
 	p9c_put32(&enc, count);
@@ -1026,11 +1111,13 @@ out:
  * untouched), so the caller MUST p9c_clunk(fid) before returning it to the
  * pool -- it is not implicitly freed (FIX D4).
  *   Tlcreate[fid[4] name[s] flags[4] mode[4] gid[4]] -> Rlcreate[qid[13] iounit[4]].
+ * M3b: `cgid` is the BODY gid[4] (the group of the new file); `uid`/`gid` are
+ * the M3b caller-identity prefix (the squash sentinel in squash mode).
  */
 int
 p9c_lcreate(struct vio9p_softc *sc, uint32_t fid, const char *name,
-    uint32_t flags, uint32_t mode, uint32_t gid, struct p9_qid *qid,
-    uint32_t *iounit)
+    uint32_t flags, uint32_t mode, uint32_t cgid, uint32_t uid, uint32_t gid,
+    struct p9_qid *qid, uint32_t *iounit)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -1040,12 +1127,13 @@ p9c_lcreate(struct vio9p_softc *sc, uint32_t fid, const char *name,
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLCREATE);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLCREATE,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_puts(&enc, name, strlen(name));
 	p9c_put32(&enc, flags);
 	p9c_put32(&enc, mode);
-	p9c_put32(&enc, gid);
+	p9c_put32(&enc, cgid);		/* Tlcreate body gid (group of new file) */
 
 	error = p9c_rpc(sc, &enc, P9_RLCREATE, p9c_rxbuf, sizeof(p9c_rxbuf),
 	    &rxlen);
@@ -1071,10 +1159,13 @@ out:
  * Unlike Tlcreate the fid is NOT replaced; only the new qid comes back.  The
  * caller then Twalk-clones a fresh fid for the child vnode (lookup-after-create).
  *   Tmkdir[dfid[4] name[s] mode[4] gid[4]] -> Rmkdir[qid[13]].
+ * M3b: `cgid` is the BODY gid[4] (group of the new dir); `uid`/`gid` are the
+ * M3b caller-identity prefix (the squash sentinel in squash mode).
  */
 int
 p9c_mkdir(struct vio9p_softc *sc, uint32_t dfid, const char *name,
-    uint32_t mode, uint32_t gid, struct p9_qid *qid)
+    uint32_t mode, uint32_t cgid, uint32_t uid, uint32_t gid,
+    struct p9_qid *qid)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -1083,11 +1174,12 @@ p9c_mkdir(struct vio9p_softc *sc, uint32_t dfid, const char *name,
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TMKDIR);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TMKDIR,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, dfid);
 	p9c_puts(&enc, name, strlen(name));
 	p9c_put32(&enc, mode);
-	p9c_put32(&enc, gid);
+	p9c_put32(&enc, cgid);		/* Tmkdir body gid (group of new dir) */
 
 	error = p9c_rpc(sc, &enc, P9_RMKDIR, p9c_rxbuf, sizeof(p9c_rxbuf),
 	    &rxlen);
@@ -1110,7 +1202,7 @@ out:
  */
 int
 p9c_unlinkat(struct vio9p_softc *sc, uint32_t dfid, const char *name,
-    uint32_t flags)
+    uint32_t flags, uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
 	size_t rxlen = 0;
@@ -1118,7 +1210,8 @@ p9c_unlinkat(struct vio9p_softc *sc, uint32_t dfid, const char *name,
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TUNLINKAT);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TUNLINKAT,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, dfid);
 	p9c_puts(&enc, name, strlen(name));
 	p9c_put32(&enc, flags);
@@ -1136,11 +1229,14 @@ p9c_unlinkat(struct vio9p_softc *sc, uint32_t dfid, const char *name,
  * (the server ignores uid/gid in squash).  Rsetattr is header-only.
  *   Tsetattr[fid[4] valid[4] mode[4] uid[4] gid[4] size[8]
  *            atime_sec[8] atime_nsec[8] mtime_sec[8] mtime_nsec[8]] -> Rsetattr[].
+ * M3b: the body uid/gid are the target owner (only honored if valid selects
+ * them -- never in squash); cuid/cgid are the M3b caller-identity prefix.
  */
 int
 p9c_setattr(struct vio9p_softc *sc, uint32_t fid, uint32_t valid, uint32_t mode,
     uint32_t uid, uint32_t gid, uint64_t size, int64_t atime_sec,
-    int64_t atime_nsec, int64_t mtime_sec, int64_t mtime_nsec)
+    int64_t atime_nsec, int64_t mtime_sec, int64_t mtime_nsec, uint32_t cuid,
+    uint32_t cgid)
 {
 	struct p9c_enc enc;
 	size_t rxlen = 0;
@@ -1148,7 +1244,8 @@ p9c_setattr(struct vio9p_softc *sc, uint32_t fid, uint32_t valid, uint32_t mode,
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSETATTR);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSETATTR,
+	    sc->sc_extended, cuid, cgid);
 	p9c_put32(&enc, fid);
 	p9c_put32(&enc, valid);
 	p9c_put32(&enc, mode);
@@ -1182,7 +1279,7 @@ p9c_setattr(struct vio9p_softc *sc, uint32_t fid, uint32_t valid, uint32_t mode,
  */
 int
 p9c_renameat(struct vio9p_softc *sc, uint32_t olddirfid, const char *oldname,
-    uint32_t newdirfid, const char *newname)
+    uint32_t newdirfid, const char *newname, uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
 	size_t rxlen = 0;
@@ -1190,7 +1287,8 @@ p9c_renameat(struct vio9p_softc *sc, uint32_t olddirfid, const char *oldname,
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TRENAMEAT);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TRENAMEAT,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, olddirfid);
 	p9c_puts(&enc, oldname, strlen(oldname));
 	p9c_put32(&enc, newdirfid);
@@ -1208,10 +1306,13 @@ p9c_renameat(struct vio9p_softc *sc, uint32_t olddirfid, const char *oldname,
  * verbatim -- NFS model, the guest resolves on read).  *qid receives the new
  * link's qid.  The caller Twalk-clones a fresh fid for the child afterward.
  *   Tsymlink[dfid[4] name[s] target[s] gid[4]] -> Rsymlink[qid[13]].
+ * M3b: `cgid` is the BODY gid[4] (group of the new link); `uid`/`gid` are the
+ * M3b caller-identity prefix (the squash sentinel in squash mode).
  */
 int
 p9c_symlink(struct vio9p_softc *sc, uint32_t dfid, const char *name,
-    const char *target, uint32_t gid, struct p9_qid *qid)
+    const char *target, uint32_t cgid, uint32_t uid, uint32_t gid,
+    struct p9_qid *qid)
 {
 	struct p9c_enc enc;
 	struct p9c_dec dec;
@@ -1220,11 +1321,12 @@ p9c_symlink(struct vio9p_softc *sc, uint32_t dfid, const char *name,
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSYMLINK);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSYMLINK,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, dfid);
 	p9c_puts(&enc, name, strlen(name));
 	p9c_puts(&enc, target, strlen(target));
-	p9c_put32(&enc, gid);
+	p9c_put32(&enc, cgid);		/* Tsymlink body gid (group of new link) */
 
 	error = p9c_rpc(sc, &enc, P9_RSYMLINK, p9c_rxbuf, sizeof(p9c_rxbuf),
 	    &rxlen);
@@ -1248,7 +1350,8 @@ out:
  *   Tlink[dfid[4] fid[4] name[s]] -> Rlink[].
  */
 int
-p9c_link(struct vio9p_softc *sc, uint32_t dfid, uint32_t fid, const char *name)
+p9c_link(struct vio9p_softc *sc, uint32_t dfid, uint32_t fid, const char *name,
+    uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
 	size_t rxlen = 0;
@@ -1256,7 +1359,8 @@ p9c_link(struct vio9p_softc *sc, uint32_t dfid, uint32_t fid, const char *name)
 
 	rw_enter_write(&p9c_lock);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLINK);
+	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLINK,
+	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, dfid);
 	p9c_put32(&enc, fid);
 	p9c_puts(&enc, name, strlen(name));
