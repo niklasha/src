@@ -41,6 +41,16 @@ struct vio9p_softc {
 	char			 sc_tag[VIO9P_TAG_MAX + 1];
 	uint16_t		 sc_taglen;
 	uint32_t		 sc_msize;	/* negotiated by Tversion */
+	/*
+	 * M3b: set by p9c_version iff the host echoed the extended version
+	 * string ("9P2000.L.appli").  When set, every T-message except Tversion
+	 * carries a uid[4] gid[4] caller-identity prefix right after the 7-byte
+	 * header (see miscfs/vio9p/vio9p.h).  This lives on the transport softc
+	 * (not the per-mount vio9p_mnt) because the 9P encoder p9c_enc_start
+	 * reaches it via the softc the wrapper already holds; there is one 9P
+	 * session per transport, so one negotiated flag per softc is correct.
+	 */
+	int			 sc_extended;	/* extended dialect negotiated */
 
 	uint8_t			*sc_tbuf;	/* request (device-readable) */
 	uint8_t			*sc_rbuf;	/* reply   (device-writable) */

@@ -126,6 +126,18 @@
 #define P9_AT_REMOVEDIR		0x200
 
 #define VIO9P_VERSION_STR "9P2000.L"
+/*
+ * M3b: the appli extended dialect.  When BOTH ends agree on this version string
+ * in the Tversion/Rversion exchange, every T-message EXCEPT Tversion carries,
+ * immediately after the 7-byte header (size[4] type[1] tag[2]) and BEFORE the
+ * type-specific body, the caller identity as two little-endian uint32 fields:
+ * uid[4] then gid[4].  R-messages never carry it; Tversion never carries it (it
+ * is sent before negotiation).  size[4] (the whole message length) includes the
+ * 8 prefix bytes automatically because it is computed from the encoder length.
+ * When the server is plain "9P2000.L" the prefix is NOT emitted and behavior is
+ * byte-identical to M3 (squash).
+ */
+#define VIO9P_VERSION_EXT "9P2000.L.appli"
 #define VIO9P_FID_ROOT	0		/* attach-root fid */
 #define VIO9P_MAX_FIDS	1024		/* = VIOFS_MAX_FIDS (viofs.c:171) */
 #define VIO9P_NOFID	0xffffffffU
@@ -185,6 +197,15 @@ struct vio9p_mnt {
 	int			 vm_rdonly;	/* legacy; see vm_rw */
 	int			 vm_rw;		/* M3: write ops permitted */
 	gid_t			 vm_owner_gid;	/* squash gid for create/mkdir */
+	/*
+	 * M3b: the mount owner identity, captured from the mounting process's
+	 * cred at mount time.  This is the SENTINEL uid/gid threaded into every
+	 * cred-less p9c_* wrapper (version, attach, statfs-at-mount, the
+	 * reclaim/redundant clunk) so the extended uid/gid prefix is always a
+	 * coherent identity; under squash the host ignores it.  vm_owner_gid is
+	 * the gid half (kept for the create/mkdir gid argument too).
+	 */
+	uid_t			 vm_owner_uid;	/* sentinel uid (mount owner) */
 };
 #define VFSTOVIO9P(mp)	((struct vio9p_mnt *)((mp)->mnt_data))
 
@@ -200,45 +221,67 @@ struct vio9p_node {
 	uint8_t			 n_qtype;	/* P9_QT* -> v_type */
 	uint32_t		 n_fid;		/* owned fid; VIO9P_NOFID=none */
 	uint8_t			 n_fid_opened;	/* Tlopen issued? */
+	uint8_t			 n_fid_write;	/* fid opened RDWR (vs RDONLY)? */
 	uint64_t		 n_dir_off;	/* readdir cookie */
 	off_t			 n_size;
 	struct rrwlock		 n_lock;
 };
 #define VTON(vp)	((struct vio9p_node *)(vp)->v_data)
 
-/* ---- 9P client API (vio9p_client.c) ---- */
-int	p9c_version(struct vio9p_softc *);
-int	p9c_attach(struct vio9p_softc *, uint32_t, struct p9_qid *);
-int	p9c_clunk(struct vio9p_softc *, uint32_t);
-int	p9c_getattr(struct vio9p_softc *, uint32_t, struct p9_attr *);
-int	p9c_statfs(struct vio9p_softc *, uint32_t, struct p9_statfs *);
+/*
+ * ---- 9P client API (vio9p_client.c) ----
+ *
+ * M3b: every wrapper takes a trailing (uint32_t uid, uint32_t gid) caller
+ * identity.  When the extended dialect is negotiated (sc->sc_extended), p9c_rpc
+ * threads it into p9c_enc_start, which emits it as the uid[4] gid[4] prefix on
+ * every T-message except Tversion; when it is NOT negotiated the identity is
+ * ignored and no prefix is emitted (byte-identical to M3).  User-issued VOPs
+ * pass cred->cr_uid/cr_gid; cred-less wrappers (version, attach, the
+ * reclaim/redundant clunk, statfs at mount) pass the mount-owner sentinel
+ * (vm_owner_uid/vm_owner_gid).  p9c_version is special: it is sent BEFORE
+ * negotiation so it never emits the prefix, but it still takes the sentinel for
+ * signature uniformity.
+ */
+int	p9c_version(struct vio9p_softc *, uint32_t, uint32_t);
+int	p9c_attach(struct vio9p_softc *, uint32_t, uint32_t, uint32_t,
+	    struct p9_qid *);
+int	p9c_clunk(struct vio9p_softc *, uint32_t, uint32_t, uint32_t);
+int	p9c_getattr(struct vio9p_softc *, uint32_t, uint32_t, uint32_t,
+	    struct p9_attr *);
+int	p9c_statfs(struct vio9p_softc *, uint32_t, uint32_t, uint32_t,
+	    struct p9_statfs *);
 int	p9c_errno(uint32_t);
 
 /* M2c: the file-I/O ops */
 int	p9c_walk(struct vio9p_softc *, uint32_t, uint32_t, const char *,
-	    struct p9_qid *, int *);
-int	p9c_lopen(struct vio9p_softc *, uint32_t, uint32_t, uint32_t *);
+	    uint32_t, uint32_t, struct p9_qid *, int *);
+int	p9c_lopen(struct vio9p_softc *, uint32_t, uint32_t, uint32_t, uint32_t,
+	    uint32_t *);
 int	p9c_read(struct vio9p_softc *, uint32_t, uint64_t, void *, uint32_t,
-	    uint32_t *);
+	    uint32_t, uint32_t, uint32_t *);
 int	p9c_readdir(struct vio9p_softc *, uint32_t, uint64_t, void *, uint32_t,
-	    uint32_t *);
-int	p9c_readlink(struct vio9p_softc *, uint32_t, char *, size_t, size_t *);
+	    uint32_t, uint32_t, uint32_t *);
+int	p9c_readlink(struct vio9p_softc *, uint32_t, uint32_t, uint32_t, char *,
+	    size_t, size_t *);
 
 /* M3: the write/mutate ops (mirror the host p9_* write handlers) */
 int	p9c_write(struct vio9p_softc *, uint32_t, uint64_t, const void *,
-	    uint32_t, uint32_t *);
+	    uint32_t, uint32_t, uint32_t, uint32_t *);
 int	p9c_lcreate(struct vio9p_softc *, uint32_t, const char *, uint32_t,
-	    uint32_t, uint32_t, struct p9_qid *, uint32_t *);
+	    uint32_t, uint32_t, uint32_t, uint32_t, struct p9_qid *, uint32_t *);
 int	p9c_mkdir(struct vio9p_softc *, uint32_t, const char *, uint32_t,
-	    uint32_t, struct p9_qid *);
-int	p9c_unlinkat(struct vio9p_softc *, uint32_t, const char *, uint32_t);
+	    uint32_t, uint32_t, uint32_t, struct p9_qid *);
+int	p9c_unlinkat(struct vio9p_softc *, uint32_t, const char *, uint32_t,
+	    uint32_t, uint32_t);
 int	p9c_setattr(struct vio9p_softc *, uint32_t, uint32_t, uint32_t,
-	    uint32_t, uint32_t, uint64_t, int64_t, int64_t, int64_t, int64_t);
+	    uint32_t, uint32_t, uint64_t, int64_t, int64_t, int64_t, int64_t,
+	    uint32_t, uint32_t);
 int	p9c_renameat(struct vio9p_softc *, uint32_t, const char *, uint32_t,
-	    const char *);
+	    const char *, uint32_t, uint32_t);
 int	p9c_symlink(struct vio9p_softc *, uint32_t, const char *,
-	    const char *, uint32_t, struct p9_qid *);
-int	p9c_link(struct vio9p_softc *, uint32_t, uint32_t, const char *);
+	    const char *, uint32_t, uint32_t, uint32_t, struct p9_qid *);
+int	p9c_link(struct vio9p_softc *, uint32_t, uint32_t, const char *,
+	    uint32_t, uint32_t);
 
 /* fid pool (vio9p_node.c) */
 uint32_t vio9p_fid_alloc(struct vio9p_mnt *);

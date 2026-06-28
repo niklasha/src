@@ -129,21 +129,47 @@ vio9p_mount(struct mount *mp, const char *path, void *data,
 	vmp->vm_rdonly = vmp->vm_rw ? 0 : 1;
 	if (!vmp->vm_rw)
 		mp->mnt_flag |= MNT_RDONLY;	/* belt: VFS-level RO wall */
-	vmp->vm_owner_gid = 0;			/* host owns identity (squash) */
+
+	/*
+	 * M3b: capture the mounting process's identity as the SENTINEL uid/gid.
+	 * In squash mode the host ignores it; under the extended dialect it is
+	 * the caller identity emitted on every cred-less RPC (version, attach,
+	 * statfs-at-mount, the reclaim/redundant clunk) so the wire prefix is
+	 * always a coherent identity.  vm_owner_gid doubles as the squash group
+	 * for the create/mkdir/symlink BODY gid -- using the mount owner's gid
+	 * keeps the body gid and the cred-less prefix gid consistent.
+	 */
+	vmp->vm_owner_uid = p->p_ucred->cr_uid;
+	vmp->vm_owner_gid = p->p_ucred->cr_gid;
 
 	/*
 	 * 9P session bring-up.  Unlike fuse, the server is the host (not the
 	 * mounting process), so it is safe to block on the virtqueue here.
+	 * p9c_version negotiates the dialect: if the host echoes the extended
+	 * version string it sets sc->sc_extended and every later RPC carries the
+	 * uid[4] gid[4] prefix.  Pass the sentinel for signature uniformity
+	 * (Tversion itself never emits the prefix).
 	 */
-	error = p9c_version(sc);
+	error = p9c_version(sc, vmp->vm_owner_uid, vmp->vm_owner_gid);
 	if (error != 0)
 		goto bad;
 	vmp->vm_msize = sc->sc_msize;
 	vmp->vm_iomax = sc->sc_msize - P9_READ_IOHDRSZ;
 	vmp->vm_womax = sc->sc_msize - P9_WRITE_IOHDRSZ;
+	/*
+	 * On an extended mount the Twrite request also carries the 8-byte
+	 * uid/gid prefix, so the writable payload per Twrite shrinks by 8.
+	 * Lower vm_womax accordingly so vio9p_write's chunks still satisfy
+	 * "put == want" (no spurious short VOP_WRITE -- the cp single-write
+	 * contract).  The read budget (vm_iomax) is unaffected: Rread carries
+	 * no prefix.
+	 */
+	if (sc->sc_extended)
+		vmp->vm_womax -= (4 + 4);
 	vmp->vm_rootfid = VIO9P_FID_ROOT;
 
-	error = p9c_attach(sc, vmp->vm_rootfid, &vmp->vm_rootqid);
+	error = p9c_attach(sc, vmp->vm_rootfid, vmp->vm_owner_uid,
+	    vmp->vm_owner_gid, &vmp->vm_rootqid);
 	if (error != 0)
 		goto bad;
 	vmp->vm_rootpath = vmp->vm_rootqid.path;
@@ -192,8 +218,12 @@ vio9p_unmount(struct mount *mp, int mntflags, struct proc *p)
 	if (error != 0)
 		return (error);
 
-	/* Swallow the error: the host may already have torn the session down. */
-	(void)p9c_clunk(vmp->vm_sc, vmp->vm_rootfid);
+	/*
+	 * Swallow the error: the host may already have torn the session down.
+	 * Cred-less clunk -> the mount-owner sentinel identity (M3b).
+	 */
+	(void)p9c_clunk(vmp->vm_sc, vmp->vm_rootfid, vmp->vm_owner_uid,
+	    vmp->vm_owner_gid);
 
 	free(vmp, M_MISCFSMNT, sizeof(*vmp));
 	mp->mnt_data = NULL;
@@ -247,7 +277,9 @@ vio9p_statfs(struct mount *mp, struct statfs *sbp, struct proc *p)
 
 	copy_statfs_info(sbp, mp);
 
-	error = p9c_statfs(vmp->vm_sc, vmp->vm_rootfid, &s);
+	/* statfs at the root has no user cred -> mount-owner sentinel (M3b). */
+	error = p9c_statfs(vmp->vm_sc, vmp->vm_rootfid, vmp->vm_owner_uid,
+	    vmp->vm_owner_gid, &s);
 	if (error != 0) {
 		sbp->f_bsize = 0;
 		sbp->f_iosize = 0;
