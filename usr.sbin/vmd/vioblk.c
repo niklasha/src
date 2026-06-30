@@ -42,6 +42,7 @@ static int vioblk_write(struct virtio_dev *, struct viodev_msg *);
 static uint32_t vioblk_dev_read(struct virtio_dev *, struct viodev_msg *);
 
 static int vioblk_notifyq(struct virtio_dev *, uint16_t);
+static int vioblk_flush(struct vioblk_dev *);
 static ssize_t vioblk_io(struct vioblk_dev *, struct virtio_vq_info *, int,
     off_t, struct vring_desc *, struct vring_desc **);
 
@@ -243,6 +244,29 @@ vioblk_cmd_name(uint32_t type)
 }
 
 /*
+ * Flush the backing store(s) to stable storage for a guest
+ * VIRTIO_BLK_T_FLUSH command (negotiated via VIRTIO_BLK_F_FLUSH).
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int
+vioblk_flush(struct vioblk_dev *dev)
+{
+	int i;
+
+	for (i = 0; i < dev->ndisk_fd; i++) {
+		if (dev->disk_fd[i] == -1)
+			continue;
+		if (fdatasync(dev->disk_fd[i]) == -1) {
+			log_warn("%s: fdatasync of disk fd %d failed",
+			    __func__, dev->disk_fd[i]);
+			return (-1);
+		}
+	}
+	return (0);
+}
+
+/*
  * Process virtqueue notifications. If an unrecoverable error occurs, puts
  * device into a "needs reset" state.
  *
@@ -330,6 +354,20 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 			sz = vioblk_io(vioblk, vq_info, is_write, offset, table,
 			    &desc);
 			if (sz == -1)
+				ds = VIRTIO_BLK_S_IOERR;
+			else
+				ds = VIRTIO_BLK_S_OK;
+			break;
+		case VIRTIO_BLK_T_FLUSH:
+		case VIRTIO_BLK_T_FLUSH_OUT:
+			/*
+			 * Flush (negotiated via VIRTIO_BLK_F_FLUSH). The guest
+			 * issues this on fsync(2)/sync; honor it as a real
+			 * fdatasync of the backing store(s). Without it a guest
+			 * fsync would silently leave data only in the host
+			 * buffer cache.
+			 */
+			if (vioblk_flush(vioblk) == -1)
 				ds = VIRTIO_BLK_S_IOERR;
 			else
 				ds = VIRTIO_BLK_S_OK;
