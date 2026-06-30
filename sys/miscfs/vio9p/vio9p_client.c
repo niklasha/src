@@ -75,9 +75,6 @@
  * serializes per softc, but the buffers below are shared across every mount/
  * softc, so a dedicated lock guards the framing-to-parse window.
  */
-static uint8_t		p9c_txbuf[VIO9P_MSIZE_MAX];
-static uint8_t		p9c_rxbuf[VIO9P_MSIZE_MAX];
-static struct rwlock	p9c_lock = RWLOCK_INITIALIZER("vio9prpc");
 
 /* The single tag used by the steady-state single-outstanding model. */
 #define P9C_TAG		0
@@ -424,10 +421,11 @@ p9c_errno(uint32_t lerr)
  *   - the type is the expected R-type, or P9_RLERROR (translated), else EIO.
  */
 static int
-p9c_rpc(struct vio9p_softc *sc, struct p9c_enc *enc, uint8_t rtype,
-    uint8_t *rxbuf, size_t rxcap, size_t *rxlenp)
+p9c_rpc(struct vio9p_softc *sc, struct vio9p_req *req, struct p9c_enc *enc,
+    uint8_t rtype, size_t *rxlenp)
 {
 	struct p9c_dec dec;
+	uint8_t *rxbuf = req->req_rbuf;
 	size_t rxlen = 0;
 	uint32_t declared, ecode;
 	uint16_t tag;
@@ -437,13 +435,18 @@ p9c_rpc(struct vio9p_softc *sc, struct p9c_enc *enc, uint8_t rtype,
 	if (enc->err)
 		return (EIO);
 
-	/* Patch the framed size now that the body length is final. */
+	/*
+	 * Patch the framed size and the per-request tag now that the body is
+	 * final.  The tag (= the request context's pool index) is unique among
+	 * the requests in flight, so the reply demultiplexes correctly.
+	 */
 	put_le32(&enc->buf[0], (uint32_t)enc->len);
+	put_le16(&enc->buf[5], req->req_tag);
 
 	if (enc->len < P9_HDRLEN || enc->len > sc->sc_msize)
 		return (EIO);
 
-	error = vio9p_submit(sc, enc->buf, enc->len, rxbuf, rxcap, &rxlen);
+	error = vio9p_rpc(sc, req, enc->len, &rxlen);
 	if (error != 0)
 		return (error);
 
@@ -455,7 +458,7 @@ p9c_rpc(struct vio9p_softc *sc, struct p9c_enc *enc, uint8_t rtype,
 		return (EIO);
 	type = rxbuf[4];
 	tag = get_le16(&rxbuf[5]);
-	if (tag != P9C_TAG)
+	if (tag != req->req_tag)
 		return (EIO);
 
 	if (type == P9_RLERROR) {
@@ -492,18 +495,19 @@ int
 p9c_version(struct vio9p_softc *sc, uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	char ver[32];
 	size_t rxlen = 0;
 	uint32_t msize;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
 	/* Renegotiating: drop any stale extended state before proposing. */
 	sc->sc_extended = 0;
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TVERSION, 0, uid,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TVERSION, 0, uid,
 	    gid);
 	/*
 	 * The proposal must fit the static scratch buffers; the negotiated
@@ -517,12 +521,12 @@ p9c_version(struct vio9p_softc *sc, uint32_t uid, uint32_t gid)
 	 * sc_msize is the transport's max (VIO9P_MSIZE_MAX) until we lower it
 	 * below, so p9c_rpc's size bound holds for this first exchange.
 	 */
-	error = p9c_rpc(sc, &enc, P9_RVERSION, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RVERSION,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	msize = p9c_get32(&dec);
 	p9c_gets(&dec, ver, sizeof(ver));
 	if (dec.err) {
@@ -550,7 +554,7 @@ p9c_version(struct vio9p_softc *sc, uint32_t uid, uint32_t gid)
 	}
 	sc->sc_msize = msize;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -564,13 +568,14 @@ p9c_attach(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
     struct p9_qid *root_qid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TATTACH,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TATTACH,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put32(&enc, P9_NOFID);		/* afid: no auth */
@@ -578,17 +583,17 @@ p9c_attach(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
 	p9c_puts(&enc, "", 0);			/* aname (root fixed) */
 	p9c_put32(&enc, P9_NOFID);		/* n_uname */
 
-	error = p9c_rpc(sc, &enc, P9_RATTACH, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RATTACH,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	p9c_getqid(&dec, root_qid);
 	if (dec.err)
 		error = EIO;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -601,19 +606,20 @@ int
 p9c_clunk(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TCLUNK,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TCLUNK,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 
-	error = p9c_rpc(sc, &enc, P9_RCLUNK, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RCLUNK,
 	    &rxlen);
 
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -632,23 +638,24 @@ p9c_getattr(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
     struct p9_attr *a)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TGETATTR,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TGETATTR,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put64(&enc, P9_GETATTR_BASIC);	/* request_mask */
 
-	error = p9c_rpc(sc, &enc, P9_RGETATTR, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RGETATTR,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	(void)p9c_get64(&dec);			/* valid mask (ignored) */
 	p9c_getqid(&dec, &a->qid);
 	a->mode = p9c_get32(&dec);
@@ -669,7 +676,7 @@ p9c_getattr(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
 	if (dec.err)
 		error = EIO;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -686,22 +693,23 @@ p9c_statfs(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
     struct p9_statfs *s)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSTATFS,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TSTATFS,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 
-	error = p9c_rpc(sc, &enc, P9_RSTATFS, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RSTATFS,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	s->type = p9c_get32(&dec);
 	s->bsize = p9c_get32(&dec);
 	s->blocks = p9c_get64(&dec);
@@ -714,7 +722,7 @@ p9c_statfs(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
 	if (dec.err)
 		error = EIO;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -751,6 +759,7 @@ p9c_walk(struct vio9p_softc *sc, uint32_t fid, uint32_t newfid,
     int *nwqid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	struct p9_qid q;
 	size_t rxlen = 0;
@@ -760,9 +769,9 @@ p9c_walk(struct vio9p_softc *sc, uint32_t fid, uint32_t newfid,
 	nwname = (name != NULL) ? 1 : 0;
 	*nwqid = 0;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TWALK,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TWALK,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put32(&enc, newfid);
@@ -770,12 +779,12 @@ p9c_walk(struct vio9p_softc *sc, uint32_t fid, uint32_t newfid,
 	if (nwname == 1)
 		p9c_puts(&enc, name, strlen(name));
 
-	error = p9c_rpc(sc, &enc, P9_RWALK, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RWALK,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	nwq = p9c_get16(&dec);
 	if (dec.err || nwq > P9_MAXWELEM) {
 		error = EIO;
@@ -803,7 +812,7 @@ p9c_walk(struct vio9p_softc *sc, uint32_t fid, uint32_t newfid,
 		*wqid = q;
 	*nwqid = nwq;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -823,25 +832,26 @@ p9c_lopen(struct vio9p_softc *sc, uint32_t fid, uint32_t flags, uint32_t uid,
     uint32_t gid, uint32_t *iounit)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	struct p9_qid q;
 	size_t rxlen = 0;
 	uint32_t iu;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLOPEN,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TLOPEN,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put32(&enc, flags);
 
-	error = p9c_rpc(sc, &enc, P9_RLOPEN, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RLOPEN,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	p9c_getqid(&dec, &q);			/* qid (cached elsewhere) */
 	iu = p9c_get32(&dec);
 	if (dec.err) {
@@ -851,7 +861,7 @@ p9c_lopen(struct vio9p_softc *sc, uint32_t fid, uint32_t flags, uint32_t uid,
 	if (iounit != NULL)
 		*iounit = iu;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -869,6 +879,7 @@ p9c_read(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
     uint32_t len, uint32_t uid, uint32_t gid, uint32_t *got)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	uint32_t count, n;
@@ -886,20 +897,20 @@ p9c_read(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
 	if (count > sc->sc_msize - P9_READ_IOHDRSZ)
 		count = sc->sc_msize - P9_READ_IOHDRSZ;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TREAD,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TREAD,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put64(&enc, off);
 	p9c_put32(&enc, count);
 
-	error = p9c_rpc(sc, &enc, P9_RREAD, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RREAD,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	n = p9c_get32(&dec);
 	if (dec.err || n > count) {	/* server must not exceed what we asked */
 		error = EIO;
@@ -912,7 +923,7 @@ p9c_read(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
 	}
 	*got = n;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -932,6 +943,7 @@ p9c_readdir(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
     uint32_t len, uint32_t uid, uint32_t gid, uint32_t *got)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	uint32_t count, n;
@@ -944,20 +956,20 @@ p9c_readdir(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
 	if (count > sc->sc_msize - P9_READ_IOHDRSZ)
 		count = sc->sc_msize - P9_READ_IOHDRSZ;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TREADDIR,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TREADDIR,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put64(&enc, off);
 	p9c_put32(&enc, count);
 
-	error = p9c_rpc(sc, &enc, P9_RREADDIR, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RREADDIR,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	n = p9c_get32(&dec);
 	if (dec.err || n > count) {
 		error = EIO;
@@ -970,7 +982,7 @@ p9c_readdir(struct vio9p_softc *sc, uint32_t fid, uint64_t off, void *buf,
 	}
 	*got = n;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -989,6 +1001,7 @@ p9c_readlink(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
     char *buf, size_t bufsz, size_t *lenp)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	int error;
@@ -996,18 +1009,18 @@ p9c_readlink(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
 	if (lenp != NULL)
 		*lenp = 0;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TREADLINK,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TREADLINK,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 
-	error = p9c_rpc(sc, &enc, P9_RREADLINK, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RREADLINK,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	p9c_gets(&dec, buf, bufsz);	/* rejects embedded NUL + overflow */
 	if (dec.err) {
 		error = EIO;
@@ -1016,7 +1029,7 @@ p9c_readlink(struct vio9p_softc *sc, uint32_t fid, uint32_t uid, uint32_t gid,
 	if (lenp != NULL)
 		*lenp = strlen(buf);
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -1039,6 +1052,7 @@ p9c_write(struct vio9p_softc *sc, uint32_t fid, uint64_t off, const void *buf,
     uint32_t len, uint32_t uid, uint32_t gid, uint32_t *put)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	uint32_t count, n, hdr;
@@ -1064,9 +1078,9 @@ p9c_write(struct vio9p_softc *sc, uint32_t fid, uint64_t off, const void *buf,
 	if (count > sc->sc_msize - hdr)
 		count = sc->sc_msize - hdr;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TWRITE,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TWRITE,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_put64(&enc, off);
@@ -1079,12 +1093,12 @@ p9c_write(struct vio9p_softc *sc, uint32_t fid, uint64_t off, const void *buf,
 	} else
 		enc.err = 1;
 
-	error = p9c_rpc(sc, &enc, P9_RWRITE, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RWRITE,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	n = p9c_get32(&dec);
 	if (dec.err || n > count) {	/* server must not claim more than asked */
 		error = EIO;
@@ -1092,7 +1106,7 @@ p9c_write(struct vio9p_softc *sc, uint32_t fid, uint64_t off, const void *buf,
 	}
 	*put = n;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -1120,14 +1134,15 @@ p9c_lcreate(struct vio9p_softc *sc, uint32_t fid, const char *name,
     struct p9_qid *qid, uint32_t *iounit)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	uint32_t iu;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLCREATE,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TLCREATE,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, fid);
 	p9c_puts(&enc, name, strlen(name));
@@ -1135,12 +1150,12 @@ p9c_lcreate(struct vio9p_softc *sc, uint32_t fid, const char *name,
 	p9c_put32(&enc, mode);
 	p9c_put32(&enc, cgid);		/* Tlcreate body gid (group of new file) */
 
-	error = p9c_rpc(sc, &enc, P9_RLCREATE, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RLCREATE,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	p9c_getqid(&dec, qid);
 	iu = p9c_get32(&dec);
 	if (dec.err) {
@@ -1150,7 +1165,7 @@ p9c_lcreate(struct vio9p_softc *sc, uint32_t fid, const char *name,
 	if (iounit != NULL)
 		*iounit = iu;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -1168,30 +1183,31 @@ p9c_mkdir(struct vio9p_softc *sc, uint32_t dfid, const char *name,
     struct p9_qid *qid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TMKDIR,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TMKDIR,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, dfid);
 	p9c_puts(&enc, name, strlen(name));
 	p9c_put32(&enc, mode);
 	p9c_put32(&enc, cgid);		/* Tmkdir body gid (group of new dir) */
 
-	error = p9c_rpc(sc, &enc, P9_RMKDIR, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RMKDIR,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	p9c_getqid(&dec, qid);
 	if (dec.err)
 		error = EIO;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -1205,21 +1221,22 @@ p9c_unlinkat(struct vio9p_softc *sc, uint32_t dfid, const char *name,
     uint32_t flags, uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TUNLINKAT,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TUNLINKAT,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, dfid);
 	p9c_puts(&enc, name, strlen(name));
 	p9c_put32(&enc, flags);
 
-	error = p9c_rpc(sc, &enc, P9_RUNLINKAT, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RUNLINKAT,
 	    &rxlen);
 
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -1239,12 +1256,13 @@ p9c_setattr(struct vio9p_softc *sc, uint32_t fid, uint32_t valid, uint32_t mode,
     uint32_t cgid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSETATTR,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TSETATTR,
 	    sc->sc_extended, cuid, cgid);
 	p9c_put32(&enc, fid);
 	p9c_put32(&enc, valid);
@@ -1257,10 +1275,10 @@ p9c_setattr(struct vio9p_softc *sc, uint32_t fid, uint32_t valid, uint32_t mode,
 	p9c_put64(&enc, (uint64_t)mtime_sec);
 	p9c_put64(&enc, (uint64_t)mtime_nsec);
 
-	error = p9c_rpc(sc, &enc, P9_RSETATTR, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RSETATTR,
 	    &rxlen);
 
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -1282,22 +1300,23 @@ p9c_renameat(struct vio9p_softc *sc, uint32_t olddirfid, const char *oldname,
     uint32_t newdirfid, const char *newname, uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TRENAMEAT,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TRENAMEAT,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, olddirfid);
 	p9c_puts(&enc, oldname, strlen(oldname));
 	p9c_put32(&enc, newdirfid);
 	p9c_puts(&enc, newname, strlen(newname));
 
-	error = p9c_rpc(sc, &enc, P9_RRENAMEAT, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RRENAMEAT,
 	    &rxlen);
 
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -1315,30 +1334,31 @@ p9c_symlink(struct vio9p_softc *sc, uint32_t dfid, const char *name,
     struct p9_qid *qid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	struct p9c_dec dec;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TSYMLINK,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TSYMLINK,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, dfid);
 	p9c_puts(&enc, name, strlen(name));
 	p9c_puts(&enc, target, strlen(target));
 	p9c_put32(&enc, cgid);		/* Tsymlink body gid (group of new link) */
 
-	error = p9c_rpc(sc, &enc, P9_RSYMLINK, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RSYMLINK,
 	    &rxlen);
 	if (error != 0)
 		goto out;
 
-	p9c_dec_init(&dec, p9c_rxbuf, rxlen);
+	p9c_dec_init(&dec, req->req_rbuf, rxlen);
 	p9c_getqid(&dec, qid);
 	if (dec.err)
 		error = EIO;
 out:
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
 
@@ -1354,20 +1374,21 @@ p9c_link(struct vio9p_softc *sc, uint32_t dfid, uint32_t fid, const char *name,
     uint32_t uid, uint32_t gid)
 {
 	struct p9c_enc enc;
+	struct vio9p_req *req;
 	size_t rxlen = 0;
 	int error;
 
-	rw_enter_write(&p9c_lock);
+	req = vio9p_get(sc);
 
-	p9c_enc_start(&enc, p9c_txbuf, sizeof(p9c_txbuf), P9_TLINK,
+	p9c_enc_start(&enc, req->req_tbuf, sc->sc_msize, P9_TLINK,
 	    sc->sc_extended, uid, gid);
 	p9c_put32(&enc, dfid);
 	p9c_put32(&enc, fid);
 	p9c_puts(&enc, name, strlen(name));
 
-	error = p9c_rpc(sc, &enc, P9_RLINK, p9c_rxbuf, sizeof(p9c_rxbuf),
+	error = p9c_rpc(sc, req, &enc, P9_RLINK,
 	    &rxlen);
 
-	rw_exit_write(&p9c_lock);
+	vio9p_put(sc, req);
 	return (error);
 }
