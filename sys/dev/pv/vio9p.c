@@ -18,17 +18,22 @@
 
 /*
  * virtio-9p transport driver: owns the PCI virtio-9p device and the request
- * virtqueue, reads the mount tag from configuration space, and exposes one
- * synchronous primitive, vio9p_submit(), that the in-kernel 9P client
- * (sys/miscfs/vio9p/) builds T-messages on.  The guest mounts a host
- * bind-mount share served by the M1 host server (usr.sbin/vmd/viofs.c).
+ * virtqueue, reads the mount tag from configuration space, and exposes a small
+ * primitive set, vio9p_get()/vio9p_rpc()/vio9p_put(), that the in-kernel 9P
+ * client (sys/miscfs/vio9p/) builds T-messages on.  Several requests may be in
+ * flight at once: each borrows a request context (its own DMA T/R buffers and
+ * a unique 9P tag), and replies are demultiplexed back to the waiting context
+ * by virtqueue slot.  The guest mounts a host bind-mount share served by the
+ * M1 host server (usr.sbin/vmd/viofs.c).
  */
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <machine/bus.h>
 #include <sys/device.h>
-#include <sys/rwlock.h>
+#include <sys/malloc.h>
+#include <sys/mutex.h>
+#include <sys/queue.h>
 #include <sys/time.h>
 
 #include <dev/pv/virtioreg.h>
@@ -37,6 +42,7 @@
 #include <dev/pv/vio9pvar.h>
 
 #define P9_HDRLEN	7		/* size[4] type[1] tag[2] */
+#define VIO9P_NREQ	16		/* desired outstanding requests */
 
 int	vio9p_match(struct device *, void *, void *);
 void	vio9p_attach(struct device *, struct device *, void *);
@@ -107,6 +113,24 @@ vio9p_buf_free(struct vio9p_softc *sc, bus_dma_segment_t *seg,
 	bus_dmamem_free(dmat, seg, 1);
 }
 
+/* Free the first nreq request contexts' buffers (cleanup helper). */
+static void
+vio9p_reqs_free(struct vio9p_softc *sc, int nreq)
+{
+	struct vio9p_req *req;
+	int i;
+
+	for (i = 0; i < nreq; i++) {
+		req = &sc->sc_reqs[i];
+		if (req->req_rbuf != NULL)
+			vio9p_buf_free(sc, &req->req_rseg, req->req_rmap,
+			    req->req_rbuf);
+		if (req->req_tbuf != NULL)
+			vio9p_buf_free(sc, &req->req_tseg, req->req_tmap,
+			    req->req_tbuf);
+	}
+}
+
 int
 vio9p_match(struct device *parent, void *match, void *aux)
 {
@@ -123,7 +147,9 @@ vio9p_attach(struct device *parent, struct device *self, void *aux)
 	struct vio9p_softc *sc = (struct vio9p_softc *)self;
 	struct virtio_softc *vsc = (struct virtio_softc *)parent;
 	struct virtio_attach_args *va = aux;
-	uint16_t i;
+	struct vio9p_req *req;
+	int i, nreq;
+	uint16_t t;
 
 	if (vsc->sc_child != NULL)
 		panic("%s: parent already has a child", sc->sc_dev.dv_xname);
@@ -150,142 +176,212 @@ vio9p_attach(struct device *parent, struct device *self, void *aux)
 		printf(": bad tag length %u\n", sc->sc_taglen);
 		goto err;
 	}
-	for (i = 0; i < sc->sc_taglen; i++)
-		sc->sc_tag[i] = virtio_read_device_config_1(vsc,
-		    VIRTIO_9P_CONFIG_TAG + i);
+	for (t = 0; t < sc->sc_taglen; t++)
+		sc->sc_tag[t] = virtio_read_device_config_1(vsc,
+		    VIRTIO_9P_CONFIG_TAG + t);
 	sc->sc_tag[sc->sc_taglen] = '\0';
-
-	if (vio9p_buf_alloc(sc, VIO9P_MSIZE_MAX, BUS_DMA_WRITE,
-	    &sc->sc_tseg, &sc->sc_tmap, &sc->sc_tbuf) != 0) {
-		printf(": cannot allocate request buffer\n");
-		goto err;
-	}
-	if (vio9p_buf_alloc(sc, VIO9P_MSIZE_MAX, BUS_DMA_READ,
-	    &sc->sc_rseg, &sc->sc_rmap, &sc->sc_rbuf) != 0) {
-		printf(": cannot allocate reply buffer\n");
-		goto err_tbuf;
-	}
 
 	/* Two descriptors per request: readable T then writable R. */
 	if (virtio_alloc_vq(vsc, &sc->sc_vq[0], 0, 2, "9p request") != 0) {
 		printf(": cannot allocate virtqueue\n");
-		goto err_rbuf;
+		goto err;
 	}
 	sc->sc_vq[0].vq_done = vio9p_vq_done;
 
-	rw_init(&sc->sc_lock, "vio9p");
+	/*
+	 * Size the request pool so at most vq_num/2 requests (two descriptors
+	 * each) are ever outstanding, and never fewer than one.
+	 */
+	nreq = sc->sc_vq[0].vq_num / 2;
+	if (nreq > VIO9P_NREQ)
+		nreq = VIO9P_NREQ;
+	if (nreq < 1)
+		nreq = 1;
+
+	sc->sc_reqs = mallocarray(nreq, sizeof(struct vio9p_req), M_DEVBUF,
+	    M_NOWAIT | M_ZERO);
+	sc->sc_slot_req = mallocarray(sc->sc_vq[0].vq_num,
+	    sizeof(struct vio9p_req *), M_DEVBUF, M_NOWAIT | M_ZERO);
+	if (sc->sc_reqs == NULL || sc->sc_slot_req == NULL) {
+		printf(": cannot allocate request pool\n");
+		goto err_vq;
+	}
+
+	TAILQ_INIT(&sc->sc_free);
+	for (i = 0; i < nreq; i++) {
+		req = &sc->sc_reqs[i];
+		req->req_tag = (uint16_t)i;
+		if (vio9p_buf_alloc(sc, VIO9P_MSIZE_MAX, BUS_DMA_WRITE,
+		    &req->req_tseg, &req->req_tmap, &req->req_tbuf) != 0) {
+			printf(": cannot allocate request buffers\n");
+			vio9p_reqs_free(sc, i);
+			goto err_pool;
+		}
+		if (vio9p_buf_alloc(sc, VIO9P_MSIZE_MAX, BUS_DMA_READ,
+		    &req->req_rseg, &req->req_rmap, &req->req_rbuf) != 0) {
+			printf(": cannot allocate reply buffers\n");
+			vio9p_reqs_free(sc, i);	/* frees this req's tbuf too */
+			goto err_pool;
+		}
+		TAILQ_INSERT_TAIL(&sc->sc_free, req, req_link);
+	}
+	sc->sc_nreq = nreq;
+
+	mtx_init(&sc->sc_mtx, IPL_BIO);
 	sc->sc_msize = VIO9P_MSIZE_MAX;
-	sc->sc_done = 0;
 
 	virtio_start_vq_intr(vsc, &sc->sc_vq[0]);
 
-	printf(": tag \"%s\"\n", sc->sc_tag);
+	printf(": tag \"%s\", %d outstanding\n", sc->sc_tag, nreq);
 
 	if (virtio_attach_finish(vsc, va) != 0)
-		goto err_vq;
+		goto err_reqs;
 	return;
 
+err_reqs:
+	vio9p_reqs_free(sc, nreq);
+err_pool:
+	free(sc->sc_reqs, M_DEVBUF, 0);
+	free(sc->sc_slot_req, M_DEVBUF, 0);
 err_vq:
 	virtio_free_vq(vsc, &sc->sc_vq[0]);
-err_rbuf:
-	vio9p_buf_free(sc, &sc->sc_rseg, sc->sc_rmap, sc->sc_rbuf);
-err_tbuf:
-	vio9p_buf_free(sc, &sc->sc_tseg, sc->sc_tmap, sc->sc_tbuf);
 err:
 	vsc->sc_child = VIRTIO_CHILD_ERROR;
 }
 
+/*
+ * Reply completion (IPL_BIO).  Demultiplex every finished slot back to its
+ * request context, record the reply length, and wake that context's waiter.
+ */
 int
 vio9p_vq_done(struct virtqueue *vq)
 {
 	struct virtio_softc *vsc = vq->vq_owner;
 	struct vio9p_softc *sc = (struct vio9p_softc *)vsc->sc_child;
-	int slot, len;
+	struct vio9p_req *req;
+	int slot, len, handled = 0;
 
-	if (virtio_dequeue(vsc, vq, &slot, &len) != 0)
-		return (0);
-	bus_dmamap_sync(vsc->sc_dmat, sc->sc_tmap, 0, VIO9P_MSIZE_MAX,
-	    BUS_DMASYNC_POSTWRITE);
-	bus_dmamap_sync(vsc->sc_dmat, sc->sc_rmap, 0, VIO9P_MSIZE_MAX,
-	    BUS_DMASYNC_POSTREAD);
-	virtio_dequeue_commit(vq, slot);
-
-	if (len < 0 || len > VIO9P_MSIZE_MAX)
-		len = 0;		/* defensive; the client rejects short */
-	sc->sc_rlen = len;
-	sc->sc_done = 1;
-	wakeup_one(&sc->sc_done);
-	return (1);
+	mtx_enter(&sc->sc_mtx);
+	while (virtio_dequeue(vsc, vq, &slot, &len) == 0) {
+		req = sc->sc_slot_req[slot];
+		sc->sc_slot_req[slot] = NULL;
+		if (req != NULL) {
+			bus_dmamap_sync(vsc->sc_dmat, req->req_tmap, 0,
+			    VIO9P_MSIZE_MAX, BUS_DMASYNC_POSTWRITE);
+			bus_dmamap_sync(vsc->sc_dmat, req->req_rmap, 0,
+			    VIO9P_MSIZE_MAX, BUS_DMASYNC_POSTREAD);
+		}
+		virtio_dequeue_commit(vq, slot);
+		if (req != NULL) {
+			if (len < 0 || len > VIO9P_MSIZE_MAX)
+				len = 0;	/* defensive; client rejects */
+			req->req_rlen = len;
+			req->req_done = 1;
+			wakeup(req);
+		}
+		handled = 1;
+	}
+	mtx_leave(&sc->sc_mtx);
+	return (handled);
 }
 
 /*
- * Submit one 9P request and wait for its reply.  Serialized: one request is
- * outstanding at a time.  During autoconf (cold) the used ring is polled, as
- * sleeping is not permitted; otherwise the queue interrupt wakes us.
+ * Borrow a request context, blocking until one of the sc_nreq contexts is
+ * free.  Callers run in process context (mount/VFS), so sleeping is fine; the
+ * autoconf (cold) path uses the pool single-threaded, so it never blocks here.
+ */
+struct vio9p_req *
+vio9p_get(struct vio9p_softc *sc)
+{
+	struct vio9p_req *req;
+
+	mtx_enter(&sc->sc_mtx);
+	while ((req = TAILQ_FIRST(&sc->sc_free)) == NULL)
+		msleep_nsec(&sc->sc_free, &sc->sc_mtx, PRIBIO, "vio9pq",
+		    INFSLP);
+	TAILQ_REMOVE(&sc->sc_free, req, req_link);
+	mtx_leave(&sc->sc_mtx);
+	return (req);
+}
+
+/* Return a borrowed context to the free pool and wake one waiter. */
+void
+vio9p_put(struct vio9p_softc *sc, struct vio9p_req *req)
+{
+	mtx_enter(&sc->sc_mtx);
+	TAILQ_INSERT_TAIL(&sc->sc_free, req, req_link);
+	mtx_leave(&sc->sc_mtx);
+	wakeup_one(&sc->sc_free);
+}
+
+/*
+ * Submit req's T-message (tlen bytes in req->req_tbuf) and wait for its reply,
+ * copied by the device into req->req_rbuf with length stored in *rlenp.
+ * During autoconf (cold) the used ring is polled; otherwise the queue
+ * interrupt wakes us.  Other contexts may be in flight concurrently.
  */
 int
-vio9p_submit(struct vio9p_softc *sc, const void *tbuf, size_t tlen,
-    void *rbuf, size_t rcap, size_t *rlenp)
+vio9p_rpc(struct vio9p_softc *sc, struct vio9p_req *req, size_t tlen,
+    size_t *rlenp)
 {
 	struct virtio_softc *vsc = sc->sc_virtio;
 	struct virtqueue *vq = &sc->sc_vq[0];
-	int slot, s, error = 0;
+	int slot, error = 0;
 
 	if (tlen < P9_HDRLEN || tlen > VIO9P_MSIZE_MAX)
 		return (EINVAL);
-	if (rcap > VIO9P_MSIZE_MAX)
-		rcap = VIO9P_MSIZE_MAX;
 
-	rw_enter_write(&sc->sc_lock);
-	memcpy(sc->sc_tbuf, tbuf, tlen);
-
-	s = splbio();
-	sc->sc_done = 0;
-	sc->sc_rlen = 0;
-	bus_dmamap_sync(vsc->sc_dmat, sc->sc_tmap, 0, tlen,
+	bus_dmamap_sync(vsc->sc_dmat, req->req_tmap, 0, tlen,
 	    BUS_DMASYNC_PREWRITE);
-	bus_dmamap_sync(vsc->sc_dmat, sc->sc_rmap, 0, rcap,
+	bus_dmamap_sync(vsc->sc_dmat, req->req_rmap, 0, sc->sc_msize,
 	    BUS_DMASYNC_PREREAD);
 
+	mtx_enter(&sc->sc_mtx);
+	req->req_done = 0;
+	req->req_rlen = 0;
 	if (virtio_enqueue_prep(vq, &slot) != 0 ||
 	    virtio_enqueue_reserve(vq, slot, 2) != 0) {
-		splx(s);
-		rw_exit_write(&sc->sc_lock);
-		return (EAGAIN);	/* single-outstanding: not in steady state */
+		mtx_leave(&sc->sc_mtx);
+		return (EAGAIN);	/* pool <= vq_num/2, so should not happen */
 	}
 	/* Device reads the request (write=1), then writes the reply (write=0). */
-	virtio_enqueue_p(vq, slot, sc->sc_tmap, 0, tlen, 1);
-	virtio_enqueue_p(vq, slot, sc->sc_rmap, 0, rcap, 0);
+	virtio_enqueue_p(vq, slot, req->req_tmap, 0, tlen, 1);
+	virtio_enqueue_p(vq, slot, req->req_rmap, 0, sc->sc_msize, 0);
+	req->req_slot = slot;
+	sc->sc_slot_req[slot] = req;
 	virtio_enqueue_commit(vsc, vq, slot, 1);
 
 	if (cold) {
 		int timo;
 
-		for (timo = 1500000; timo > 0 && !sc->sc_done; timo--) {
+		/*
+		 * No interrupts during autoconf: poll the used ring.  Release
+		 * the mutex first so vio9p_vq_done() (called from
+		 * virtio_check_vq) can take it.
+		 */
+		mtx_leave(&sc->sc_mtx);
+		for (timo = 1500000; timo > 0 && !req->req_done; timo--) {
 			virtio_check_vq(vsc, vq);
-			if (!sc->sc_done)
+			if (!req->req_done)
 				delay(10);	/* up to ~15s total */
 		}
-		if (!sc->sc_done)
+		if (!req->req_done)
 			error = EIO;
 	} else {
-		while (!sc->sc_done) {
-			if (tsleep_nsec(&sc->sc_done, PRIBIO, "vio9p",
-			    SEC_TO_NSEC(15)) == EWOULDBLOCK && !sc->sc_done) {
+		while (!req->req_done) {
+			if (msleep_nsec(req, &sc->sc_mtx, PRIBIO, "vio9p",
+			    SEC_TO_NSEC(15)) == EWOULDBLOCK && !req->req_done) {
 				error = EIO;	/* host wedged */
 				break;
 			}
 		}
+		mtx_leave(&sc->sc_mtx);
 	}
-	splx(s);
 
 	if (error == 0 &&
-	    (sc->sc_rlen < P9_HDRLEN || (size_t)sc->sc_rlen > rcap))
+	    (req->req_rlen < P9_HDRLEN || (size_t)req->req_rlen > sc->sc_msize))
 		error = EIO;
-	if (error == 0) {
-		memcpy(rbuf, sc->sc_rbuf, sc->sc_rlen);
-		*rlenp = sc->sc_rlen;
-	}
-	rw_exit_write(&sc->sc_lock);
+	if (error == 0)
+		*rlenp = req->req_rlen;
 	return (error);
 }
