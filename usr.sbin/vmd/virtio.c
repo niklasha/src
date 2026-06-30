@@ -39,10 +39,37 @@
 #include <unistd.h>
 
 #include "atomicio.h"
+#include "mmio.h"
 #include "pci.h"
 #include "vioscsi.h"
 #include "virtio.h"
 #include "vmd.h"
+
+/*
+ * MSI-X prototype for viofs.  When 1, the viofs PCI device advertises an
+ * MSI-X capability (SMP guests only) so the guest negotiates MSI-X and
+ * the completion interrupt is delivered as an edge MSI directly to the
+ * target vcpu's LAPIC -- eliminating the legacy-INTx ISR-read round-trip.
+ * When 0, the MMIO BAR is still added but no capability is advertised, so
+ * the guest stays on INTx and all the new MSI-X paths remain dormant.
+ */
+#define VIOFS_MSIX_ENABLE	1
+
+/* MSI-X capability id (PCI 3.0). */
+#ifndef PCI_CAP_MSIX
+#define PCI_CAP_MSIX		0x11
+#endif
+
+/*
+ * Layout of the MSI-X table + PBA within the device's MSI-X MMIO BAR.
+ * The BAR is a single 4 KiB page -- the size vmd reports to the guest's
+ * BAR size-probe (pci.c hardcodes 0xfffff000) -- so the table (offset 0)
+ * and the PBA (offset 0x800) both fit, and a relocated handler never
+ * overlaps the adjacent emulated IOAPIC.
+ */
+#define VIOFS_MSIX_BAR_SIZE	0x1000
+#define VIOFS_MSIX_TABLE_OFFSET	0x0000
+#define VIOFS_MSIX_PBA_OFFSET	0x0800
 
 #define VIRTIO_DEBUG	0
 #ifdef DPRINTF
@@ -93,6 +120,10 @@ static void virtio_dispatch_dev(int, short, void *);
 static int handle_dev_msg(struct viodev_msg *, struct virtio_dev *);
 static int virtio_dev_closefds(struct virtio_dev *);
 static void virtio_pci_add_cap(uint8_t, uint8_t, uint8_t, uint32_t);
+static void virtio_add_msix_cap(uint8_t, uint8_t, uint16_t);
+static int virtio_msix_mmio_read(uint64_t, uint8_t, uint64_t *, void *);
+static int virtio_msix_mmio_write(uint64_t, uint8_t, uint64_t, void *);
+static void virtio_deliver_msix(struct virtio_dev *, uint16_t);
 static void vmmci_pipe_dispatch(int, short, void *);
 
 static int virtio_io_dispatch(int, uint16_t, uint32_t *, uint8_t *, void *,
@@ -422,7 +453,8 @@ virtio_io_cfg(struct virtio_dev *dev, int dir, uint8_t reg, uint32_t data,
 			    dev->driver_feature);
 			break;
 		case VIO1_PCI_CONFIG_MSIX_VECTOR:
-			/* Ignore until we support MSIX. */
+			/* Config-change interrupt vector (subprocess). */
+			dev->config_msix_vector = (uint16_t)data;
 			break;
 		case VIO1_PCI_NUM_QUEUES:
 			log_warnx("illegal write to num queues register");
@@ -438,6 +470,7 @@ virtio_io_cfg(struct virtio_dev *dev, int dir, uint8_t reg, uint32_t data,
 				/* Reset device and virtqueues (if any). */
 				dev->driver_feature = 0;
 				dev->isr = 0;
+				dev->config_msix_vector = VIRTIO_MSI_NO_VECTOR;
 
 				/*
 				 * A reset must lower the interrupt line.
@@ -505,7 +538,15 @@ virtio_io_cfg(struct virtio_dev *dev, int dir, uint8_t reg, uint32_t data,
 			virtio_update_qa(dev);
 			break;
 		case VIO1_PCI_QUEUE_MSIX_VECTOR:
-			/* Ignore until we support MSI-X. */
+			/*
+			 * Assign an MSI-X table index to the selected
+			 * virtqueue (subprocess).  Stamped into the KICK
+			 * message by virtio_assert_irq() so the VM process
+			 * delivers the right vector.
+			 */
+			if (pci_cfg->queue_select < dev->num_queues)
+				dev->vq[pci_cfg->queue_select].msix_vector =
+				    (uint16_t)data;
 			break;
 		case VIO1_PCI_QUEUE_ENABLE:
 			pci_cfg->queue_enable = data;
@@ -607,7 +648,7 @@ virtio_io_cfg(struct virtio_dev *dev, int dir, uint8_t reg, uint32_t data,
 			}
 			break;
 		case VIO1_PCI_CONFIG_MSIX_VECTOR:
-			res = VIRTIO_MSI_NO_VECTOR;	/* Unsupported */
+			res = dev->config_msix_vector;
 			break;
 		case VIO1_PCI_NUM_QUEUES:
 			res = dev->num_queues;
@@ -625,7 +666,10 @@ virtio_io_cfg(struct virtio_dev *dev, int dir, uint8_t reg, uint32_t data,
 			res = pci_cfg->queue_size;
 			break;
 		case VIO1_PCI_QUEUE_MSIX_VECTOR:
-			res = VIRTIO_MSI_NO_VECTOR;	/* Unsupported */
+			if (pci_cfg->queue_select < dev->num_queues)
+				res = dev->vq[pci_cfg->queue_select].msix_vector;
+			else
+				res = VIRTIO_MSI_NO_VECTOR;
 			break;
 		case VIO1_PCI_QUEUE_ENABLE:
 			res = pci_cfg->queue_enable;
@@ -1244,6 +1288,37 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 			    bar_id, 0);
 
 			/*
+			 * MSI-X (SMP guests only).  The userland LAPIC fabric
+			 * that delivers an edge interrupt to a specific vcpu
+			 * only exists when the guest has more than one vcpu; on
+			 * the single-cpu legacy path we keep INTx.  Add a
+			 * dedicated MMIO BAR for the MSI-X table + PBA and
+			 * register an emulation handler over its GPA range.
+			 */
+			if (vmc->vmc_ncpus > 1) {
+				int msix_bar;
+
+				msix_bar = pci_add_bar(id, PCI_MAPREG_TYPE_MEM,
+				    NULL, dev);
+				if (msix_bar == -1) {
+					log_warnx("can't add msix bar for "
+					    "virtio 9p device");
+					return (1);
+				}
+				dev->msix_bar_gpa =
+				    pci_get_bar_addr(id, msix_bar);
+				if (mmio_register(dev->msix_bar_gpa,
+				    VIOFS_MSIX_BAR_SIZE, virtio_msix_mmio_read,
+				    virtio_msix_mmio_write, dev) == -1)
+					log_warnx("can't register msix mmio "
+					    "handler for virtio 9p device");
+#if VIOFS_MSIX_ENABLE
+				virtio_add_msix_cap(id, msix_bar,
+				    VIRTIO_9P_QUEUES + 1);
+#endif
+			}
+
+			/*
 			 * Device specific initialization.  The share dir fd is
 			 * opened by the device subprocess itself under unveil(2)
 			 * (a directory fd cannot be passed here: pledge "sendfd"
@@ -1480,6 +1555,9 @@ virtio_dev_init(struct vmd_vm *vm, struct virtio_dev *dev, uint8_t pci_id,
 	dev->queue_size = queue_size;
 	dev->cfg.queue_size = queue_size;
 
+	/* No MSI-X vectors assigned until the guest negotiates them. */
+	dev->config_msix_vector = VIRTIO_MSI_NO_VECTOR;
+
 	dev->async_fd = -1;
 	dev->sync_fd = -1;
 
@@ -1519,6 +1597,9 @@ virtio_vq_init(struct virtio_dev *dev, size_t idx)
 
 	vq_info->last_avail = 0;
 	vq_info->notified_avail = 0;
+
+	/* Reset to legacy INTx until the guest assigns an MSI-X vector. */
+	vq_info->msix_vector = VIRTIO_MSI_NO_VECTOR;
 }
 
 
@@ -1563,6 +1644,119 @@ virtio_pci_add_cap(uint8_t pci_id, uint8_t cfg_type, uint8_t bar_id,
 		fatalx("%s: can't add capability for virtio pci device %u",
 		    __func__, pci_id);
 	}
+}
+
+/*
+ * Add a standard PCI MSI-X capability to a device.  The MSI-X table and
+ * the pending-bit array (PBA) both live in the device's MSI-X MMIO BAR
+ * (bar_id) at the fixed offsets below.  nvec is the number of table
+ * entries (one per virtqueue plus one for config-change interrupts).
+ */
+static void
+virtio_add_msix_cap(uint8_t pci_id, uint8_t bar_id, uint16_t nvec)
+{
+	struct msix_cap {
+		uint8_t  mc_cap_id;	/* PCI_CAP_MSIX */
+		uint8_t  mc_next;
+		uint16_t mc_msg_ctrl;	/* [10:0] table size-1, [15] enable */
+		uint32_t mc_table;	/* [31:3] offset, [2:0] BIR */
+		uint32_t mc_pba;	/* [31:3] offset, [2:0] BIR */
+	} __packed mc;
+	struct pci_cap cap;
+
+	memset(&mc, 0, sizeof(mc));
+	mc.mc_cap_id = PCI_CAP_MSIX;
+	mc.mc_next = 0;
+	mc.mc_msg_ctrl = nvec - 1;	/* Enable bit set later by the guest. */
+	mc.mc_table = (VIOFS_MSIX_TABLE_OFFSET & ~0x7U) | (bar_id & 0x7);
+	mc.mc_pba = (VIOFS_MSIX_PBA_OFFSET & ~0x7U) | (bar_id & 0x7);
+
+	/* pci_add_capability() stores a fixed-size pci_cap; zero-pad. */
+	memset(&cap, 0, sizeof(cap));
+	memcpy(&cap, &mc, sizeof(mc));
+
+	if (pci_add_capability(pci_id, &cap) == -1)
+		fatalx("%s: can't add msix capability for pci device %u",
+		    __func__, pci_id);
+}
+
+/*
+ * Emulate guest reads of the MSI-X table BAR (VM process).  off is the
+ * byte offset into the BAR.  The table is a flat array of 32-bit dwords;
+ * the PBA region reports no pending bits in this prototype.
+ */
+static int
+virtio_msix_mmio_read(uint64_t off, uint8_t bytes, uint64_t *val, void *cookie)
+{
+	struct virtio_dev *dev = cookie;
+	uint32_t *t = (uint32_t *)dev->msix_table;
+	size_t ndw = sizeof(dev->msix_table) / (sizeof(uint32_t));
+	uint64_t idx = off / 4;
+
+	*val = 0;
+	if (off >= VIOFS_MSIX_PBA_OFFSET || (off & 0x3) != 0)
+		return (0);
+	if (idx < ndw)
+		*val = t[idx];
+	if (bytes == 8 && (idx + 1) < ndw)
+		*val |= (uint64_t)t[idx + 1] << 32;
+	return (0);
+}
+
+/*
+ * Emulate guest writes to the MSI-X table BAR (VM process).  The guest
+ * programs each entry's message address/data and per-vector mask bit.
+ */
+static int
+virtio_msix_mmio_write(uint64_t off, uint8_t bytes, uint64_t val, void *cookie)
+{
+	struct virtio_dev *dev = cookie;
+	uint32_t *t = (uint32_t *)dev->msix_table;
+	size_t ndw = sizeof(dev->msix_table) / (sizeof(uint32_t));
+	uint64_t idx = off / 4;
+
+	/* PBA is read-only; table accesses are dword-aligned. */
+	if (off >= VIOFS_MSIX_PBA_OFFSET || (off & 0x3) != 0)
+		return (0);
+	if (idx < ndw)
+		t[idx] = (uint32_t)val;
+	if (bytes == 8 && (idx + 1) < ndw)
+		t[idx + 1] = (uint32_t)(val >> 32);
+	return (0);
+}
+
+/*
+ * Deliver an MSI-X interrupt (VM process).  Decode the x86 MSI message
+ * stored in the device's table entry and inject an edge interrupt to the
+ * destination vcpu's LAPIC.  Unlike legacy INTx there is no ISR register
+ * to read back, so this avoids the second guest->host round-trip.
+ */
+static void
+virtio_deliver_msix(struct virtio_dev *dev, uint16_t vector)
+{
+	struct virtio_msix_entry *e;
+	uint32_t apic_id;
+	uint8_t vec;
+
+	if (vector >= VIRTIO_MSIX_MAX_VECTORS)
+		return;
+	e = &dev->msix_table[vector];
+
+	/* Honor the per-vector mask bit (PBA tracking omitted). */
+	if (e->vector_ctrl & 0x1)
+		return;
+
+	/*
+	 * x86 MSI message, physical destination mode (what the guest
+	 * programs): addr[19:12] = destination APIC id, data[7:0] = the
+	 * delivered interrupt vector.
+	 */
+	apic_id = (e->addr_lo >> 12) & 0xff;
+	vec = e->data & 0xff;
+	if (vec == 0)
+		return;		/* entry not yet programmed */
+
+	lapic_smp_deliver_ipi(apic_id, vec);
 }
 
 /*
@@ -2098,7 +2292,15 @@ handle_dev_msg(struct viodev_msg *msg, struct virtio_dev *gdev)
 
 	switch (msg->type) {
 	case VIODEV_MSG_KICK:
-		if (msg->state == INTR_STATE_ASSERT)
+		if (msg->vector != VIRTIO_MSI_NO_VECTOR) {
+			/*
+			 * MSI-X: deliver an edge interrupt straight to the
+			 * target vcpu's LAPIC.  DEASSERT is a no-op since
+			 * MSI-X is edge-triggered (no level line to lower).
+			 */
+			if (msg->state == INTR_STATE_ASSERT)
+				virtio_deliver_msix(gdev, msg->vector);
+		} else if (msg->state == INTR_STATE_ASSERT)
 			vcpu_assert_irq(vmm_id, msg->vcpu, msg->irq);
 		else if (msg->state == INTR_STATE_DEASSERT)
 			vcpu_deassert_irq(vmm_id, msg->vcpu, msg->irq);
@@ -2238,6 +2440,13 @@ virtio_assert_irq(struct virtio_dev *dev, int vcpu)
 	msg.vcpu = vcpu;
 	msg.type = VIODEV_MSG_KICK;
 	msg.state = INTR_STATE_ASSERT;
+	/*
+	 * MSI-X vector for the data path (viofs has a single request
+	 * queue).  VIRTIO_MSI_NO_VECTOR selects the legacy INTx path in
+	 * the VM process; any device that has not negotiated MSI-X leaves
+	 * vq[0].msix_vector at NO_VECTOR.
+	 */
+	msg.vector = dev->vq[0].msix_vector;
 
 	ret = imsg_compose_event(&dev->async_iev, IMSG_DEVOP_MSG, 0, 0, -1,
 	    &msg, sizeof(msg));
@@ -2256,6 +2465,8 @@ virtio_deassert_irq(struct virtio_dev *dev, int vcpu)
 	msg.vcpu = vcpu;
 	msg.type = VIODEV_MSG_KICK;
 	msg.state = INTR_STATE_DEASSERT;
+	/* See virtio_assert_irq(); MSI-X deassert is a no-op in the VM proc. */
+	msg.vector = dev->vq[0].msix_vector;
 
 	ret = imsg_compose_event(&dev->async_iev, IMSG_DEVOP_MSG, 0, 0, -1,
 	    &msg, sizeof(msg));

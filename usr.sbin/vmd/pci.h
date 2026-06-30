@@ -116,6 +116,7 @@ int pci_add_bar(uint8_t, uint32_t, void *, void *);
 int pci_set_bar_fn(uint8_t, uint8_t, void *, void *);
 uint8_t pci_get_dev_irq(uint8_t);
 uint16_t pci_get_subsys_id(uint8_t);
+uint64_t pci_get_bar_addr(uint8_t, int);
 
 #ifdef __amd64__
 void pci_handle_address_reg(struct vm_run_params *);

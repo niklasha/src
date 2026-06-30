@@ -148,6 +148,15 @@ struct viodev_msg {
 
 	uint32_t data;		/* Data (if any) */
 	uint8_t data_valid;	/* 1 if data field is populated. */
+
+	/*
+	 * MSI-X vector index for a KICK (ASSERT) interrupt, or
+	 * VIRTIO_MSI_NO_VECTOR (0xffff) for a legacy INTx interrupt.
+	 * Set by the device subprocess in virtio_assert_irq(); the VM
+	 * process maps it through the device's MSI-X table and delivers
+	 * an edge interrupt to the target vcpu's LAPIC.
+	 */
+	uint16_t vector;
 } __packed;
 
 /*
@@ -215,6 +224,14 @@ struct virtio_vq_info {
 	uint16_t notified_avail;
 
 	uint8_t vq_enabled;
+
+	/*
+	 * MSI-X vector assigned to this virtqueue by the guest (written to
+	 * the virtio common-config QUEUE_MSIX_VECTOR register), or
+	 * VIRTIO_MSI_NO_VECTOR when the queue uses legacy INTx.  Tracked in
+	 * the device subprocess and stamped into the KICK message.
+	 */
+	uint16_t msix_vector;
 };
 
 /*
@@ -347,6 +364,22 @@ struct viofs_dev {
 	unsigned int	idx;
 };
 
+/*
+ * MSI-X support (SMP guests only).  A virtio device exposes one MSI-X
+ * vector per virtqueue plus one for configuration-change interrupts.
+ * The table + PBA live in a dedicated MMIO BAR emulated by the VM
+ * process; each entry is programmed by the guest via MMIO and consumed
+ * when delivering an edge interrupt to the target vcpu's LAPIC.
+ */
+#define VIRTIO_MSIX_MAX_VECTORS	(VIRTIO_MAX_QUEUES + 1)
+
+struct virtio_msix_entry {
+	uint32_t	addr_lo;	/* message address low (dest APIC id) */
+	uint32_t	addr_hi;	/* message address high */
+	uint32_t	data;		/* message data (delivered vector) */
+	uint32_t	vector_ctrl;	/* bit 0 = masked */
+};
+
 struct virtio_dev {
 	uint16_t device_id;			/* Virtio device id [r] */
 	union {
@@ -394,6 +427,18 @@ struct virtio_dev {
 	 * not waitpid() it; PROC_PARENT reaps it on VM death.
 	 */
 	int		dev_parent_launched;
+
+	/*
+	 * MSI-X state (SMP guests only).  msix_bar_gpa is the GPA of the
+	 * MMIO BAR holding the table + PBA; msix_table is owned by the VM
+	 * process (programmed by the guest through the MSI-X MMIO handler).
+	 * The device subprocess tracks per-vq vector assignments separately
+	 * in vq[].msix_vector and stamps them into each KICK message.
+	 */
+	uint64_t	msix_bar_gpa;
+	uint16_t	config_msix_vector;	/* config-change MSI-X vector */
+	struct virtio_msix_entry msix_table[VIRTIO_MSIX_MAX_VECTORS];
+
 	SLIST_ENTRY(virtio_dev) dev_next;
 };
 

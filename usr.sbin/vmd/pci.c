@@ -28,6 +28,7 @@
 
 #include "vmd.h"
 #include "pci.h"
+#include "mmio.h"
 #include "atomicio.h"
 
 struct pci pci;
@@ -397,8 +398,10 @@ pci_handle_data_reg(struct vm_run_params *vrp)
 	 * value in the address register.
 	 */
 	if (vei->vei.vei_dir == VEI_DIR_OUT) {
-		if ((o >= 0x10 && o <= 0x24) &&
-		    vei->vei.vei_data == 0xffffffff) {
+		int bar_sizeprobe = (o >= 0x10 && o <= 0x24) &&
+		    vei->vei.vei_data == 0xffffffff;
+
+		if (bar_sizeprobe) {
 			/*
 			 * Compute BAR index:
 			 * o = 0x10 -> baridx = 0
@@ -428,6 +431,23 @@ pci_handle_data_reg(struct vm_run_params *vrp)
 		 */
 		if (o != PCI_EXROMADDR_0)
 			get_input_data(vei, &pd->pd_cfg_space[cfgidx]);
+
+		/*
+		 * The guest may relocate a memory BAR during PCI resource
+		 * assignment.  I/O BARs are re-read live from config space on
+		 * each access, but an MMIO BAR's emulation handler snapshots
+		 * its base, so move it to follow the new address.  Skip the
+		 * size-probe write (all-ones), which is not a real address.
+		 */
+		if (!bar_sizeprobe && o >= 0x10 && o <= 0x24 &&
+		    baridx < pd->pd_bar_ct &&
+		    pd->pd_bartype[baridx] == PCI_BAR_TYPE_MMIO &&
+		    pd->pd_bar_cookie[baridx] != NULL) {
+			uint64_t nb =
+			    PCI_MAPREG_MEM_ADDR(pd->pd_cfg_space[cfgidx]);
+			if (nb != 0)
+				mmio_move(pd->pd_bar_cookie[baridx], nb);
+		}
 	} else {
 		/*
 		 * vei_dir == VEI_DIR_IN : in instruction
@@ -486,4 +506,22 @@ pci_get_subsys_id(uint8_t pci_id)
 		return (0);
 	else
 		return (pci.pci_devices[pci_id].pd_subsys_id);
+}
+
+/*
+ * Return the guest physical address that was assigned to a device's BAR.
+ * Used by MMIO BARs (e.g. the MSI-X table) to register an emulation
+ * handler for the BAR's GPA range.  Returns 0 on error.
+ */
+uint64_t
+pci_get_bar_addr(uint8_t pci_id, int bar)
+{
+	uint8_t bar_reg_idx;
+
+	if (pci_id >= pci.pci_dev_ct || bar < 0 || bar >= PCI_MAX_BARS)
+		return (0);
+
+	bar_reg_idx = (PCI_MAPREG_START + (bar * 4)) / 4;
+	return (PCI_MAPREG_MEM_ADDR(
+	    pci.pci_devices[pci_id].pd_cfg_space[bar_reg_idx]));
 }

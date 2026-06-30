@@ -69,6 +69,31 @@ mmio_register(uint64_t base, uint64_t size,
 	return (0);
 }
 
+/*
+ * Relocate a previously-registered handler (matched by cookie) to a new
+ * base address.  The guest reprograms a device's MMIO BAR during PCI
+ * resource assignment, which moves the GPA window the handler covers;
+ * unlike I/O BARs (re-read live from config space on each access), an
+ * MMIO handler snapshots its base and must be told about the move.
+ *
+ * BAR assignment happens during early single-threaded boot, so updating
+ * the base (a single aligned store, read lock-free by mmio_find on other
+ * vcpu threads) does not race with live MMIO to this window.  Returns 0
+ * if a handler matched, -1 otherwise.
+ */
+int
+mmio_move(void *cookie, uint64_t new_base)
+{
+	int i;
+	for (i = 0; i < mmio_n_handlers; i++) {
+		if (mmio_handlers[i].cookie == cookie) {
+			mmio_handlers[i].base = new_base;
+			return (0);
+		}
+	}
+	return (-1);
+}
+
 static struct mmio_handler *
 mmio_find(uint64_t gpa)
 {

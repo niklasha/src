@@ -165,4 +165,10 @@ int	mmio_register(uint64_t, uint64_t,
 	    int (*)(uint64_t, uint8_t, uint64_t, void *),
 	    void *);
 
+/*
+ * Relocate a registered handler (matched by cookie) when the guest
+ * reprograms the device's MMIO BAR.  Returns 0 if moved, -1 if no match.
+ */
+int	mmio_move(void *cookie, uint64_t new_base);
+
 #endif /* _MMIO_H_ */
