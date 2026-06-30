@@ -212,7 +212,7 @@ extern struct vmd_vm *current_vm;
 #define L_O_WRITE_MASK	(L_O_WRONLY | L_O_RDWR | L_O_TRUNC | L_O_APPEND)
 
 #define VIOFS_MSIZE_MIN	512
-#define VIOFS_MSIZE_MAX	(64 * 1024)
+#define VIOFS_MSIZE_MAX	(256 * 1024)
 #define VIOFS_VERSION	"9P2000.L"
 
 /* Treaddir: each wire dirent = qid[13] off[8] type[1] namelen[2] + name. */
