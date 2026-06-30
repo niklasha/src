@@ -2194,7 +2194,7 @@ p9_setattr(struct p9_treq *req, struct p9_resp *resp)
 	uint32_t	 fid, valid, mode, uid, gid;
 	uint64_t	 size;
 	uint64_t	 atime_sec, atime_nsec, mtime_sec, mtime_nsec;
-	int		 cerr, did_times;
+	int		 cerr, did_times, tfd;
 
 	fid = p9_get32(req);
 	valid = p9_get32(req);
@@ -2248,9 +2248,34 @@ p9_setattr(struct p9_treq *req, struct p9_resp *resp)
 		}
 		if (ftruncate(f->fd, (off_t)size) == -1) {
 			cerr = errno;
-			viofs_restorecred();
-			p9_rlerror(resp, errno_xlate(cerr));
-			return;
+			/*
+			 * The held fd may be O_RDONLY: p9_walk opens a fid
+			 * read-only, and an O_TRUNC open truncates via
+			 * VOP_SETATTR(size=0) BEFORE the writable VOP_OPEN
+			 * (vfs_vnops.c vn_open), so a cold (freshly walked) fid is
+			 * not yet reopened for writing and ftruncate() fails
+			 * EINVAL.  Per 9P2000.L Tsetattr does not require the fid
+			 * to be open: obtain a writable fd via the carried parent
+			 * (as p9_lopen does for write-intent opens) and retry,
+			 * leaving the held fd's open mode untouched.
+			 */
+			if ((cerr == EINVAL || cerr == EBADF) && !f->is_dir &&
+			    f->parentfd != -1 && f->name[0] != '\0') {
+				tfd = openat(f->parentfd, f->name,
+				    O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
+				if (tfd == -1)
+					cerr = errno;
+				else {
+					cerr = ftruncate(tfd, (off_t)size) == -1
+					    ? errno : 0;
+					close(tfd);
+				}
+			}
+			if (cerr != 0) {
+				viofs_restorecred();
+				p9_rlerror(resp, errno_xlate(cerr));
+				return;
+			}
 		}
 	}
 
