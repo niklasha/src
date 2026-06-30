@@ -213,7 +213,7 @@ extern struct vmd *env;		/* M3b: trusted launcher policy (vmd_dev_*) */
 #define L_O_WRITE_MASK	(L_O_WRONLY | L_O_RDWR | L_O_TRUNC | L_O_APPEND)
 
 #define VIOFS_MSIZE_MIN	512
-#define VIOFS_MSIZE_MAX	(64 * 1024)
+#define VIOFS_MSIZE_MAX	(256 * 1024)
 #define VIOFS_VERSION	"9P2000.L"
 /*
  * M3b extended dialect.  When the guest proposes this version string in

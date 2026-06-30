@@ -34,6 +34,6 @@
 
 /* msize bounds mirror the host server (VIOFS_MSIZE_{MIN,MAX}, viofs.c). */
 #define VIO9P_MSIZE_MIN		512
-#define VIO9P_MSIZE_MAX		(64 * 1024)
+#define VIO9P_MSIZE_MAX		(256 * 1024)
 
 #endif /* _DEV_PV_VIO9PREG_H_ */
