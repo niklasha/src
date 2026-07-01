@@ -1584,6 +1584,7 @@ vionet_assert_pic_irq(struct virtio_dev *dev)
 	msg.irq = dev->irq;
 	msg.vcpu = 0; /* XXX: smp */
 	msg.type = VIODEV_MSG_KICK;
+	msg.vector = VIRTIO_MSI_NO_VECTOR; /* vionet is INTx-only, never MSI-X */
 	msg.state = INTR_STATE_ASSERT;
 
 	ret = imsg_compose_event2(&dev->async_iev, IMSG_DEVOP_MSG, 0, 0, -1,
@@ -1606,6 +1607,7 @@ vionet_deassert_pic_irq(struct virtio_dev *dev)
 	msg.irq = dev->irq;
 	msg.vcpu = 0; /* XXX: smp */
 	msg.type = VIODEV_MSG_KICK;
+	msg.vector = VIRTIO_MSI_NO_VECTOR; /* vionet is INTx-only, never MSI-X */
 	msg.state = INTR_STATE_DEASSERT;
 
 	ret = imsg_compose_event2(&dev->async_iev, IMSG_DEVOP_MSG, 0, 0, -1,
