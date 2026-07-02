@@ -40,11 +40,13 @@
 #define PAGE_MASK (PAGE_SIZE - 1)
 #endif
 
+#include "acpi.h"
 #include "i8253.h"
 #include "i8259.h"
 #include "ioapic.h"
 #include "lapic.h"
 #include "loadfile.h"
+#include "mptable.h"
 #include "mc146818.h"
 #include "ns8250.h"
 #include "pci.h"
@@ -59,6 +61,9 @@
  * vcpu_assert_irq / vcpu_deassert_irq use it to pulse IOAPIC pins so
  * APs receive ISA IRQs via mpbios's IOAPIC->LAPIC routing.
  */
+extern struct lapic	*lapic_smp_get(uint32_t);
+extern uint32_t		 lapic_smp_ncpus(void);
+extern struct ioapic	*lapic_smp_ioapic(void);
 
 /*
  * ACPI PM timer: 24-bit free-running counter at 3.579545 MHz.
@@ -86,12 +91,12 @@ vcpu_exit_acpi_pmtimer(struct vm_run_params *vrp)
 	uint32_t count;
 
 	if (vei->vei.vei_dir == VEI_DIR_OUT)
-		return (0xFF);	/* writes ignored */
+		return 0xFF;	/* writes ignored */
 
 	/* Only the PM timer port returns a meaningful value. */
 	if (vei->vei.vei_port != ACPI_PM_TIMER_PORT) {
 		set_return_data(vei, 0);
-		return (0xFF);
+		return 0xFF;
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
@@ -101,7 +106,7 @@ vcpu_exit_acpi_pmtimer(struct vm_run_params *vrp)
 	count &= 0x00FFFFFF;	/* 24-bit counter */
 
 	set_return_data(vei, count);
-	return (0xFF);
+	return 0xFF;
 }
 
 typedef uint8_t (*io_fn_t)(struct vm_run_params *);
@@ -119,6 +124,12 @@ static void	vcpu_exit_inout(struct vm_run_params *);
 
 extern struct vmd_vm	*current_vm;
 extern int		 con_fd;
+
+/*
+ * Set when the firmware is a (SeaBIOS) BIOS image rather than an ELF
+ * kernel; gates how the MP table is published in init_emulated_hw().
+ */
+static int vm_boot_is_bios;
 
 /*
  * Represents a standard register set for an OS to be booted
@@ -310,6 +321,12 @@ load_firmware(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 	 */
 	memcpy(vrs, &vcpu_init_flat64, sizeof(*vrs));
 
+	/*
+	 * Set when the firmware is a (SeaBIOS) BIOS image rather than an
+	 * ELF kernel; gates how the MP table is published below.
+	 */
+	vm_boot_is_bios = 0;
+
 	/* Find and open kernel image */
 	if ((fp = gzdopen(vm->vm_kernel, "r")) == NULL)
 		fatalx("failed to open kernel - exiting");
@@ -322,8 +339,10 @@ load_firmware(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 	 * with vm->vm_kernel and the file is not compressed)
 	 */
 	if (ret && errno == ENOEXEC && vm->vm_kernel != -1 &&
-	    gzdirect(fp) && (ret = fstat(vm->vm_kernel, &sb)) == 0)
+	    gzdirect(fp) && (ret = fstat(vm->vm_kernel, &sb)) == 0) {
 		ret = loadfile_bios(fp, sb.st_size, vrs);
+		vm_boot_is_bios = 1;
+	}
 
 	gzclose(fp);
 
@@ -437,6 +456,23 @@ init_emulated_hw(struct vmd_vm *vm, int child_cdrom,
 	ioports_map[TIMER_BASE + TIMER_CNTR1] = vcpu_exit_i8253;
 	ioports_map[TIMER_BASE + TIMER_CNTR2] = vcpu_exit_i8253;
 	ioports_map[PCKBC_AUX] = vcpu_exit_i8253_misc;
+	ioports_map[0x64] = vcpu_exit_i8253_misc;	/* KBC status: ready */
+	ioports_map[0x60] = vcpu_exit_i8253_misc;	/* KBC data */
+
+	/* Init ACPI PM timer */
+	acpi_pmtimer_init();
+	/*
+	 * ACPI PM I/O block: 0x600-0x60B (PM base).
+	 * Only the PM timer at +8 returns meaningful data; other offsets return
+	 * 0 on read and ignore writes.  NOTE: MUST stay below
+	 * VM_PCI_IO_BAR_BASE (0x1000): the PCI I/O BAR window (0x1000-0xFFFF)
+	 * is mapped to vcpu_exit_pci just below and would otherwise overwrite
+	 * these entries, misrouting PM1/PM-timer accesses to the PCI dispatcher
+	 * (guest ACPI reads garbage -> the "PM1 stuck" SCI spin).  The matching
+	 * FADT base is acpi.c ACPI_PM_BASE.
+	 */
+	for (i = 0x600; i <= 0x60B; i++)
+		ioports_map[i] = vcpu_exit_acpi_pmtimer;
 
 	/* Init mc146818 RTC */
 	mc146818_init(vm->vm_vmmid, memlo, memhi);
@@ -477,6 +513,31 @@ init_emulated_hw(struct vmd_vm *vm, int child_cdrom,
 	 * detection.
 	 */
 	fw_cfg_init(vmc);
+
+	/*
+	 * ELF boot: write MP table for guest SMP discovery.
+	 * IOAPIC's APIC ID must not collide with any LAPIC's APIC ID
+	 * (LAPIC IDs are 0..ncpus-1).  If it does, Linux renumbers
+	 * the colliding LAPIC, and subsequent IOAPIC RTE writes carry
+	 * the renumbered (out-of-range) APIC ID, causing silent IRQ
+	 * drops in ioapic_assert_to_lapic.  ncpus is safely above the
+	 * LAPIC range.
+	 */
+	if (vmc->vmc_ncpus > 1) {
+		/*
+		 * SeaBIOS owns the low-memory MP scan regions and its own
+		 * MP table mis-resolves at high vcpu counts, so hand it the
+		 * table via fw_cfg.  Direct ELF boot has no firmware loader,
+		 * so write it to guest RAM directly.
+		 */
+		if (vm_boot_is_bios) {
+			if (acpi_init(vmc->vmc_ncpus) != 0)
+				log_warnx("acpi_init failed");
+		} else if (mptable_init(vmc->vmc_ncpus, 0,
+		    vmc->vmc_ncpus) != 0)
+			log_warnx("mptable_init failed");
+	}
+
 	ioports_map[FW_CFG_IO_SELECT] = vcpu_exit_fw_cfg;
 	ioports_map[FW_CFG_IO_DATA] = vcpu_exit_fw_cfg;
 	ioports_map[FW_CFG_IO_DMA_ADDR_HIGH] = vcpu_exit_fw_cfg_dma;
@@ -548,6 +609,25 @@ vcpu_exit_inout(struct vm_run_params *vrp)
 		vcpu_assert_irq(vrp->vrp_vm_id, vrp->vrp_vcpu_id, intr);
 }
 
+/*
+ * vcpu_exit
+ *
+ * Handle a vcpu exit. This function is called when it is determined that
+ * vmm(4) requires the assistance of vmd to support a particular guest
+ * exit type (eg, accessing an I/O port or device). Guest state is contained
+ * in 'vrp', and will be resent to vmm(4) on exit completion.
+ *
+ * Upon conclusion of handling the exit, the function determines if any
+ * interrupts should be injected into the guest, and asserts the proper
+ * IRQ line whose interrupt should be vectored.
+ *
+ * Parameters:
+ *  vrp: vcpu run parameters containing guest state for this exit
+ *
+ * Return values:
+ *  0: the exit was handled successfully
+ *  1: an error occurred (eg, unknown exit reason passed in 'vrp')
+ */
 /* KVM hypercall number for SEND_IPI (from dev/pv/pvreg.h). */
 #define KVM_HC_SEND_IPI		10
 
@@ -589,11 +669,9 @@ vcpu_exit_vmcall(struct vm_run_params *vrp)
 	for (i = 0; i < 64; i++) {
 		if (bitmap_lo & (1ULL << i)) {
 			target = (uint32_t)(min + i);
-			/*
-			 * lapic_smp_deliver_ipi resolves APIC ID -> vcpu
+			/* lapic_smp_deliver_ipi resolves APIC ID -> vcpu
 			 * and silently ignores invalid targets, so no
-			 * bounds check needed here.
-			 */
+			 * bounds check needed here. */
 			lapic_smp_deliver_ipi(target, vec);
 			delivered++;
 		}
@@ -609,25 +687,6 @@ vcpu_exit_vmcall(struct vm_run_params *vrp)
 	vrs->vrs_gprs[VCPU_REGS_RAX] = delivered;
 }
 
-/*
- * vcpu_exit
- *
- * Handle a vcpu exit. This function is called when it is determined that
- * vmm(4) requires the assistance of vmd to support a particular guest
- * exit type (eg, accessing an I/O port or device). Guest state is contained
- * in 'vrp', and will be resent to vmm(4) on exit completion.
- *
- * Upon conclusion of handling the exit, the function determines if any
- * interrupts should be injected into the guest, and asserts the proper
- * IRQ line whose interrupt should be vectored.
- *
- * Parameters:
- *  vrp: vcpu run parameters containing guest state for this exit
- *
- * Return values:
- *  0: the exit was handled successfully
- *  1: an error occurred (eg, unknown exit reason passed in 'vrp')
- */
 int
 vcpu_exit(struct vm_run_params *vrp)
 {
@@ -704,8 +763,6 @@ vcpu_exit_eptviolation(struct vm_run_params *vrp)
 	struct x86_insn insn;
 	uint64_t va, pa;
 	size_t len = 15;		/* Max instruction length in x86. */
-	char hb[64];
-	int hi, hl;
 	switch (ve->vee.vee_fault_type) {
 	case VEE_FAULT_HANDLED:
 		break;
@@ -756,9 +813,10 @@ vcpu_exit_eptviolation(struct vm_run_params *vrp)
 		ret = insn_decode(ve, &insn);
 		if (ret == 0)
 			ret = insn_emulate(ve, &insn);
-mmio_done:
+	mmio_done:
 		if (ret != 0) {
-			hl = 0;
+			char hb[64];
+			int hi, hl = 0;
 			for (hi = 0; hi < 15 && hl < 60; hi++)
 				hl += snprintf(hb + hl, sizeof(hb) - hl,
 				    "%02x ", ve->vee.vee_insn_bytes[hi]);
@@ -1334,6 +1392,14 @@ intr_pending(struct vmd_vm *vm, uint32_t vcpu_id)
 }
 
 /*
+ * Side-effect-free counterpart to intr_pending(): does NOT fire/kick a
+ * due LAPIC timer (i8259_is_pending and lapic_pending_nofire are pure
+ * reads).  Safe to call while holding vcpu_run_mtx -- intr_pending()
+ * itself is not, because lapic_pending() can fire a timer whose kick
+ * re-enters vcpu_unhalt()/vcpu_run_mtx.  Used by the halt decision in
+ * vcpu_run_loop to catch a vector a racing timer-thread kick already set.
+ */
+/*
  * Undo a speculative intr_ack() when the kernel declined to inject the
  * vector (see vcpu_run_loop gated-ack).  Restores the LAPIC vector from
  * ISR back to IRR so it is retried, preventing a stranded ISR bit from
@@ -1353,14 +1419,6 @@ intr_unack(struct vmd_vm *vm, uint32_t vcpu_id, uint8_t vec)
 	}
 }
 
-/*
- * Side-effect-free counterpart to intr_pending(): does NOT fire/kick a
- * due LAPIC timer (i8259_is_pending and lapic_pending_nofire are pure
- * reads).  Safe to call while holding vcpu_run_mtx -- intr_pending()
- * itself is not, because lapic_pending() can fire a timer whose kick
- * re-enters vcpu_unhalt()/vcpu_run_mtx.  Used by the halt decision in
- * vcpu_run_loop to catch a vector a racing timer-thread kick already set.
- */
 int
 intr_pending_nofire(struct vmd_vm *vm, uint32_t vcpu_id)
 {
@@ -1389,7 +1447,7 @@ intr_ack(struct vmd_vm *vm, uint32_t vcpu_id)
 	/* Same priority as intr_pending: i8259 first. */
 	if (vcpu_id == 0 && i8259_is_pending())
 		/* i8259 first: timer can starve disk IRQs */
-		return (i8259_ack());
+		return i8259_ack();
 	if (l != NULL && lvec >= 0)
 		return ((int)lapic_ack(l));
 	return (0xff);		/* spurious */

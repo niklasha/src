@@ -32,6 +32,8 @@
 #define	FW_CFG_SIGNATURE	0x0000
 #define	FW_CFG_ID		0x0001
 #define	FW_CFG_NOGRAPHIC	0x0004
+#define	FW_CFG_NB_CPUS		0x0005
+#define	FW_CFG_MAX_CPUS		0x000f
 #define	FW_CFG_FILE_DIR		0x0019
 #define	FW_CFG_FILE_FIRST	0x0020
 
@@ -62,6 +64,7 @@ static struct fw_cfg_state {
 } fw_cfg_state;
 
 static uint64_t	fw_cfg_dma_addr;
+static uint16_t	fw_cfg_ncpus;
 
 static bios_memmap_t e820[VMM_MAX_MEM_RANGES];
 
@@ -98,6 +101,8 @@ fw_cfg_init(struct vmop_create_params *vmc)
 
 	/* do not double print chars on serial port */
 	fw_cfg_add_file("etc/screen-and-debug", &sd, sizeof(sd));
+
+	fw_cfg_ncpus = htole16((uint16_t)vmc->vmc_ncpus);
 
 	switch (vmc->vmc_bootdevice) {
 	case VMBOOTDEV_DISK:
@@ -158,6 +163,10 @@ fw_cfg_select(uint16_t selector)
 		break;
 	case FW_CFG_NOGRAPHIC:
 		fw_cfg_set_state(&one, sizeof(one));
+		break;
+	case FW_CFG_NB_CPUS:
+	case FW_CFG_MAX_CPUS:
+		fw_cfg_set_state(&fw_cfg_ncpus, sizeof(fw_cfg_ncpus));
 		break;
 	case FW_CFG_FILE_DIR:
 		fw_cfg_file_dir();
