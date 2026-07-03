@@ -494,7 +494,7 @@ vcpu_process_com_msr(struct vm_exit *vei)
 		 *
 		 * Read from MSR. We always report DCD, DSR, and CTS.
 		 */
-		set_return_data(vei, com1_dev.regs.lsr | MSR_DCD | MSR_DSR |
+		set_return_data(vei, com1_dev.regs.msr | MSR_DCD | MSR_DSR |
 		    MSR_CTS);
 	}
 }
