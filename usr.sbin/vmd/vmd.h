@@ -50,10 +50,6 @@
 #define MB(x)	(x * 1024UL * 1024UL)
 #define GB(x)	(x * 1024UL * 1024UL * 1024UL)
 
-/* Debug-only SMP trace; each including .c file must have "env" in scope. */
-#define DPRINTF_SMP(x...)						\
-	do { if (env->vmd_verbose >= 2) log_warnx(x); } while (0)
-
 #define VMD_USER		"_vmd"
 #define VMD_CONF		"/etc/vm.conf"
 #define SOCKET_NAME		"/var/run/vmd.sock"
@@ -423,6 +419,8 @@ struct vmd {
 
 	int			 vmd_debug;
 	int			 vmd_verbose;
+#define DPRINTF_SMP(x...)						\
+	do { if (env->vmd_verbose >= 2) log_warnx(x); } while (0)
 	int			 vmd_noaction;
 
 	uint32_t		 vmd_nvm;
@@ -451,6 +449,7 @@ enum pipe_msg_type {
 	I8253_RESET_CHAN_2 = 2,
 	NS8250_ZERO_READ,
 	NS8250_RATELIMIT,
+	NS8250_REENABLE_RX,
 	MC146818_RESCHEDULE_PER,
 	VIRTIO_NOTIFY,
 	VIRTIO_RAISE_IRQ,
@@ -597,6 +596,7 @@ int	 lapic_smp_timer_start(void);
 void	 lapic_smp_timer_stop(void);
 void	 lapic_smp_free(void);
 void	 lapic_smp_deliver_ipi(uint32_t, uint8_t);
+
 
 /* config.c */
 int	 config_init(struct vmd *);
