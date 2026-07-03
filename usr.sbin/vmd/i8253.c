@@ -349,6 +349,8 @@ i8253_reset(uint8_t chn)
 	i8253_channel[chn].in_use = 1;
 	i8253_channel[chn].state = 0;
 	tv.tv_usec = (i8253_channel[chn].start * NS_PER_TICK) / 1000;
+	if (tv.tv_usec < 1000)
+		tv.tv_usec = 1000;
 	clock_gettime(CLOCK_MONOTONIC, &i8253_channel[chn].ts);
 	evtimer_add(&i8253_channel[chn].timer, &tv);
 }
@@ -375,6 +377,8 @@ i8253_fire(int fd, short type, void *arg)
 	if (ctr->mode != TIMER_INTTC) {
 		timerclear(&tv);
 		tv.tv_usec = (ctr->start * NS_PER_TICK) / 1000;
+		if (tv.tv_usec < 1000)
+			tv.tv_usec = 1000;
 		evtimer_add(&ctr->timer, &tv);
 	} else
 		ctr->state = 1;
