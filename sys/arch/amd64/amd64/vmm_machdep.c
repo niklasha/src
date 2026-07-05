@@ -3003,7 +3003,36 @@ vcpu_init(struct vcpu *vcpu, struct vm_create_params *vcp)
 void
 vcpu_deinit_vmx(struct vcpu *vcpu)
 {
+	/*
+	 * If this VMCS is still launched and current on a (possibly
+	 * remote) cpu, that cpu can write cached VMCS host state back
+	 * into the page after km_free() below returns it to the
+	 * allocator, corrupting whatever the page is recycled for.
+	 * Retire it first, exactly as vmm_quiesce_vmx() does before
+	 * suspend and vcpu_reload_vmcs_vmx() does before migration.
+	 */
+	if (atomic_load_int(&vcpu->vc_vmx_vmcs_state) == VMCS_LAUNCHED) {
+#ifdef MULTIPROCESSOR
+		if (vcpu->vc_last_pcpu != curcpu()) {
+			/* Remote cpu vmclear via ipi. */
+			if (vmx_remote_vmclear(vcpu->vc_last_pcpu, vcpu))
+				printf("%s: failed to remote vmclear "
+				    "vcpu %d of vm %d\n", __func__,
+				    vcpu->vc_id, vcpu->vc_parent->vm_id);
+		} else
+#endif
+		{
+			/* Local cpu vmclear instruction. */
+			if (vmclear(&vcpu->vc_control_pa))
+				printf("%s: failed to locally vmclear "
+				    "vcpu %d of vm %d\n", __func__,
+				    vcpu->vc_id, vcpu->vc_parent->vm_id);
+			atomic_swap_uint(&vcpu->vc_vmx_vmcs_state,
+			    VMCS_CLEARED);
+		}
+	}
 	if (vcpu->vc_control_va) {
+
 		km_free((void *)vcpu->vc_control_va, PAGE_SIZE,
 		    &kv_page, &kp_zero);
 		vcpu->vc_control_va = 0;
