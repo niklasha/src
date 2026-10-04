@@ -58,8 +58,13 @@ _xdr_ypresp_all_seq(XDR *xdrs, u_long *objp)
 			*objp = (u_long)YP_YPERR;
 			goto fail;
 		}
-		if (out.more == 0)
+		if (out.more == 0) {
+			/* clean end of data, also for an empty map */
+			*objp = (u_long)YP_TRUE;
+			rc = TRUE;
+			done = 1;
 			goto fail;
+		}
 		status = out.ypresp_all_u.val.stat;
 		if (status == YP_TRUE) {
 			size = out.ypresp_all_u.val.key.keydat_len;
@@ -104,7 +109,7 @@ yp_all(const char *dom, const char *inmap, struct ypall_callback *incallback)
 	struct dom_binding ypbinding;
 	struct timeval  tv;
 	int connected = 1;
-	u_long		status;
+	u_long		status = (u_long)YP_YPERR;
 	int		r = 0, s;
 
 	if (dom == NULL || strlen(dom) == 0)
