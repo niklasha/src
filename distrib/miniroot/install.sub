@@ -2034,9 +2034,10 @@ install_http() {
 	if [[ -n $INSTALL_MIRROR ]]; then
 		INSTALL_URL=$_http_proto://$INSTALL_MIRROR
 	else
-		# Remove the architecture and snapshots or version part.
+		# Remove the architecture and snapshots, version or Appli
+		# baseline (blNN) part.
 		INSTALL_URL=${_url_base%/$ARCH}
-		INSTALL_URL=${INSTALL_URL%@(/$VNAME|/snapshots)}
+		INSTALL_URL=${INSTALL_URL%@(/$VNAME|/snapshots|/bl+([0-9]))}
 	fi
 }
 
