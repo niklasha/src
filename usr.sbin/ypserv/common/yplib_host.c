@@ -250,8 +250,13 @@ ypserv_xdr_ypresp_all_seq(XDR *xdrs, u_long *objp)
 			*objp = (u_long)YP_YPERR;
 			goto fail;
 		}
-		if (out.more == 0)
+		if (out.more == 0) {
+			/* clean end of data, also for an empty map */
+			*objp = (u_long)YP_TRUE;
+			rc = TRUE;
+			done = 1;
 			goto fail;
+		}
 		status = out.ypresp_all_u.val.stat;
 		if (status == YP_TRUE) {
 			size = out.ypresp_all_u.val.key.keydat_len;
@@ -295,7 +300,7 @@ yp_all_host(CLIENT *client, char *indomain, char *inmap,
 {
 	struct ypreq_nokey yprnk;
 	struct timeval tv;
-	u_long status;
+	u_long status = (u_long)YP_YPERR;
 
 	tv.tv_sec = _yplib_host_timeout;
 	tv.tv_usec = 0;
