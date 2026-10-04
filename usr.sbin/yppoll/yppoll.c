@@ -44,7 +44,7 @@
 
 #include <rpc/rpc.h>
 #include <rpc/xdr.h>
-#include <rpcsvc/yp_prot.h>
+#include <rpcsvc/yp.h>
 #include <rpcsvc/ypclnt.h>
 
 static void
@@ -106,7 +106,7 @@ get_remote_info(char *indomain, char *inmap, char *server, int *outorder,
 	*outorder = ypro.ordernum;
 	xdr_free(xdr_ypresp_order, (char *)&ypro);
 
-	r = ypprot_err(ypro.status);
+	r = ypprot_err(ypro.stat);
 	if (r == RPC_SUCCESS) {
 		bzero((char *)&yprm, sizeof yprm);
 
@@ -114,9 +114,9 @@ get_remote_info(char *indomain, char *inmap, char *server, int *outorder,
 		    &yprnk, xdr_ypresp_master, &yprm, tv);
 		if (r != RPC_SUCCESS)
 			clnt_perror(client, "yp_master: clnt_call");
-		r = ypprot_err(yprm.status);
+		r = ypprot_err(yprm.stat);
 		if (r==0)
-			*outname = (char *)strdup(yprm.master);
+			*outname = (char *)strdup(yprm.peer);
 		xdr_free(xdr_ypresp_master, (char *)&yprm);
 	}
 	clnt_destroy(client);
