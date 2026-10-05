@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: December 7 2020 $
+.Dd $Mdocdate: October 5 2026 $
 .Dt SYSPATCH 8
 .Os
 .Sh NAME
@@ -22,12 +22,30 @@
 .Nd manage base system binary patches
 .Sh SYNOPSIS
 .Nm syspatch
+.Op Fl O
 .Op Fl c | l | R | r
 .Sh DESCRIPTION
 .Nm
 is a utility to fetch, verify, install and revert
 .Ox
 binary patches.
+On Appli baseline systems it uses the patches of the running baseline
+rather than the official
+.Ox
+ones:
+the baseline number is derived from the release
+.Pq Ox 8.0 is baseline 43 ,
+patches are fetched from
+.Pa blNN/syspatch/<arch>
+below the mirror in
+.Pa /etc/installurl ,
+verified with
+.Pa /etc/signify/baseline-NN-syspatch.pub
+and named
+.Pa blNN-NNN_name .
+Kernel patches can only be applied to the Appli kernels
+.Pq Dv GENERIC_APPLI.MP No and Dv GENERIC_APPLI.VMM ;
+a patch carrying kernel objects but none for the running kernel is refused.
 .Pp
 When run without any options,
 .Nm syspatch
@@ -42,6 +60,22 @@ of them.
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
+.It Fl O
+Use the official
+.Ox
+syspatches instead, fetched directly from
+.Lk https://cdn.openbsd.org/pub/OpenBSD/syspatch/ ,
+bypassing the mirror, verified with
+.Pa /etc/signify/openbsd-XY-syspatch.pub
+and named
+.Pa XY-NNN_name .
+With
+.Fl c
+this only shows which official patches exist.
+Installing them replaces Appli-built files with upstream builds and is
+dangerous; it requires typing
+.Dq yes
+on a terminal.
 .It Fl c
 List available patches; suitable for
 .Xr cron 8 .
@@ -55,12 +89,16 @@ Revert the most recently installed patch.
 .Sh FILES
 .Bl -tag -width "/etc/installurl" -compact
 .It Pa /etc/installurl
-.Ox
-mirror top-level URL for fetching patches.
+Mirror top-level URL; Appli patches are fetched from
+.Pa blNN/syspatch/<arch>
+below it.
+.It Pa /etc/signify/baseline-NN-syspatch.pub
+Public key used to verify Appli baseline patches.
 .It Pa /var/syspatch/*
-Directories containing the rollback tarball and original signed
+Directories containing the rollback tarball and the
 .Xr diff 1
-of installed patches.
+of installed patches
+.Pq Pa blNN-NNN_name No for Appli , Pa XY-NNN_name No for official patches .
 .El
 .Sh EXIT STATUS
 .Ex -std syspatch
@@ -80,6 +118,8 @@ was written by
 .An Antoine Jacoutot Aq Mt ajacoutot@openbsd.org .
 .Sh CAVEATS
 .Nm
-is designed to work solely on official
+is designed to work solely on Appli baseline releases and, with
+.Fl O ,
+official
 .Ox
 releases.

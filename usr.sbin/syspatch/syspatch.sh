@@ -28,7 +28,7 @@ err()
 
 usage()
 {
-	echo "usage: ${0##*/} [-c | -l | -R | -r]" 1>&2
+	echo "usage: ${0##*/} [-O] [-c | -l | -R | -r]" 1>&2
 	return 1
 }
 
@@ -41,14 +41,27 @@ apply_patch()
 
 	fetch_and_verify "syspatch${_patch}.tgz"
 
+	# a patch carrying kernel objects must have them for the running
+	# kernel; only the Appli kernels can be patched (this also refuses
+	# upstream GENERIC kernel patches fetched with -O)
+	if tar -tzf ${_TMP}/syspatch${_patch}.tgz |
+	    grep -q '^usr/share/relink/kernel/' &&
+	    ! tar -tzf ${_TMP}/syspatch${_patch}.tgz |
+	    grep -q "^usr/share/relink/kernel/${_KERNEL}/"; then
+		err "patch ${_patch##${_PFX}-} has no kernel objects for \
+${_KERNEL} (supported: ${_KERNELS})"
+	fi
+
 	trap '' INT
-	echo "Installing patch ${_patch##${_OSrev}-}"
+	echo "Installing patch ${_patch##${_PFX}-}"
 	install -d ${_edir} ${_PDIR}/${_patch}
 
-	_kernel=$(sysctl -n kern.osversion)
-	[[ ${_kernel%#*} == "GENERIC.MP" ]] &&
-		_s="-s @usr/share/relink/kernel/GENERIC/.*@@g" ||
-		_s="-s @usr/share/relink/kernel/GENERIC.MP/.*@@g"
+	# install only the relink objects of the running kernel
+	_s=
+	for _kernel in ${_KERNELS}; do
+		[[ ${_kernel} == ${_KERNEL} ]] ||
+			_s="${_s} -s @usr/share/relink/kernel/${_kernel}/.*@@g"
+	done
 	_files="$(tar -xvzphf ${_TMP}/syspatch${_patch}.tgz -C ${_edir} \
 		${_s})" || { rm -r ${_PDIR}/${_patch}; return 1; }
 
@@ -62,7 +75,7 @@ apply_patch()
 	done
 
 	if ((_rc != 0)); then
-		err "Failed to apply patch ${_patch##${_OSrev}-}" 0
+		err "Failed to apply patch ${_patch##${_PFX}-}" 0
 		rollback_patch; return ${_rc}
 	fi
 	# don't fill up /tmp when installing multiple patches at once; non-fatal
@@ -70,7 +83,7 @@ apply_patch()
 	trap exit INT
 
 	echo ${_files} | grep -Eqv \
-		'(^|[[:blank:]]+)usr/share/relink/kernel/GENERI(C|C.MP)/[[:print:]]+([[:blank:]]+|$)' ||
+		'(^|[[:blank:]]+)usr/share/relink/kernel/GENERIC_APPLI\.(MP|VMM)/[[:print:]]+([[:blank:]]+|$)' ||
 		_KARL=true
 
 	(! ${_upself} || err "updated itself, run it again to install \
@@ -128,7 +141,7 @@ create_rollback()
 	tar -C / -czf ${_PDIR}/${_patch}/rollback.tgz ${_rbfiles} || _rc=$?
 
 	if ((_rc != 0)); then
-		err "Failed to create rollback patch ${_patch##${_OSrev}-}" 0
+		err "Failed to create rollback patch ${_patch##${_PFX}-}" 0
 		rm -r ${_PDIR}/${_patch}; return ${_rc}
 	fi
 }
@@ -163,8 +176,8 @@ install_file()
 ls_installed()
 {
 	local _p
-	for _p in ${_PDIR}/${_OSrev}-+([[:digit:]])_+([[:alnum:]_-]); do
-		[[ -f ${_p}/rollback.tgz ]] && echo ${_p##*/${_OSrev}-}
+	for _p in ${_PDIR}/${_PFX}-+([[:digit:]])_+([[:alnum:]_-]); do
+		[[ -f ${_p}/rollback.tgz ]] && echo ${_p##*/${_PFX}-}
 	done
 }
 
@@ -176,21 +189,21 @@ ls_missing()
 	unpriv -f "${_sha}.sig" ftp -N syspatch -MVo "${_sha}.sig" \
 		"${_MIRROR}/SHA256.sig" >/dev/null
 	unpriv -f "${_sha}" signify -Veq -x ${_sha}.sig -m ${_sha} -p \
-		/etc/signify/openbsd-${_OSrev}-syspatch.pub >/dev/null
+		${_SIGKEY} >/dev/null
 
 	# sig file less than 3 lines long doesn't list any patch (new release)
 	(($(grep -c ".*" ${_sha}.sig) < 3)) && return
 
 	set -o pipefail
-	grep -Eo "syspatch${_OSrev}-[[:digit:]]{3}_[[:alnum:]_-]+" ${_sha} |
-		while read _c; do _c=${_c##syspatch${_OSrev}-} &&
+	grep -Eo "syspatch${_PFX}-[[:digit:]]{3}_[[:alnum:]_-]+" ${_sha} |
+		while read _c; do _c=${_c##syspatch${_PFX}-} &&
 		[[ -n ${_l} ]] && echo ${_c} | grep -qw -- "${_l}" || echo ${_c}
 	done | while read _p; do
 		# no earlier version of _all_ files contained in the tgz
 		# exists on the system, it means a missing set: skip it;
 		# otherwise stop ftp(1) and tell pipefail it's not an error
 		{ unpriv "ftp -N syspatch -MVo - \
-			${_MIRROR}/syspatch${_OSrev}-${_p}.tgz" |
+			${_MIRROR}/syspatch${_PFX}-${_p}.tgz" |
 			(cd ${TMPDIR:-/tmp} && unpriv "tar tzf -") |
 			while read _f; do
 			[[ -f /${_f} ]] || continue && echo ${_p} && pkill -u \
@@ -208,10 +221,10 @@ rollback_patch()
 	[[ -n ${_patch} ]] || return 0 # nothing to rollback
 
 	_edir=${_TMP}/${_patch}-rollback
-	_patch=${_OSrev}-${_patch}
+	_patch=${_PFX}-${_patch}
 
 	trap '' INT
-	echo "Reverting patch ${_patch##${_OSrev}-}"
+	echo "Reverting patch ${_patch##${_PFX}-}"
 	install -d ${_edir}
 
 	_files="$(tar xvzphf ${_PDIR}/${_patch}/rollback.tgz -C ${_edir})"
@@ -224,12 +237,12 @@ rollback_patch()
 
 	((_rc != 0)) || rm -r ${_PDIR}/${_patch} || _rc=$?
 	((_rc == 0)) ||
-		err "Failed to revert patch ${_patch##${_OSrev}-}" ${_rc}
+		err "Failed to revert patch ${_patch##${_PFX}-}" ${_rc}
 	rm -rf ${_edir} # don't fill up /tmp when using `-R'; non-fatal
 	trap exit INT
 
 	echo ${_files} | grep -Eqv \
-		'(^|[[:blank:]]+)usr/share/relink/kernel/GENERI(C|C.MP)/[[:print:]]+([[:blank:]]+|$)' ||
+		'(^|[[:blank:]]+)usr/share/relink/kernel/GENERIC_APPLI\.(MP|VMM)/[[:print:]]+([[:blank:]]+|$)' ||
 		_KARL=true
 }
 
@@ -283,6 +296,14 @@ set -A _KERNV -- $(sysctl -n kern.version |
 	sed 's/^OpenBSD \([1-9][0-9]*\.[0-9]\)\([^ ]*\).*/\1 \2/;q')
 ((${#_KERNV[*]} > 1)) && err "Unsupported release: ${_KERNV[0]}${_KERNV[1]}"
 
+# -O: official OpenBSD syspatches instead of the Appli baseline ones
+_OFFICIAL=false
+if [[ $1 == -O* ]]; then
+	_OFFICIAL=true
+	_a=${1#-O}; shift
+	[[ -n ${_a} ]] && set -- -${_a} "$@"
+fi
+
 [[ $@ == @(|-[[:alpha:]]) ]] || usage; [[ $@ == @(|-(c|R|r)) ]] &&
 	(($(id -u) != 0)) && err "need root privileges"
 [[ $@ == @(|-(R|r)) ]] && pgrep -U 0 -qxf '/bin/ksh .*reorder_kernel$' &&
@@ -291,19 +312,37 @@ set -A _KERNV -- $(sysctl -n kern.version |
 _OSrev=${_KERNV[0]%.*}${_KERNV[0]#*.}
 [[ -n ${_OSrev} ]]
 
-_MIRROR=$(while read _line; do _line=${_line%%#*}; [[ -n ${_line} ]] &&
-	print -r -- "${_line}" | grep -v '[[:cntrl:]"$&;<>\`|'\']
-	done </etc/installurl | tail -1) 2>/dev/null
-[[ ${_MIRROR} == @(file|ftp|http|https)://* ]] ||
-	_MIRROR=https://cdn.openbsd.org/pub/OpenBSD
-_MIRROR="${_MIRROR}/syspatch/${_KERNV[0]}/$(machine)"
+# Appli baseline number, as in sysupgrade -A (8.0 -> 43)
+_BL=$((_OSrev - 37))
+
+# only the Appli kernels can receive kernel syspatches
+_KERNELS="GENERIC_APPLI.MP GENERIC_APPLI.VMM"
+_KERNEL=$(sysctl -n kern.osversion)
+_KERNEL=${_KERNEL%#*}
+
+if ${_OFFICIAL}; then
+	# bypass the installurl mirror, which blocks upstream syspatches
+	_MIRROR="https://cdn.openbsd.org/pub/OpenBSD/syspatch/${_KERNV[0]}/$(machine)"
+	_SIGKEY=/etc/signify/openbsd-${_OSrev}-syspatch.pub
+	_PFX=${_OSrev}		# syspatch80-NNN_name.tgz, /var/syspatch/80-NNN_name
+else
+	_MIRROR=$(while read _line; do _line=${_line%%#*}; [[ -n ${_line} ]] &&
+		print -r -- "${_line}" | grep -v '[[:cntrl:]"$&;<>\`|'\']
+		done </etc/installurl | tail -1) 2>/dev/null
+	[[ ${_MIRROR} == @(file|ftp|http|https)://* ]] ||
+		err "no usable mirror in /etc/installurl"
+	_MIRROR="${_MIRROR}/bl${_BL}/syspatch/$(machine)"
+	_SIGKEY=/etc/signify/baseline-${_BL}-syspatch.pub
+	_PFX=bl${_BL}		# syspatchbl43-NNN_name.tgz, /var/syspatch/bl43-NNN_name
+fi
 
 _PATCH_APPLIED=false
 _PDIR="/var/syspatch"
 _TMP=$(mktemp -d -p ${TMPDIR:-/tmp} syspatch.XXXXXXXXXX)
 _KARL=false
 
-readonly _KERNV _MIRROR _OSrev _PDIR _TMP
+readonly _BL _KERNEL _KERNELS _KERNV _MIRROR _OFFICIAL _OSrev _PDIR _PFX \
+	_SIGKEY _TMP
 
 trap 'trap_handler' EXIT
 trap exit HUP INT TERM
@@ -322,16 +361,25 @@ shift $((OPTIND - 1))
 
 # default action: apply all patches
 if ((OPTIND == 1)); then
-	# remove non matching release /var/syspatch/ content
+	# remove non matching release /var/syspatch/ content; keep both the
+	# Appli (blNN-) and the official (OSrev-) patches of this release
 	for _D in ${_PDIR}/{.[!.],}*; do
 		[[ -e ${_D} ]] || continue
-		[[ ${_D##*/} == ${_OSrev}-+([[:digit:]])_+([[:alnum:]_-]) ]] &&
+		[[ ${_D##*/} == @(bl${_BL}|${_OSrev})-+([[:digit:]])_+([[:alnum:]_-]) ]] &&
 			[[ -f ${_D}/rollback.tgz ]] || rm -r ${_D}
 	done
 	_PATCHES=$(ls_missing) # can't use errexit in a for loop
 	[[ -n ${_PATCHES} ]] || exit 2
+	if ${_OFFICIAL}; then
+		echo "WARNING: official OpenBSD syspatches replace Appli-built" \
+		    "files with upstream\nbuilds; kernel patches cannot be" \
+		    "applied to ${_KERNEL}. Patches:" ${_PATCHES} 1>&2
+		[[ -t 0 ]] || err "-O requires confirmation on a terminal"
+		read _ans?"Type 'yes' to install official syspatches: "
+		[[ ${_ans} == yes ]] || err "aborted"
+	fi
 	for _PATCH in ${_PATCHES}; do
-		apply_patch ${_OSrev}-${_PATCH}
+		apply_patch ${_PFX}-${_PATCH}
 		_PATCH_APPLIED=true
 	done
 fi
