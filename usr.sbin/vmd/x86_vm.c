@@ -695,6 +695,15 @@ vcpu_exit_eptviolation(struct vm_run_params *vrp)
 		break;
 
 	case VEE_FAULT_MMIO_ASSIST:
+		/*
+		 * AMD SVM decode assist reports the bytes it fetched, which
+		 * can be none (the fetch itself faulted) or, if bogus, more
+		 * than an instruction can hold.  Fetch them ourselves then.
+		 */
+		if ((ve->vee.vee_insn_info & VEE_BYTES_VALID) &&
+		    (ve->vee.vee_insn_len == 0 || ve->vee.vee_insn_len > 15))
+			ve->vee.vee_insn_info &= ~VEE_BYTES_VALID;
+
 		/* Intel VMX might give us the length of the instruction. */
 		if (ve->vee.vee_insn_info & VEE_LEN_VALID)
 			len = ve->vee.vee_insn_len;
