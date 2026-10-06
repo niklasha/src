@@ -689,11 +689,21 @@ vcpu_exit_eptviolation(struct vm_run_params *vrp)
 	struct x86_insn insn;
 	uint64_t va, pa;
 	size_t len = 15;		/* Max instruction length in x86. */
+	size_t first;
 	switch (ve->vee.vee_fault_type) {
 	case VEE_FAULT_HANDLED:
 		break;
 
 	case VEE_FAULT_MMIO_ASSIST:
+		/*
+		 * AMD SVM decode assist reports the bytes it fetched, which
+		 * can be none (the fetch itself faulted) or, if bogus, more
+		 * than an instruction can hold.  Fetch them ourselves then.
+		 */
+		if ((ve->vee.vee_insn_info & VEE_BYTES_VALID) &&
+		    (ve->vee.vee_insn_len == 0 || ve->vee.vee_insn_len > 15))
+			ve->vee.vee_insn_info &= ~VEE_BYTES_VALID;
+
 		/* Intel VMX might give us the length of the instruction. */
 		if (ve->vee.vee_insn_info & VEE_LEN_VALID)
 			len = ve->vee.vee_insn_len;
@@ -708,13 +718,15 @@ vcpu_exit_eptviolation(struct vm_run_params *vrp)
 			    sizeof(ve->vee.vee_insn_bytes));
 			va = ve->vrs.vrs_gprs[VCPU_REGS_RIP];
 
-			/* XXX Only support instructions that fit on 1 page. */
-			if ((va & PAGE_MASK) + len > PAGE_SIZE) {
-				log_warnx("%s: instruction might cross page "
-				    "boundary", __func__);
-				ret = EINVAL;
-				break;
-			}
+			/*
+			 * The instruction may straddle a page boundary, in
+			 * which case the two guest pages need not be
+			 * physically contiguous.  Translate and fetch each
+			 * part separately.
+			 */
+			first = PAGE_SIZE - (va & PAGE_MASK);
+			if (first > len)
+				first = len;
 
 			ret = translate_gva(ve, va, &pa, PROT_EXEC);
 			if (ret != 0) {
@@ -723,11 +735,35 @@ vcpu_exit_eptviolation(struct vm_run_params *vrp)
 				break;
 			}
 
-			ret = read_mem(pa, ve->vee.vee_insn_bytes, len);
+			ret = read_mem(pa, ve->vee.vee_insn_bytes, first);
 			if (ret != 0) {
 				log_warnx("%s: failed to fetch instruction "
 				    "bytes from 0x%llx", __func__, pa);
 				break;
+			}
+
+			if (first < len) {
+				if (translate_gva(ve, va + first, &pa,
+				    PROT_EXEC) != 0 ||
+				    read_mem(pa, ve->vee.vee_insn_bytes + first,
+				    len - first) != 0) {
+					/*
+					 * Without a length from the CPU we
+					 * fetched the maximum; a short
+					 * instruction may still be complete
+					 * on the first page.  The decoder
+					 * fails if it is not.
+					 */
+					if (ve->vee.vee_insn_info &
+					    VEE_LEN_VALID) {
+						log_warnx("%s: failed to fetch "
+						    "instruction bytes across "
+						    "page boundary", __func__);
+						ret = EFAULT;
+						break;
+					}
+					len = first;
+				}
 			}
 			ve->vee.vee_insn_len = len;
 		}
