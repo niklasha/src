@@ -2839,6 +2839,12 @@ viofs_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	used = (struct vring_used *)(vr + vq_info->vq_usedoffset);
 
 	while (idx != avail->idx) {
+		/*
+		 * Read barrier: avail->idx has been observed; make sure the
+		 * ring slot and the descriptor the driver published before
+		 * it are not read stale (the guest vcpu runs on another CPU).
+		 */
+		__sync_synchronize();
 		__sync_synchronize();
 		head = avail->ring[idx & mask];
 

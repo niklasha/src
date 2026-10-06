@@ -2236,6 +2236,12 @@ vioscsi_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 			goto out;
 		}
 
+		/*
+		 * Read barrier: avail->idx has been observed; make sure the
+		 * ring slot and the descriptor the driver published before
+		 * it are not read stale (the guest vcpu runs on another CPU).
+		 */
+		__sync_synchronize();
 		acct.req_idx = acct.avail->ring[acct.idx] & vq_info->mask;
 		acct.req_desc = &(acct.desc[acct.req_idx]);
 

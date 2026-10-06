@@ -381,6 +381,12 @@ vionet_rx(struct virtio_dev *dev, int fd)
 	used->flags |= VRING_USED_F_NO_NOTIFY;
 
 	while (idx != avail->idx) {
+		/*
+		 * Read barrier: avail->idx has been observed; make sure the
+		 * ring slot and the descriptor the driver published before
+		 * it are not read stale (the guest vcpu runs on another CPU).
+		 */
+		__sync_synchronize();
 		hdr_idx = avail->ring[idx & vq_info->mask];
 		desc = &table[hdr_idx & vq_info->mask];
 		if (!DESC_WRITABLE(desc)) {
@@ -753,6 +759,12 @@ vionet_tx(struct virtio_dev *dev)
 	used = vq_info->q_used_hva;
 
 	while (idx != avail->idx) {
+		/*
+		 * Read barrier: avail->idx has been observed; make sure the
+		 * ring slot and the descriptor the driver published before
+		 * it are not read stale (the guest vcpu runs on another CPU).
+		 */
+		__sync_synchronize();
 		hdr_idx = avail->ring[idx & vq_info->mask];
 		desc = &table[hdr_idx & vq_info->mask];
 		if (DESC_WRITABLE(desc)) {
