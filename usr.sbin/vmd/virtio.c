@@ -1392,6 +1392,7 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 				log_warnx("can't add bar for virtio 9p device");
 				return (1);
 			}
+			virtio_pci_add_intr_caps(id, dev->num_queues);
 			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_COMMON_CFG,
 			    bar_id, 0);
 			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_DEVICE_CFG,
