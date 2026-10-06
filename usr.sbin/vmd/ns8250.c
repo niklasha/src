@@ -69,6 +69,9 @@ ns8250_pipe_dispatch(int fd, short event, void *arg)
 	case NS8250_RATELIMIT:
 		evtimer_add(&com1_dev.rate, &com1_dev.rate_tv);
 		break;
+	case NS8250_REENABLE_RX:
+		event_add(&com1_dev.event, NULL);
+		break;
 	default:
 		fatalx("%s: unexpected pipe message %d", __func__, msg);
 	}
@@ -165,8 +168,17 @@ com_rcv_event(int fd, short kind, void *arg)
 		return;
 	}
 
-	if ((com1_dev.regs.lsr & LSR_RXRDY) == 0)
+	if ((com1_dev.regs.lsr & LSR_RXRDY) == 0) {
 		com_rcv(&com1_dev, 0);
+	} else {
+		/*
+		 * The guest has not consumed the previous byte yet.  The
+		 * persistent read event would fire again at once on the
+		 * still-readable pty and spin, so remove it; it is re-added
+		 * when the guest reads the data register.
+		 */
+		event_del(&com1_dev.event);
+	}
 
 	/* If pending interrupt, inject */
 	if ((com1_dev.regs.iir & IIR_NOPEND) == 0) {
@@ -304,6 +316,7 @@ vcpu_process_com_data(struct vm_exit *vei, uint32_t vcpu_id)
 			set_return_data(vei, com1_dev.regs.data);
 			com1_dev.regs.data = 0x0;
 			com1_dev.regs.lsr &= ~LSR_RXRDY;
+			vm_pipe_send(&dev_pipe, NS8250_REENABLE_RX);
 		} else {
 			set_return_data(vei, com1_dev.regs.data);
 			log_debug("%s: guest reading com1 when not ready",
