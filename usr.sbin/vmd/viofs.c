@@ -2556,16 +2556,27 @@ viofs_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	vq_info = &dev->vq[vq_idx];
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
-	if (vr == NULL)
+	if (vr == NULL || vq_info->q_avail_hva == NULL ||
+	    vq_info->q_used_hva == NULL)
 		fatalx("%s: null vring", __func__);
 	mask = vq_info->mask;
 	qs = vq_info->qs;
 
+	/*
+	 * Locate the independently mapped split virtqueue areas.  The
+	 * virtio 1.x path of virtio_update_qa() maps desc/avail/used
+	 * separately and leaves vq_availoffset/vq_usedoffset at 0.
+	 */
 	table = (struct vring_desc *)(vr);
-	avail = (struct vring_avail *)(vr + vq_info->vq_availoffset);
-	used = (struct vring_used *)(vr + vq_info->vq_usedoffset);
+	avail = vq_info->q_avail_hva;
+	used = vq_info->q_used_hva;
 
 	while (idx != avail->idx) {
+		/*
+		 * Read barrier: avail->idx has been observed; make sure the
+		 * ring slot and the descriptor the driver published before
+		 * it are not read stale (the guest vcpu runs on another CPU).
+		 */
 		__sync_synchronize();
 		head = avail->ring[idx & mask];
 
@@ -2603,6 +2614,8 @@ viofs_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	return (notify);
 
 reset:
+	/* Don't replay chains already placed in the used ring. */
+	vq_info->last_avail = idx;
 	dev->status |= DEVICE_NEEDS_RESET;
 	dev->isr |= VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
 	return (1);
