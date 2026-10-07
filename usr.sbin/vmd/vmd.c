@@ -1130,6 +1130,22 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 	char			*s;
 	int			 ret = 0;
 
+	*ret_vm = NULL;
+
+	/*
+	 * Bound the counts that index the request's fixed arrays before
+	 * vm_instance() walks them.
+	 */
+	if (vmc->vmc_ndisks > VM_MAX_DISKS_PER_VM) {
+		log_warnx("invalid number of disks");
+		errno = EINVAL;
+		return (-1);
+	} else if (vmc->vmc_nnics > VM_MAX_NICS_PER_VM) {
+		log_warnx("invalid number of interfaces");
+		errno = EINVAL;
+		return (-1);
+	}
+
 	/* Check if this is an instance of another VM */
 	if ((ret = vm_instance(ps, &vm_parent, vmc, uid)) != 0) {
 		errno = ret; /* XXX might set invalid errno */
@@ -1174,12 +1190,6 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 		goto fail;
 	} else if (vmc->vmc_nmemranges > VMM_MAX_MEM_RANGES) {
 		log_warnx("invalid number of memory ranges");
-		goto fail;
-	} else if (vmc->vmc_ndisks > VM_MAX_DISKS_PER_VM) {
-		log_warnx("invalid number of disks");
-		goto fail;
-	} else if (vmc->vmc_nnics > VM_MAX_NICS_PER_VM) {
-		log_warnx("invalid number of interfaces");
 		goto fail;
 	} else if ((vmc->vmc_flags & VMOP_CREATE_KERNEL) == 0 &&
 	    vmc->vmc_ndisks == 0 && strlen(vmc->vmc_cdrom) == 0) {
@@ -1893,6 +1903,7 @@ vmop_create_params_read(struct imsg *imsg, struct vmop_create_params *vmc)
 	for (i = 0; i < n; i++)
 		vmc->vmc_ifgroup[i][sizeof(vmc->vmc_ifgroup[i]) - 1] = '\0';
 
+	vmc->vmc_cdrom[sizeof(vmc->vmc_cdrom) - 1] = '\0';
 	vmc->vmc_instance[sizeof(vmc->vmc_instance) - 1] = '\0';
 }
 
