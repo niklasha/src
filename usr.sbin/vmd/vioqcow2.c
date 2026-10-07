@@ -32,6 +32,8 @@
 
 #define QCOW2_COMPRESSED	0x4000000000000000ull
 #define QCOW2_INPLACE		0x8000000000000000ull
+#define QCOW2_ZERO		0x0000000000000001ull	/* v3: reads as zeros */
+#define QCOW2_OFFMASK		0x00fffffffffffe00ull	/* host offset bits 9-55 */
 
 #define QCOW2_DIRTY		(1 << 0)
 #define QCOW2_CORRUPT		(1 << 1)
@@ -94,7 +96,7 @@ struct qcdisk {
 	uint32_t headersz;
 };
 
-static off_t xlate(struct qcdisk *, off_t, int *);
+static off_t xlate(struct qcdisk *, off_t, int *, int *);
 static void copy_cluster(struct qcdisk *, struct qcdisk *, off_t, off_t);
 static void inc_refs(struct qcdisk *, off_t, int);
 static off_t mkcluster(struct qcdisk *, struct qcdisk *, off_t, off_t);
@@ -338,6 +340,7 @@ qc2_pread(void *p, char *buf, size_t len, off_t off)
 	struct qcdisk *disk, *d;
 	off_t phys_off, end, cluster_off;
 	ssize_t sz, rem;
+	int zero;
 
 	disk = p;
 	end = off + len;
@@ -347,9 +350,15 @@ qc2_pread(void *p, char *buf, size_t len, off_t off)
 	/* handle head chunk separately */
 	rem = len;
 	while (off != end) {
-		for (d = disk; d; d = d->base)
-			if ((phys_off = xlate(d, off, NULL)) > 0)
+		for (d = disk; d; d = d->base) {
+			if ((phys_off = xlate(d, off, NULL, &zero)) > 0)
 				break;
+			/* A zero cluster hides any data in the base images. */
+			if (zero) {
+				d = NULL;
+				break;
+			}
+		}
 		/* Break out into chunks. This handles
 		 * three cases:
 		 *
@@ -411,9 +420,8 @@ qc2_pwrite(void *p, char *buf, size_t len, off_t off)
 	struct qcdisk *disk, *d;
 	off_t phys_off, cluster_off, end;
 	ssize_t sz, rem;
-	int inplace;
+	int inplace, zero;
 
-	d = p;
 	disk = p;
 	inplace = 1;
 	end = off + len;
@@ -427,7 +435,14 @@ qc2_pwrite(void *p, char *buf, size_t len, off_t off)
 		if (sz > rem)
 			sz = rem;
 
-		phys_off = xlate(disk, off, &inplace);
+		/*
+		 * The copy-on-write source is this disk unless the
+		 * search below finds the cluster in a backing image.
+		 * Do not carry over a previous chunk's choice.
+		 */
+		d = disk;
+
+		phys_off = xlate(disk, off, &inplace, &zero);
 		if (phys_off == -1)
 			return -1;
 		/*
@@ -435,10 +450,13 @@ qc2_pwrite(void *p, char *buf, size_t len, off_t off)
 		 * see if it exists in the base image. If it does, we
 		 * need to copy it before the write. The copy happens
 		 * in the '!inplace' if clause below the search.
+		 * A zero cluster has nothing to copy: the fresh cluster
+		 * allocated below already reads as zeros.
 		 */
-		if (phys_off == 0)
+		if (phys_off == 0 && !zero)
 			for (d = disk->base; d; d = d->base)
-				if ((phys_off = xlate(d, off, NULL)) > 0)
+				if ((phys_off = xlate(d, off, NULL, &zero)) > 0 ||
+				    zero)
 					break;
 		if (!inplace || phys_off == 0)
 			phys_off = mkcluster(disk, d, off, phys_off);
@@ -473,11 +491,13 @@ qc2_close(void *p, int stayopen)
  * Translates a virtual offset into an on-disk offset.
  * Returns:
  * 	-1 on error
- * 	 0 on 'not found'
+ * 	 0 on 'not found'; *zero, if given, is set when the cluster
+ * 	   is a qcow2 v3 zero cluster, which reads as zeros and hides
+ * 	   the backing images
  * 	>0 on found
  */
 static off_t
-xlate(struct qcdisk *disk, off_t off, int *inplace)
+xlate(struct qcdisk *disk, off_t off, int *inplace, int *zero)
 {
 	off_t l2sz, l1off, l2tab, l2off, cluster, clusteroff;
 	uint64_t buf;
@@ -491,6 +511,8 @@ xlate(struct qcdisk *disk, off_t off, int *inplace)
 	 */
 	if (inplace)
 		*inplace = 0;
+	if (zero)
+		*zero = 0;
 	if (off < 0)
 		goto err;
 
@@ -516,8 +538,20 @@ xlate(struct qcdisk *disk, off_t off, int *inplace)
 		*inplace = !!(cluster & QCOW2_INPLACE);
 	if (cluster & QCOW2_COMPRESSED)
 		fatalx("%s: compressed clusters unsupported", __func__);
+	/*
+	 * A v3 zero cluster reads as all zeros. A host offset only
+	 * describes a preallocation and must not be read, nor may the
+	 * base images be consulted. Report a miss with *zero set.
+	 */
+	if (cluster & QCOW2_ZERO) {
+		if (inplace)
+			*inplace = 0;
+		if (zero)
+			*zero = 1;
+		return 0;
+	}
 	clusteroff = 0;
-	cluster &= ~QCOW2_INPLACE;
+	cluster &= QCOW2_OFFMASK;
 	if (cluster)
 		clusteroff = off % disk->clustersz;
 	return cluster + clusteroff;
