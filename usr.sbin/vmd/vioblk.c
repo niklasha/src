@@ -430,6 +430,9 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	return (notify);
 
 reset:
+	/* Don't replay chains already placed in the used ring. */
+	vq_info->last_avail = idx;
+
 	/*
 	 * When setting the "needs reset" flag, the driver is notified
 	 * via a configuration change interrupt.

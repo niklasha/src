@@ -501,6 +501,8 @@ vionet_rx(struct virtio_dev *dev, int fd)
 	vq_info->last_avail = idx;
 	return (notify);
 reset:
+	/* Don't replay chains already placed in the used ring. */
+	vq_info->last_avail = idx;
 	return (-1);
 }
 
@@ -688,6 +690,15 @@ vionet_rx_event(int fd, short event, void *arg)
 			log_warnx("%s: requesting device reset", __func__);
 			dev->status |= DEVICE_NEEDS_RESET;
 			dev->isr |= VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
+			/*
+			 * The bad chain stays at last_avail, so nothing can
+			 * be received until the driver resets the device.
+			 * Stop watching the tap and the inject pipe, which
+			 * would fire again at once; the driver's next rx
+			 * kick re-arms them.
+			 */
+			event_del(&ev_tap);
+			event_del(&ev_inject);
 		}
 		raise_irq = 1;
 	}
@@ -928,6 +939,8 @@ drop:
 	vq_info->last_avail = idx;
 	return (notify);
 reset:
+	/* Don't replay chains already placed in the used ring. */
+	vq_info->last_avail = idx;
 	return (-1);
 }
 
