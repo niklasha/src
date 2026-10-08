@@ -358,6 +358,8 @@ qc2_pread(void *p, char *buf, size_t len, off_t off)
 		for (d = disk; d; d = d->base) {
 			if ((phys_off = xlate(d, off, NULL, &zero)) > 0)
 				break;
+			if (phys_off == -1)
+				return -1;
 			/* A zero cluster hides any data in the base images. */
 			if (zero) {
 				d = NULL;
@@ -458,11 +460,15 @@ qc2_pwrite(void *p, char *buf, size_t len, off_t off)
 		 * A zero cluster has nothing to copy: the fresh cluster
 		 * allocated below already reads as zeros.
 		 */
-		if (phys_off == 0 && !zero)
-			for (d = disk->base; d; d = d->base)
-				if ((phys_off = xlate(d, off, NULL, &zero)) > 0 ||
-				    zero)
+		if (phys_off == 0 && !zero) {
+			for (d = disk->base; d; d = d->base) {
+				phys_off = xlate(d, off, NULL, &zero);
+				if (phys_off != 0 || zero)
 					break;
+			}
+			if (phys_off == -1)
+				return -1;
+		}
 		if (!inplace || phys_off == 0)
 			phys_off = mkcluster(disk, d, off, phys_off);
 		if (phys_off == -1)
@@ -506,7 +512,7 @@ xlate(struct qcdisk *disk, off_t off, int *inplace, int *zero)
 {
 	off_t l2sz, l1off, l2tab, l2off, cluster, clusteroff;
 	uint64_t buf;
-
+	ssize_t n;
 
 	/*
 	 * Clear out inplace flag -- xlate misses should not
@@ -523,17 +529,23 @@ xlate(struct qcdisk *disk, off_t off, int *inplace, int *zero)
 
 	l2sz = disk->clustersz / 8;
 	l1off = (off / disk->clustersz) / l2sz;
+	/* Nothing beyond the L1 table, e.g. in a smaller base image. */
 	if (l1off >= disk->l1sz)
-		goto err;
+		return 0;
 
 	l2tab = disk->l1[l1off];
 	l2tab &= ~QCOW2_INPLACE;
 	if (l2tab == 0)
 		return 0;
 	l2off = (off / disk->clustersz) % l2sz;
-	if (pread(disk->fd, &buf, sizeof(buf), l2tab + l2off * 8) !=
-	    (ssize_t)sizeof(buf))
-		fatalx("%s: unable to read qcow2 L2 entry", __func__);
+	n = pread(disk->fd, &buf, sizeof(buf), l2tab + l2off * 8);
+	if (n == -1) {
+		log_warn("%s: unable to read qcow2 L2 entry", __func__);
+		goto err;
+	} else if (n != (ssize_t)sizeof(buf)) {
+		log_warnx("%s: short read of qcow2 L2 entry", __func__);
+		goto err;
+	}
 	cluster = be64toh(buf);
 	/*
 	 * cluster may be 0, but all future operations don't affect
@@ -586,8 +598,10 @@ mkcluster(struct qcdisk *disk, struct qcdisk *base, off_t off, off_t src_phys)
 	/* L1 entries always exist */
 	l2sz = disk->clustersz / 8;
 	l1off = off / (disk->clustersz * l2sz);
-	if (l1off >= disk->l1sz)
-		fatalx("l1 offset outside disk");
+	if (l1off >= disk->l1sz) {
+		log_warnx("%s: l1 offset outside disk", __func__);
+		return -1;
+	}
 
 	disk->end = (disk->end + disk->clustersz - 1) & ~(disk->clustersz - 1);
 
