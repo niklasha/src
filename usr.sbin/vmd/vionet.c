@@ -1671,7 +1671,24 @@ static void
 vionet_assert_irq(struct virtio_dev *dev, uint16_t vq_idx)
 {
 	struct viodev_msg	msg;
-	int			ret;
+	int			ret, pending;
+
+	/*
+	 * The rx and tx threads set isr before they ask us to raise the
+	 * interrupt, and a guest ISR read or a device reset, both handled
+	 * on this thread, can clear it in between.  Then the read has
+	 * reported the interrupt or the reset has discarded it, and an
+	 * assert would leave the line up with nothing pending.  Only this
+	 * thread clears isr, so the check holds until the assert is
+	 * queued.  With MSI-X the driver does not read the ISR (virtio
+	 * 1.x: it should not for queue interrupts), so isr stays set and
+	 * only a raise made stale by a reset is dropped.
+	 */
+	pthread_rwlock_rdlock(&lock);
+	pending = (dev->isr != 0);
+	pthread_rwlock_unlock(&lock);
+	if (!pending)
+		return;
 
 	memset(&msg, 0, sizeof(msg));
 	msg.irq = dev->irq;
