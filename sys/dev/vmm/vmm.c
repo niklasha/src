@@ -282,14 +282,7 @@ vmmioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
 
 	switch (cmd) {
 	case VMM_IOC_CREATE:
-		ret = vmm_start();
-		if (ret) {
-			vmm_stop();
-			break;
-		}
 		ret = vm_create((struct vm_create_params *)data, p);
-		if (ret)
-			break;
 		break;
 	default:
 		ret = ENOTTY;
@@ -367,6 +360,10 @@ vm_create(struct vm_create_params *vcp, struct proc *p)
 	 * Increment global counts early to see if the capacity limits
 	 * would be violated and prevent vmm(4) from disabling any
 	 * virtualization extensions on the host while creating a vm.
+	 * vm_rele() disables them under vm_lock when vm_ct drops to
+	 * zero, so enable them here, in the same vm_lock section that
+	 * counts the vm: outside suspend and resume, they then stay
+	 * enabled while vm_ct is nonzero.
 	 */
 	rw_enter_write(&vmm_softc->vm_lock);
 	if (vmm_softc->vcpu_ct + vcp->vcp_ncpus > vmm_softc->vcpu_max) {
@@ -377,6 +374,14 @@ vm_create(struct vm_create_params *vcp, struct proc *p)
 	}
 	vmm_softc->vcpu_ct += vcp->vcp_ncpus;
 	vmm_softc->vm_ct++;
+	if ((ret = vmm_start()) != 0) {
+		vmm_softc->vm_ct--;
+		vmm_softc->vcpu_ct -= vcp->vcp_ncpus;
+		if (vmm_softc->vm_ct < 1)
+			vmm_stop();
+		rw_exit_write(&vmm_softc->vm_lock);
+		return (ret);
+	}
 	rw_exit_write(&vmm_softc->vm_lock);
 
 	/* Instantiate and configure the new vm. */
