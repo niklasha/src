@@ -96,7 +96,38 @@ struct qcdisk {
 	uint32_t headersz;
 
 	int	 reffull;	/* refcount table full, warned */
+	time_t	 logsec;		/* last I/O error message, seconds */
+	unsigned int logdropped;	/* messages suppressed since */
 };
+
+/*
+ * A guest that keeps retrying against a failing disk (a full host file
+ * system, say) makes every request log a line.  Log at most one line
+ * per second per disk from the I/O error paths, and count the rest.
+ */
+static int
+qc2_logok(struct qcdisk *disk)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (disk->logsec != 0 && now.tv_sec == disk->logsec) {
+		disk->logdropped++;
+		return 0;
+	}
+	disk->logsec = now.tv_sec;
+	if (disk->logdropped != 0) {
+		log_warnx("qcow2: %u similar messages suppressed",
+		    disk->logdropped);
+		disk->logdropped = 0;
+	}
+	return 1;
+}
+
+#define QC2_WARN(d, ...) do { if (qc2_logok(d)) log_warn(__VA_ARGS__); } \
+	while (0)
+#define QC2_WARNX(d, ...) do { if (qc2_logok(d)) log_warnx(__VA_ARGS__); } \
+	while (0)
 
 static off_t xlate(struct qcdisk *, off_t, int *, int *);
 static int copy_cluster(struct qcdisk *, struct qcdisk *, off_t, off_t);
@@ -246,6 +277,8 @@ qc2_open(struct qcdisk *disk, int *fds, size_t nfd)
 	disk->refsz		= be32toh(header.refsz);
 	disk->refoff		= be64toh(header.refoff);
 	disk->reffull		= 0;
+	disk->logsec		= 0;
+	disk->logdropped	= 0;
 	disk->nsnap		= be32toh(header.snapcount);
 	disk->snapoff		= be64toh(header.snapsz);
 
@@ -540,10 +573,10 @@ xlate(struct qcdisk *disk, off_t off, int *inplace, int *zero)
 	l2off = (off / disk->clustersz) % l2sz;
 	n = pread(disk->fd, &buf, sizeof(buf), l2tab + l2off * 8);
 	if (n == -1) {
-		log_warn("%s: unable to read qcow2 L2 entry", __func__);
+		QC2_WARN(disk, "%s: unable to read qcow2 L2 entry", __func__);
 		goto err;
 	} else if (n != (ssize_t)sizeof(buf)) {
-		log_warnx("%s: short read of qcow2 L2 entry", __func__);
+		QC2_WARNX(disk, "%s: short read of qcow2 L2 entry", __func__);
 		goto err;
 	}
 	cluster = be64toh(buf);
@@ -599,7 +632,7 @@ mkcluster(struct qcdisk *disk, struct qcdisk *base, off_t off, off_t src_phys)
 	l2sz = disk->clustersz / 8;
 	l1off = off / (disk->clustersz * l2sz);
 	if (l1off >= disk->l1sz) {
-		log_warnx("%s: l1 offset outside disk", __func__);
+		QC2_WARNX(disk, "%s: l1 offset outside disk", __func__);
 		return -1;
 	}
 
@@ -626,7 +659,7 @@ mkcluster(struct qcdisk *disk, struct qcdisk *base, off_t off, off_t src_phys)
 		buf = htobe64(l2tab | QCOW2_INPLACE);
 		if (pwrite(disk->fd, &buf, sizeof(buf),
 		    disk->l1off + 8 * l1off) != 8) {
-			log_warn("%s: could not write l1", __func__);
+			QC2_WARN(disk, "%s: could not write l1", __func__);
 			return -1;
 		}
 		disk->l1[l1off] = l2tab | QCOW2_INPLACE;
@@ -641,7 +674,7 @@ mkcluster(struct qcdisk *disk, struct qcdisk *base, off_t off, off_t src_phys)
 		return -1;
 	buf = htobe64(cluster | QCOW2_INPLACE);
 	if (pwrite(disk->fd, &buf, sizeof(buf), l2tab + l2off * 8) != 8) {
-		log_warn("%s: could not write l2", __func__);
+		QC2_WARN(disk, "%s: could not write l2", __func__);
 		return -1;
 	}
 
@@ -668,7 +701,7 @@ grow_disk(struct qcdisk *disk)
 	if (!refs_covered(disk, cluster))
 		return -1;
 	if (ftruncate(disk->fd, cluster + disk->clustersz) == -1) {
-		log_warn("%s: could not grow disk", __func__);
+		QC2_WARN(disk, "%s: could not grow disk", __func__);
 		return -1;
 	}
 	disk->end = cluster + disk->clustersz;
@@ -711,25 +744,25 @@ copy_cluster(struct qcdisk *disk, struct qcdisk *base, off_t dst, off_t src)
 
 	scratch = malloc(disk->clustersz);
 	if (!scratch) {
-		log_warn("%s: malloc", __func__);
+		QC2_WARN(disk, "%s: malloc", __func__);
 		return -1;
 	}
 	src &= ~(disk->clustersz - 1);
 	dst &= ~(disk->clustersz - 1);
 	n = pread(base->fd, scratch, disk->clustersz, src);
 	if (n == -1) {
-		log_warn("%s: could not read cluster", __func__);
+		QC2_WARN(disk, "%s: could not read cluster", __func__);
 		goto done;
 	} else if (n != (ssize_t)disk->clustersz) {
-		log_warnx("%s: short read of cluster", __func__);
+		QC2_WARNX(disk, "%s: short read of cluster", __func__);
 		goto done;
 	}
 	n = pwrite(disk->fd, scratch, disk->clustersz, dst);
 	if (n == -1) {
-		log_warn("%s: could not write cluster", __func__);
+		QC2_WARN(disk, "%s: could not write cluster", __func__);
 		goto done;
 	} else if (n != (ssize_t)disk->clustersz) {
-		log_warnx("%s: short write of cluster", __func__);
+		QC2_WARNX(disk, "%s: short write of cluster", __func__);
 		goto done;
 	}
 	ret = 0;
@@ -762,7 +795,7 @@ inc_refs(struct qcdisk *disk, off_t off, int newcluster)
 		return -1;
 	l1off = disk->refoff + 8 * l1idx;
 	if (pread(disk->fd, &buf, sizeof(buf), l1off) != 8) {
-		log_warn("%s: could not read refs", __func__);
+		QC2_WARN(disk, "%s: could not read refs", __func__);
 		return -1;
 	}
 
@@ -780,7 +813,7 @@ inc_refs(struct qcdisk *disk, off_t off, int newcluster)
 			refs = htobe16(1);
 			if (pwrite(disk->fd, &refs, sizeof(refs),
 			    l2cluster + 2 * (self % nper)) != 2) {
-				log_warn("%s: could not write ref block",
+				QC2_WARN(disk, "%s: could not write ref block",
 				    __func__);
 				return -1;
 			}
@@ -789,7 +822,7 @@ inc_refs(struct qcdisk *disk, off_t off, int newcluster)
 
 		buf = htobe64(l2cluster);
 		if (pwrite(disk->fd, &buf, sizeof(buf), l1off) != 8) {
-			log_warn("%s: could not write ref table", __func__);
+			QC2_WARN(disk, "%s: could not write ref table", __func__);
 			return -1;
 		}
 	}
@@ -798,14 +831,14 @@ inc_refs(struct qcdisk *disk, off_t off, int newcluster)
 	if (!newcluster) {
 		if (pread(disk->fd, &refs, sizeof(refs),
 		    l2cluster + 2 * l2idx) != 2) {
-			log_warn("%s: could not read ref cluster", __func__);
+			QC2_WARN(disk, "%s: could not read ref cluster", __func__);
 			return -1;
 		}
 		refs = be16toh(refs) + 1;
 	}
 	refs = htobe16(refs);
 	if (pwrite(disk->fd, &refs, sizeof(refs), l2cluster + 2 * l2idx) != 2) {
-		log_warn("%s: could not write ref block", __func__);
+		QC2_WARN(disk, "%s: could not write ref block", __func__);
 		return -1;
 	}
 	return 0;

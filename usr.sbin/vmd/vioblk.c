@@ -708,6 +708,32 @@ vioblk_dev_read(struct virtio_dev *dev, struct viodev_msg *msg)
 }
 
 /*
+ * A guest retrying against a failing disk (a full host file system,
+ * say) makes every request log a line.  Log at most one line per
+ * second and count the rest.
+ */
+static int
+vioblk_logok(void)
+{
+	static time_t last;
+	static unsigned int dropped;
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (last != 0 && now.tv_sec == last) {
+		dropped++;
+		return 0;
+	}
+	last = now.tv_sec;
+	if (dropped != 0) {
+		log_warnx("%s: %u similar messages suppressed", __func__,
+		    dropped);
+		dropped = 0;
+	}
+	return 1;
+}
+
+/*
  * Emulate read/write io. Walks the descriptor chain, collecting io work and
  * then emulates the read or write.
  *
@@ -779,9 +805,11 @@ vioblk_io(struct vioblk_dev *dev, struct virtio_vq_info *vq_info, int is_write,
 	else
 		sz = dev->file.preadv(dev->file.p, io_v, io_idx, offset);
 	if (sz != (ssize_t)xfer_sz) {
-		log_warnx("%s: %s failure at offset 0x%llx, xfer_sz=%zu, "
-		    "sz=%ld", __func__, (is_write ? "write" : "read"), offset,
-		    xfer_sz, sz);
+		if (vioblk_logok()) {
+			log_warnx("%s: %s failure at offset 0x%llx, "
+			    "xfer_sz=%zu, sz=%ld", __func__,
+			    (is_write ? "write" : "read"), offset, xfer_sz, sz);
+		}
 		return (-1);
 	}
 
