@@ -2040,6 +2040,14 @@ handle_dev_msg(struct viodev_msg *msg, struct virtio_dev *gdev)
 {
 	switch (msg->type) {
 	case VIODEV_MSG_KICK:
+		/*
+		 * Device processes send every change of their INTx line,
+		 * the deassert for an ISR read included, on this channel.
+		 * This thread alone then changes the line, in the order the
+		 * device made the changes.  A deassert in a sync reply would
+		 * be applied on a vcpu thread and could land after, and
+		 * undo, an assert for a completion that followed the read.
+		 */
 		if (msg->state == INTR_STATE_ASSERT)
 			virtio_inject_irq(gdev, msg->vq_idx);
 		else if (msg->state == INTR_STATE_DEASSERT)
@@ -2158,8 +2166,10 @@ virtio_pci_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
 			    virtio_reg_name(msg.reg));
 			*data = msg.data;
 			/*
-			 * It's possible we're asked to {de,}assert after the
-			 * device performs a register read.
+			 * vioblk, vionet, vioscsi and viofs send interrupt
+			 * line changes on their async channel only, see
+			 * handle_dev_msg().  A state in the reply is still
+			 * applied, for a device process that sends one.
 			 */
 			if (msg.state == INTR_STATE_ASSERT)
 				virtio_inject_irq(dev, msg.vq_idx);

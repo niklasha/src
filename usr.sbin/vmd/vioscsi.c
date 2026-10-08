@@ -532,14 +532,18 @@ handle_sync_io(int fd, short event, void *arg)
 		switch (msg.type) {
 		case VIODEV_MSG_IO_READ:
 			/* Read IO: make sure to send a reply */
+			deassert = 0;
 			msg.data = vioscsi_read(dev, &msg, &deassert);
 			msg.data_valid = 1;
-			if (deassert) {
-				/* Inline any interrupt deassertions. */
-				msg.state = INTR_STATE_DEASSERT;
-			}
 			imsg_compose_event(iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 			    sizeof(msg));
+			/*
+			 * Lower the line for the ISR read on the async
+			 * channel, in order with our asserts, not in the
+			 * reply.  See handle_dev_msg() in virtio.c.
+			 */
+			if (deassert)
+				virtio_deassert_irq(dev, 0);
 			break;
 		case VIODEV_MSG_IO_WRITE:
 			/* Write IO: no reply needed, but maybe an irq assert */
