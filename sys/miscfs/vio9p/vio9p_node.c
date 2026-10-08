@@ -221,7 +221,8 @@ vio9p_fid_drop(struct vio9p_mnt *vmp, uint32_t fid)
 	if (fid == VIO9P_NOFID || fid == VIO9P_FID_ROOT)
 		return;
 
-	(void)p9c_clunk(vmp->vm_sc, fid);
+	/* M3b: Tclunk carries no identity; use the mount-owner sentinel. */
+	(void)p9c_clunk(vmp->vm_sc, fid, vmp->vm_owner_uid, vmp->vm_owner_gid);
 	vio9p_fid_free(vmp, fid);
 }
 
