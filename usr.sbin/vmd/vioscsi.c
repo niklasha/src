@@ -27,6 +27,7 @@
 
 #include <errno.h>
 #include <event.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -64,7 +65,7 @@ vioscsi_main(int fd, int vm_fd)
 	struct viodev_msg 	 msg;
 	struct vmd_vm		 vm;
 	ssize_t			 sz;
-	int			 ret;
+	int			 ret, sync_init = 0;
 
 	/*
 	 * stdio - needed for read/write to disk fds and channels to the vm.
@@ -148,6 +149,7 @@ vioscsi_main(int fd, int vm_fd)
 		log_warn("imsgbuf_init");
 		goto fail;
 	}
+	sync_init = 1;
 	dev.sync_iev.handler = handle_sync_io;
 	dev.sync_iev.data = &dev;
 	dev.sync_iev.events = EV_READ;
@@ -183,13 +185,21 @@ vioscsi_main(int fd, int vm_fd)
 	}
 
 fail:
-	/* Try letting the vm know we've failed something. */
-	memset(&msg, 0, sizeof(msg));
-	msg.type = VIODEV_MSG_ERROR;
-	msg.data = ret;
-	imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
-	    sizeof(msg));
-	imsgbuf_flush(&dev.sync_iev.ibuf);
+	/*
+	 * Try letting the vm know we've failed something. An early failure
+	 * comes before the sync channel's imsgbuf is set up, so set it up
+	 * here, on fd: dev.sync_fd may not be set yet either. If the vm is
+	 * already gone, let the write fail instead of dying of SIGPIPE.
+	 */
+	signal(SIGPIPE, SIG_IGN);
+	if (sync_init || imsgbuf_init(&dev.sync_iev.ibuf, fd) != -1) {
+		memset(&msg, 0, sizeof(msg));
+		msg.type = VIODEV_MSG_ERROR;
+		msg.data = ret;
+		imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1,
+		    &msg, sizeof(msg));
+		imsgbuf_flush(&dev.sync_iev.ibuf);
+	}
 
 	close_fd(dev.sync_fd);
 	close_fd(dev.async_fd);
