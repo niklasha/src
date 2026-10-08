@@ -599,7 +599,7 @@ int
 vmm_start(void)
 {
 	int rv = 0;
-	struct cpu_info *self = curcpu();
+	struct cpu_info *self;
 #ifdef MULTIPROCESSOR
 	struct cpu_info *ci;
 	CPU_INFO_ITERATOR cii;
@@ -609,6 +609,8 @@ vmm_start(void)
 #endif /* MULTIPROCESSOR */
 
 	rw_enter_write(&vmm_softc->sc_slock);
+	/* Only now: rw_enter_write() may have slept and moved us. */
+	self = curcpu();
 
 	/* VMM is already running */
 	if (self->ci_flags & CPUF_VMM)
@@ -659,7 +661,7 @@ int
 vmm_stop(void)
 {
 	int rv = 0;
-	struct cpu_info *self = curcpu();
+	struct cpu_info *self;
 #ifdef MULTIPROCESSOR
 	struct cpu_info *ci;
 	CPU_INFO_ITERATOR cii;
@@ -669,6 +671,8 @@ vmm_stop(void)
 #endif /* MULTIPROCESSOR */
 
 	rw_enter_write(&vmm_softc->sc_slock);
+	/* Only now: rw_enter_write() may have slept and moved us. */
+	self = curcpu();
 
 	/* VMM is not running */
 	if (!(self->ci_flags & CPUF_VMM))
