@@ -375,6 +375,11 @@ viornd_notifyq(struct virtio_dev *dev, uint16_t idx)
 	aidx = avail->idx & vq_info->mask;
 	uidx = used->idx & vq_info->mask;
 
+	/*
+	 * Read barrier after observing avail->idx, as in the device
+	 * processes.
+	 */
+	__sync_synchronize();
 	dxx = avail->ring[aidx] & vq_info->mask;
 
 	sz = desc[dxx].len;
