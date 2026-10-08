@@ -565,6 +565,21 @@ virtio_io_cfg(struct virtio_dev *dev, int dir, uint8_t reg, uint32_t data,
 				/* Reset device and virtqueues (if any). */
 				dev->driver_feature = 0;
 				dev->isr = 0;
+
+				/*
+				 * No ISR read will lower the INTx line for
+				 * an interrupt the reset discarded, so lower
+				 * it here.  A device process sends this on
+				 * its async channel, in order with its
+				 * asserts.  The in-process entropy device
+				 * lowers it directly, as it raises it, under
+				 * viornd_mtx.
+				 */
+				if (dev->async_fd != -1)
+					virtio_deassert_irq(dev, 0);
+				else
+					pci_deassert_irq(dev->pci_id);
+
 				pci_cfg->config_msix_vector = VIRTIO_MSI_NO_VECTOR;
 
 				pci_cfg->queue_select = 0;
