@@ -94,12 +94,15 @@ struct qcdisk {
 	uint64_t autoclearfeatures;
 	uint32_t refssz;
 	uint32_t headersz;
+
+	int	 reffull;	/* refcount table full, warned */
 };
 
 static off_t xlate(struct qcdisk *, off_t, int *, int *);
 static int copy_cluster(struct qcdisk *, struct qcdisk *, off_t, off_t);
 static int inc_refs(struct qcdisk *, off_t, int);
 static off_t grow_disk(struct qcdisk *);
+static int refs_covered(struct qcdisk *, off_t);
 static off_t mkcluster(struct qcdisk *, struct qcdisk *, off_t, off_t);
 static int qc2_open(struct qcdisk *, int *, size_t);
 static ssize_t qc2_pread(void *, char *, size_t, off_t);
@@ -242,6 +245,7 @@ qc2_open(struct qcdisk *disk, int *fds, size_t nfd)
 	disk->l1off		= be64toh(header.l1off);
 	disk->refsz		= be32toh(header.refsz);
 	disk->refoff		= be64toh(header.refoff);
+	disk->reffull		= 0;
 	disk->nsnap		= be32toh(header.snapcount);
 	disk->snapoff		= be64toh(header.snapsz);
 
@@ -635,7 +639,9 @@ mkcluster(struct qcdisk *disk, struct qcdisk *base, off_t off, off_t src_phys)
 
 /*
  * Grows the disk by one cluster, which reads as zeros. Nothing
- * refers to the cluster or counts it yet.
+ * refers to the cluster or counts it yet. The refcount table must
+ * cover the new cluster, else the disk is not grown: inc_refs()
+ * could not count it, and every failed write would leak a cluster.
  *
  * Returns the offset of the cluster, or -1 on error.
  */
@@ -645,12 +651,37 @@ grow_disk(struct qcdisk *disk)
 	off_t cluster;
 
 	cluster = disk->end;
+	if (!refs_covered(disk, cluster))
+		return -1;
 	if (ftruncate(disk->fd, cluster + disk->clustersz) == -1) {
 		log_warn("%s: could not grow disk", __func__);
 		return -1;
 	}
 	disk->end = cluster + disk->clustersz;
 	return cluster;
+}
+
+/*
+ * Checks that the refcount table covers the cluster at off. We cannot
+ * grow the refcount table, so once it is full no cluster beyond it can
+ * be allocated. That is logged only once per disk, as a guest may
+ * keep writing.
+ *
+ * Returns 1 if the cluster is covered, 0 if not.
+ */
+static int
+refs_covered(struct qcdisk *disk, off_t off)
+{
+	off_t idx;
+
+	idx = (off / disk->clustersz) / (disk->clustersz / 2);
+	if (idx < disk->refsz * disk->clustersz / 8)
+		return 1;
+	if (!disk->reffull) {
+		log_warnx("%s: refcount table full", __func__);
+		disk->reffull = 1;
+	}
+	return 0;
 }
 
 /*
@@ -712,6 +743,9 @@ inc_refs(struct qcdisk *disk, off_t off, int newcluster)
 	nper = disk->clustersz / 2;
 	l1idx = (off / disk->clustersz) / nper;
 	l2idx = (off / disk->clustersz) % nper;
+	/* We cannot grow the refcount table. */
+	if (!refs_covered(disk, off))
+		return -1;
 	l1off = disk->refoff + 8 * l1idx;
 	if (pread(disk->fd, &buf, sizeof(buf), l1off) != 8) {
 		log_warn("%s: could not read refs", __func__);
