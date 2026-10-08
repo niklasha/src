@@ -62,6 +62,8 @@ int	 vm_claimid(const char *, int, uint32_t *);
 void	 start_vm_batch(int, short, void*);
 
 static inline void vm_terminate(struct vmd_vm *, const char *);
+static void vm_restart(struct privsep *, struct vmd_vm *);
+static const char *vm_start_errstr(int);
 
 struct vmd	*env;
 
@@ -410,7 +412,7 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		} else {
 			/* Stop VM instance but keep the tty open */
 			vm_stop(vm, 1, __func__);
-			config_setvm(ps, vm, (uint32_t)-1, vm->vm_uid);
+			vm_restart(ps, vm);
 		}
 
 		/* The error is meaningless for deferred responses */
@@ -1032,6 +1034,7 @@ vm_stop(struct vmd_vm *vm, int keeptty, const char *caller)
 	if (vm->vm_iev.ibuf.fd != -1) {
 		event_del(&vm->vm_iev.ev);
 		close(vm->vm_iev.ibuf.fd);
+		vm->vm_iev.ibuf.fd = -1;
 	}
 	for (i = 0; i < VM_MAX_DISKS_PER_VM; i++) {
 		for (j = 0; j < VM_MAX_BASE_PER_DISK; j++) {
@@ -1789,6 +1792,63 @@ vm_terminate(struct vmd_vm *vm, const char *caller)
 		/* vm_remove calls vm_stop */
 		vm_remove(vm, caller);
 	}
+}
+
+/*
+ * Start a vm again after its guest rebooted; the caller has stopped it
+ * but kept the tty open. If that fails, log why and leave the vm stopped
+ * like one that shut down. The vm may be freed on return.
+ */
+static void
+vm_restart(struct privsep *ps, struct vmd_vm *vm)
+{
+	char		 name[VMM_MAX_NAME_LEN];
+	const char	*reason;
+	uint32_t	 id = vm->vm_vmid;
+	int		 ret;
+
+	(void)strlcpy(name, vm->vm_params.vmc_name, sizeof(name));
+	if ((ret = config_setvm(ps, vm, (uint32_t)-1, vm->vm_uid)) == 0)
+		return;
+
+	/*
+	 * config_setvm() has logged the details. It has stopped the vm, or
+	 * removed one not from vm.conf, unless it returned early, as at the
+	 * restart rate limit: that leaves the tty open and owned by the
+	 * vm's user. Terminate what is left like a vm that shut down, and
+	 * reset the rate limit, so that a later "vmctl start" starts it
+	 * from a clean state.
+	 */
+	vm = vm_getbyvmid(id);
+	if (vm != NULL && vm->vm_start_limit >= VM_START_RATE_LIMIT)
+		reason = "restarted too quickly";
+	else
+		reason = vm_start_errstr(ret);
+	log_warnx("%s: vm %s rebooted but could not be restarted (%s), "
+	    "leaving it stopped", __func__, name, reason);
+	if (vm != NULL) {
+		vm->vm_start_limit = 0;
+		vm_terminate(vm, __func__);
+	}
+}
+
+/*
+ * Describe a config_setvm() error for the log.
+ */
+static const char *
+vm_start_errstr(int error)
+{
+	switch (error) {
+	case VMD_BIOS_MISSING:
+		return ("BIOS image not found");
+	case VMD_DISK_MISSING:
+		return ("cannot open disk image");
+	case VMD_CDROM_MISSING:
+		return ("cannot open cdrom image");
+	}
+	if (error > 0)
+		return (strerror(error));
+	return ("see previous messages");
 }
 
 /*
