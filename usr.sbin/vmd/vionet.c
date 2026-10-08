@@ -368,6 +368,17 @@ vionet_rx(struct virtio_dev *dev, int fd)
 	}
 
 	vq_info = &dev->vq[RXQ];
+	if (!vq_info->vq_enabled) {
+		/*
+		 * Don't just return 0: we run whenever the tap or the inject
+		 * pipe is readable, so the packet would stay there and we
+		 * would spin. Request a reset, which stops watching both
+		 * until the driver kicks the rx queue again.
+		 */
+		log_warnx("%s: virtqueue not enabled", __func__);
+		return (-1);
+	}
+
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
 	if (vr == NULL || vq_info->q_avail_hva == NULL ||
@@ -758,6 +769,11 @@ vionet_tx(struct virtio_dev *dev)
 	}
 
 	vq_info = &dev->vq[TXQ];
+	if (!vq_info->vq_enabled) {
+		log_warnx("%s: virtqueue not enabled", __func__);
+		return (0);
+	}
+
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
 	if (vr == NULL || vq_info->q_avail_hva == NULL ||

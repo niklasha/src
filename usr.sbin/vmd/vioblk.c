@@ -296,6 +296,11 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 		return (0);
 
 	vq_info = &dev->vq[vq_idx];
+	if (!vq_info->vq_enabled) {
+		log_warnx("%s: virtqueue not enabled", __func__);
+		return (0);
+	}
+
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
 	if (vr == NULL || vq_info->q_avail_hva == NULL ||
