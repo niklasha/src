@@ -653,8 +653,13 @@ vionet_rx_zerocopy(struct vionet_dev *dev, int fd, const struct iovec *iov,
 	}
 
 	sz = readv(fd, iov, iov_cnt);
-	if (sz == -1 && errno == EAGAIN)
+	if (sz == -1) {
+		if (errno != EAGAIN) {
+			log_warn("%s: error reading packet", __func__);
+			return (-1);
+		}
 		return (0);
+	}
 
 	if ((size_t)sz < sizeof(struct tun_hdr))
 		return (0);
