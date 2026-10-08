@@ -6293,6 +6293,28 @@ vmm_handle_xsetbv(struct vcpu *vcpu, uint64_t *rax)
 		return (VMM_ACTION_INJECT);
 	}
 
+	/*
+	 * Refuse what XSETBV itself refuses with #GP: x87 state must be
+	 * enabled, AVX state needs SSE state, the AVX-512 components are
+	 * enabled all together and only with SSE and AVX state, and the
+	 * MPX and AMX components only in pairs.  Storing such a value
+	 * would make vmm_fpurestore() fail to load it, which stops the
+	 * vcpu instead of raising #GP in the guest.
+	 */
+	if ((val & XFEATURE_X87) == 0 ||
+	    ((val & XFEATURE_AVX) && (val & XFEATURE_SSE) == 0) ||
+	    ((val & XFEATURE_AVX512) &&
+	    ((val & XFEATURE_AVX512) != XFEATURE_AVX512 ||
+	    (val & (XFEATURE_SSE | XFEATURE_AVX)) !=
+	    (XFEATURE_SSE | XFEATURE_AVX))) ||
+	    ((val & XFEATURE_MPX) && (val & XFEATURE_MPX) != XFEATURE_MPX) ||
+	    ((val & XFEATURE_AMX) && (val & XFEATURE_AMX) != XFEATURE_AMX)) {
+		DPRINTF("%s: guest specified invalid xcr0 0x%llx\n",
+		    __func__, val);
+		vmm_inject_gp(vcpu);
+		return (VMM_ACTION_INJECT);
+	}
+
 	vcpu->vc_gueststate.vg_xcr0 = val;
 
 	return (VMM_ACTION_ADVANCE);
