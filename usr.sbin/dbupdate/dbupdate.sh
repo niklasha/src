@@ -1,6 +1,6 @@
 #!/bin/ksh
 #
-# $OpenBSD: dbupdate.sh,v 1.11 2026/10/22 02:52:49 dgl Exp $
+# $OpenBSD: dbupdate.sh,v 1.11.4.1 2026/10/22 18:07:26 bluhm Exp $
 #
 # Copyright (c) 2026 Theo de Raadt <deraadt@openbsd.org>
 #
