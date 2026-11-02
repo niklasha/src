@@ -60,6 +60,7 @@
 ./etc/examples/exports
 ./etc/examples/hostapd.conf
 ./etc/examples/httpd.conf
+./etc/examples/ifstated-dcarpd.conf
 ./etc/examples/ifstated.conf
 ./etc/examples/iked.conf
 ./etc/examples/inetd.conf
@@ -2932,6 +2933,7 @@
 ./usr/sbin/cryptoadm
 ./usr/sbin/cryptoinit
 ./usr/sbin/dbupdate
+./usr/sbin/dcarpd
 ./usr/sbin/dev_mkdb
 ./usr/sbin/dhcp6leasectl
 ./usr/sbin/dhcpd
