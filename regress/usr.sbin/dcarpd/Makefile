@@ -39,7 +39,7 @@ regress:
 .endif
 
 TESTS =		route-change route-add other-carp log-live \
-		replay bad-hmac sync-interface stale
+		replay tampered wrong-key encrypted sync-interface stale
 
 # Waits for a recorded message to age out.
 REGRESS_SLOW_TARGETS +=	stale
@@ -55,6 +55,6 @@ $t: dcarp-replay
 dcarp-replay: dcarp-replay.c
 	${CC} ${CFLAGS} -Wall -Werror -o $@ ${.CURDIR}/dcarp-replay.c
 
-CLEANFILES +=	dcarp-replay dcarp.key dcarpd-*.log dcarpd-*.msg
+CLEANFILES +=	dcarp-replay dcarp.key dcarp.key.other dcarpd-*.log dcarpd-*.msg
 
 .include <bsd.regress.mk>
