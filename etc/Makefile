@@ -46,8 +46,8 @@ MUTABLE=changelist daily etc.${MACHINE}/disktab \
 
 # -rw-r--r--
 EXAMPLES=acme-client.conf chio.conf dhcpd.conf exports \
-	httpd.conf ifstated.conf inetd.conf man.conf mixerctl.conf \
-	mrouted.conf ntpd.conf printcap rad.conf rbootd.conf \
+	httpd.conf ifstated-dcarpd.conf ifstated.conf inetd.conf man.conf \
+	mixerctl.conf mrouted.conf ntpd.conf printcap rad.conf rbootd.conf \
 	remote sensorsd.conf wsconsctl.conf
 
 # -rw-------
