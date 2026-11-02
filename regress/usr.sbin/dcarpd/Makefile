@@ -8,7 +8,8 @@
 DCARPD ?=	/usr/sbin/dcarpd
 
 # Must match the interfaces created by dcarpd-test.
-INTERFACES =	carp77 carp78 carp79 veb77 vport77 vport78 vether79
+INTERFACES =	carp77 carp78 carp79 veb77 veb79 \
+		vport76 vport77 vport78 vport79 vport89
 
 .if ! (make(clean) || make(cleandir) || make(obj))
 
@@ -37,14 +38,23 @@ regress:
 
 .endif
 
-.for t in route-change route-add other-carp
+TESTS =		route-change route-add other-carp log-live \
+		replay bad-hmac sync-interface stale
+
+# Waits for a recorded message to age out.
+REGRESS_SLOW_TARGETS +=	stale
+
+.for t in ${TESTS}
 REGRESS_TARGETS +=	$t
 REGRESS_ROOT_TARGETS +=	$t
-$t:
+$t: dcarp-replay
 	${SUDO} env OBJDIR=${.OBJDIR} DCARPD=${DCARPD} \
-	    sh ${.CURDIR}/dcarpd-test $t
+	    REPLAY=${.OBJDIR}/dcarp-replay sh ${.CURDIR}/dcarpd-test $t
 .endfor
 
-CLEANFILES +=	dcarp.key dcarpd-*.log
+dcarp-replay: dcarp-replay.c
+	${CC} ${CFLAGS} -Wall -Werror -o $@ ${.CURDIR}/dcarp-replay.c
+
+CLEANFILES +=	dcarp-replay dcarp.key dcarpd-*.log dcarpd-*.msg
 
 .include <bsd.regress.mk>
