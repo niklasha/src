@@ -1,15 +1,16 @@
 #	$OpenBSD$
 
-# Regress tests for dcarpd(8).  A master and a backup dcarpd run in
-# routing domains 77 and 78, joined by veb(4); this needs root.  The
-# installed dcarpd is tested unless DCARPD names another binary:
+# Regress tests for dcarpd(8).  A master and a backup dcarpd, and for one
+# test a second backup, run in routing domains 75, 77 and 78, joined by
+# veb(4); this needs root.  The installed dcarpd is tested unless DCARPD
+# names another binary:
 #	make DCARPD=/usr/src/usr.sbin/dcarpd/obj/dcarpd
 
 DCARPD ?=	/usr/sbin/dcarpd
 
 # Must match the interfaces created by dcarpd-test.
-INTERFACES =	carp77 carp78 carp79 veb77 veb79 \
-		vport76 vport77 vport78 vport79 vport89
+INTERFACES =	carp75 carp77 carp78 carp79 veb77 veb79 \
+		vport75 vport76 vport77 vport78 vport79 vport85 vport89
 
 .if ! (make(clean) || make(cleandir) || make(obj))
 
@@ -27,6 +28,12 @@ regress:
 	@echo SKIPPED
 .endif
 
+# A member of better priority comes back as backup only without preemption.
+SYSCTL_PREEMPT !=	/sbin/sysctl -n net.inet.carp.preempt
+.if ${SYSCTL_PREEMPT} != 0
+REGRESS_SKIP_TARGETS +=	backup-follows-master
+.endif
+
 IFS_IN_USE !=	for i in ${INTERFACES}; do \
 		    /sbin/ifconfig $$i >/dev/null 2>&1 && echo $$i; \
 		done; true
@@ -41,7 +48,8 @@ regress:
 TESTS =		state-file gateway-from-route other-carp log-live \
 		replay tampered wrong-key encrypted sync-interface \
 		periodic address-change split-brain address-follow \
-		older-generation lower-priority backup-gateway-kept stale
+		older-generation lower-priority equal-priority init-takes \
+		backup-follows-master three-members backup-gateway-kept stale
 
 # Waits for a recorded message to age out.
 REGRESS_SLOW_TARGETS +=	stale
@@ -57,7 +65,7 @@ $t: dcarp-replay
 dcarp-replay: dcarp-replay.c
 	${CC} ${CFLAGS} -Wall -Werror -o $@ ${.CURDIR}/dcarp-replay.c
 
-CLEANFILES +=	dcarp-replay dcarp.key dcarp.key.other dcarpd-*.log dcarpd-*.msg \
-		dcarpd-*.state
+CLEANFILES +=	dcarp-replay dcarp.key dcarp.key.other dcarpd-hook \
+		dcarpd-*.hook dcarpd-*.log dcarpd-*.msg dcarpd-*.state
 
 .include <bsd.regress.mk>

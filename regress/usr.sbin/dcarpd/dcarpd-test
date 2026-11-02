@@ -28,41 +28,49 @@
 #				ignored
 #	rdomain 78  master	vport89
 #
+# The three-members test adds a second backup:
+#	rdomain 75  third	carp75 on vport75 on veb77, vport85 on veb79
+#
 # The Makefile skips the test when any of these interfaces exist.
 #
 # usage: dcarpd-test state-file | gateway-from-route | other-carp | log-live |
 #	 replay | tampered | wrong-key | encrypted | sync-interface |
 #	 periodic | address-change | split-brain | address-follow |
-#	 older-generation |
-#	 lower-priority | backup-gateway-kept | stale
+#	 older-generation | lower-priority | equal-priority | init-takes |
+#	 backup-follows-master | three-members | backup-gateway-kept | stale
 
 : ${OBJDIR?} ${DCARPD?} ${REPLAY?}
 
 RA=76			# attacker rdomain
 RB=77			# backup rdomain
 RM=78			# master rdomain
+RT=75			# third member's rdomain
 VHID=177
 PREFIX=10.77.0		# carp net
 INTERNAL=10.79.0	# internal net
 MAX_AGE=30		# DCARP_MAX_AGE in dcarpd.h
-INTERFACES="carp$RB carp$RM carp79 veb77 veb79 vport76 vport77 vport78
-    vport79 vport89"
+INTERFACES="carp$RB carp$RM carp$RT carp79 veb77 veb79 vport$RT vport76
+    vport77 vport78 vport79 vport85 vport89"
 
 KEY=$OBJDIR/dcarp.key
+HOOK=$OBJDIR/dcarpd-hook
 BLOG=$OBJDIR/dcarpd-$1-backup.log
 MLOG=$OBJDIR/dcarpd-$1-master.log
+TLOG=$OBJDIR/dcarpd-$1-third.log
 BSTATE=$OBJDIR/dcarpd-$1-backup.state
 MSTATE=$OBJDIR/dcarpd-$1-master.state
+TSTATE=$OBJDIR/dcarpd-$1-third.state
 MSG=$OBJDIR/dcarpd-$1.msg
 
 cleanup() {
-	for p in $bpid $cpid $mpid; do
+	for p in $bpid $cpid $mpid $tpid; do
 		kill $p 2>/dev/null
 		wait $p 2>/dev/null
 	done
 	bpid=
 	cpid=
 	mpid=
+	tpid=
 	for i in $INTERFACES; do
 		ifconfig $i destroy 2>/dev/null
 	done
@@ -75,6 +83,10 @@ fail() {
 	cat $BLOG 2>/dev/null
 	echo "--- master dcarpd log"
 	cat $MLOG 2>/dev/null
+	if [ -s $TLOG ]; then
+		echo "--- third dcarpd log"
+		cat $TLOG
+	fi
 	exit 1
 }
 
@@ -115,8 +127,18 @@ state() {	# $1 = variable, $2 = state file, the backup's by default
 	(. ${2:-$BSTATE} 2>/dev/null && eval echo "\$$1")
 }
 
-gateway_is() {	# $1 = backup gateway the backup holds: the master's -g
-	[ "$(state DCARP_BACKUP_GATEWAY)" = $1 ]
+gateway_is() {	# $1 = backup gateway held: the master's -g, $2 = state file
+	[ "$(state DCARP_BACKUP_GATEWAY $2)" = $1 ]
+}
+
+# The routes the -x hook set, from its log next to the state file
+hook_log() {	# $1 = state file
+	echo $(cat ${1%.state}.hook 2>/dev/null)
+}
+
+# The sender id a dcarpd logged when it sent
+sender() {	# $1 = log
+	sed -n 's/^sent .*(sender \([0-9a-f]*\) .*/\1/p' $1 | tail -1
 }
 
 addresses() {	# $1 = interface
@@ -174,9 +196,43 @@ setup() {	# $1 = "default" to give the backup an internal default route
 	retry carp_is carp79 MASTER || fail "carp79 did not become MASTER"
 
 	(umask 077; echo dcarpd-regress-key > $KEY) || fail "cannot write $KEY"
+	# A -x hook routing as ifstated-dcarpd.conf does, logging each route
+	cat > $HOOK <<-'EOF' || fail "cannot write $HOOK"
+	#!/bin/sh
+	. "$1" || exit 1
+	case $2 in
+	MASTER)	gw=$DCARP_GATEWAY;;
+	BACKUP)	gw=$DCARP_BACKUP_GATEWAY;;
+	*)	gw=;;
+	esac
+	echo "$2/${gw:-none}" >> "${1%.state}.hook"
+	[ -n "$gw" ] || exit 0
+	route -qn delete default >/dev/null 2>&1
+	route -qn add default $gw
+	EOF
+	run chmod 755 $HOOK
 	: > $BLOG
 	: > $MLOG
-	rm -f $MSG $BSTATE* $MSTATE*
+	: > $TLOG
+	rm -f $MSG $BSTATE* $MSTATE* $TSTATE* ${BSTATE%.state}.hook \
+	    ${MSTATE%.state}.hook ${TSTATE%.state}.hook
+}
+
+# A third member, a backup with a worse priority than the backup.
+setup_third() {
+	[ ! -e /var/db/dhcpleased/carp$RT ] ||
+	    fail "/var/db/dhcpleased/carp$RT exists, generations would differ"
+	vport vport$RT $RT veb77 ""
+	vport vport85 $RT veb79 $INTERNAL.3/24
+	mkcarp carp$RT $RT vport$RT $VHID 150 $PREFIX.77/24
+	retry carp_is carp$RT BACKUP || fail "carp$RT did not become BACKUP"
+}
+
+start_third() {		# extra dcarpd arguments
+	route -T $RT exec $DCARPD -d -v -i carp$RT -g $INTERNAL.3 -k $KEY \
+	    -f $TSTATE "$@" > $TLOG 2>&1 &
+	tpid=$!
+	retry listening $tpid || fail "third dcarpd did not start"
 }
 
 start_backup() {	# extra dcarpd arguments
@@ -495,8 +551,8 @@ older-generation)
 	    fail "older configuration not logged"
 	;;
 lower-priority)
-	# Within one generation, a sender of lower carp(4) priority is
-	# rejected: a backup forced to master does not impose its
+	# Within one generation, a master rejects a sender of lower carp(4)
+	# priority: a backup forced to master does not impose its
 	# configuration on the master.
 	setup default
 	start_backup
@@ -511,6 +567,132 @@ lower-priority)
 	stop_master
 	grep -q "rejected message from $PREFIX.77: configuration .* no better priority" $MLOG ||
 	    fail "lower priority not logged by the master"
+	;;
+equal-priority)
+	# Two masters of the same priority, that see each other's messages
+	# on the sync net but not each other's carp(4) advertisements on the
+	# split carp net: the lower sender id wins.  The other takes its
+	# configuration, although master, and it rejects the other's.
+	setup default
+	run ifconfig carp$RB advskew 0
+	start_backup -s vport79
+	start_master $PREFIX.254 -s vport89
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	run ifconfig veb77 del vport$RB
+	retry carp_is carp$RB MASTER || fail "cut off carp$RB did not become MASTER"
+	retry grep -q "^sent " $BLOG || fail "backup did not send as master"
+	b=$(sender $BLOG)
+	m=$(sender $MLOG)
+	[ -n "$b" -a -n "$m" ] || fail "sender ids not logged: '$b' '$m'"
+	if expr $b \< $m >/dev/null; then
+		winner=$BLOG loser=$MLOG
+	else
+		winner=$MLOG loser=$BLOG
+	fi
+	# The backup sent when it became master, the master resends within
+	# ten seconds.
+	retry_for 15 grep -q "taking it although not backup" $loser ||
+	    fail "sender $m or $b with the higher id did not take the configuration"
+	retry_for 15 grep -q "rejected message from .*: configuration .* no better priority" $winner ||
+	    fail "sender with the lower id did not reject the configuration"
+	! grep -q "taking it although not backup" $winner ||
+	    fail "sender with the lower id took the configuration"
+	carp_is carp$RM MASTER || fail "carp$RM is no longer MASTER"
+	carp_is carp$RB MASTER || fail "carp$RB is no longer MASTER"
+	stop_backup
+	stop_master
+	;;
+init-takes)
+	# A member without an address stays in INIT, sends nothing, and
+	# takes the master's configuration of the same generation even if
+	# its priority is better: here the master's advskew is worse.
+	# carp(4) takes the interface down with its last address; up, as
+	# with "inet autoconf" before a lease, it receives multicast.
+	setup default
+	run ifconfig carp$RB $PREFIX.77 delete
+	run ifconfig carp$RB up
+	run ifconfig carp$RB advskew 0
+	run ifconfig carp$RM advskew 50
+	retry carp_is carp$RB INIT || fail "carp$RB without an address not INIT"
+	start_backup
+	start_master $PREFIX.254
+	retry only_address carp$RB $PREFIX.77 ||
+	    fail "carp$RB in INIT did not take $PREFIX.77: $(addresses carp$RB)"
+	gateway_is $PREFIX.254 || fail "state file: $(cat $BSTATE)"
+	stop_master
+	kill $bpid 2>/dev/null || fail "backup dcarpd died"
+	wait $bpid 2>/dev/null
+	bpid=
+	grep -q "carp$RB is in INIT state" $BLOG ||
+	    fail "backup dcarpd did not see carp$RB as INIT"
+	;;
+backup-follows-master)
+	# Without preemption a member of better priority that comes back
+	# stays backup: carp(4) has elected the other, so it must take the
+	# configuration of that master, whose priority is worse.  The
+	# Makefile runs this only with net.inet.carp.preempt=0.
+	setup default
+	start_backup
+	start_master $INTERNAL.2
+	retry gateway_is $INTERNAL.2 || fail "gateway not changed to $INTERNAL.2"
+	run ifconfig carp$RM down
+	retry carp_is carp$RB MASTER || fail "carp$RB did not become MASTER"
+	run ifconfig carp$RM up
+	retry carp_is carp$RM BACKUP || fail "carp$RM did not become BACKUP"
+	retry_for 15 gateway_is $PREFIX.250 $MSTATE ||
+	    fail "member come back as backup did not take the master's -g: $(cat $MSTATE)"
+	carp_is carp$RB MASTER || fail "carp$RB is no longer MASTER"
+	stop_backup
+	stop_master
+	grep -q "Backup Gateway: $PREFIX.250\$" $MLOG ||
+	    fail "taking the master's configuration not logged"
+	;;
+three-members)
+	# A master and two backups, routed by the -x hook as ifstated(8)
+	# would.  When the master dies, the backup of the better priority
+	# takes over: it announces the provider's gateway it learned,
+	# although its default route still goes via the old master.  The
+	# other backup stays backup and must follow it, its hook routing via
+	# the new master's -g; and in turn take over when that one dies too.
+	# A cut off member models a dead one: taken down, carp(4) would bow
+	# out, and both backups would become master at first.
+	setup
+	setup_third
+	run route -T $RM -qn add default $PREFIX.254
+	start_backup -g $INTERNAL.1 -x $HOOK
+	start_third -x $HOOK
+	start_master $INTERNAL.2 -x $HOOK
+	for s in $BSTATE $TSTATE; do
+		retry gateway_is $INTERNAL.2 $s ||
+		    fail "$s: $(cat $s 2>/dev/null)"
+	done
+	retry route_is $INTERNAL.2 $RB || fail "backup routes via $(defroute $RB)"
+	retry route_is $INTERNAL.2 $RT || fail "third routes via $(defroute $RT)"
+	retry route_is $PREFIX.254 $RM || fail "master routes via $(defroute $RM)"
+
+	run ifconfig veb77 del vport$RM
+	retry carp_is carp$RB MASTER || fail "carp$RB did not become MASTER"
+	retry route_is $PREFIX.254 $RB ||
+	    fail "new master routes via $(defroute $RB): $(cat $BSTATE)"
+	retry_for 15 gateway_is $INTERNAL.1 $TSTATE ||
+	    fail "third did not follow the new master: $(cat $TSTATE)"
+	[ "$(state DCARP_GATEWAY $TSTATE)" = $PREFIX.254 ] ||
+	    fail "new master announced no provider's gateway: $(cat $TSTATE)"
+	retry route_is $INTERNAL.1 $RT || fail "third routes via $(defroute $RT)"
+	carp_is carp$RT BACKUP || fail "carp$RT is not BACKUP"
+
+	run ifconfig veb77 del vport$RB
+	retry carp_is carp$RT MASTER || fail "carp$RT did not become MASTER"
+	retry route_is $PREFIX.254 $RT ||
+	    fail "last master routes via $(defroute $RT): $(cat $TSTATE)"
+	[ "$(hook_log $TSTATE)" = "BACKUP/$INTERNAL.2 BACKUP/$INTERNAL.1 MASTER/$PREFIX.254" ] ||
+	    fail "third's hook routed $(hook_log $TSTATE)"
+	kill $tpid 2>/dev/null || fail "third dcarpd died"
+	wait $tpid 2>/dev/null
+	tpid=
+	stop_backup
+	stop_master
 	;;
 backup-gateway-kept)
 	# A member keeps the backup gateway it learned from the master, -g
@@ -551,8 +733,10 @@ stale)
 	echo "usage: dcarpd-test state-file | gateway-from-route | other-carp |" \
 	    "log-live | replay | tampered | wrong-key | encrypted |" \
 	    "sync-interface | periodic | address-change | split-brain |" \
-	    "address-follow |" \
-	    "older-generation | lower-priority | backup-gateway-kept | stale" >&2
+	    "address-follow | older-generation | lower-priority |" \
+	    "equal-priority | init-takes | backup-follows-master |" \
+	    "three-members |" \
+	    "backup-gateway-kept | stale" >&2
 	exit 2
 	;;
 esac
