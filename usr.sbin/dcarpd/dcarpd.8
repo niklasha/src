@@ -7,8 +7,10 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl dnv
-.Op Fl i Ar interface
-.Op Fl g Ar gateway_ip
+.Fl g Ar gateway_ip
+.Fl i Ar interface
+.Op Fl k Ar key_file
+.Op Fl s Ar sync_interface
 .Sh DESCRIPTION
 The
 .Nm
@@ -28,7 +30,29 @@ Increase verbosity. Can be specified multiple times.
 Specify the network interface that the daemon should listen to and manage.
 .It Fl g Ar gateway_ip
 Specify the IP address to be used by peers as gateway when this host is the master.
+.It Fl k Ar key_file
+Read the shared key from
+.Ar key_file
+instead of
+.Pa /etc/dcarp.key .
+The file must be owned by root and not readable by group or others.
+.It Fl s Ar sync_interface
+Send and receive the DCARP messages on
+.Ar sync_interface ,
+for example a dedicated link between the nodes,
+instead of on the
+.Fl i
+interface.
+Messages received on any other interface are rejected.
 .El
+.Pp
+A message is accepted only if its HMAC is valid,
+it is at most 30 seconds old,
+and its sequence number is higher than the last one accepted from the
+same sender.
+Rejected messages are logged with their source address,
+at most once every 10 seconds.
+The clocks of the nodes must therefore agree within 30 seconds.
 .Sh SEE ALSO
 .Xr carp 4 ,
 .Xr syslogd 8
