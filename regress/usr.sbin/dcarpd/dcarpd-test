@@ -31,7 +31,8 @@
 # The Makefile skips the test when any of these interfaces exist.
 #
 # usage: dcarpd-test route-change | route-add | other-carp | log-live |
-#	 replay | tampered | wrong-key | encrypted | sync-interface | stale
+#	 replay | tampered | wrong-key | encrypted | sync-interface |
+#	 periodic | address-change | split-brain | stale
 
 : ${OBJDIR?} ${DCARPD?} ${REPLAY?}
 
@@ -51,12 +52,13 @@ MLOG=$OBJDIR/dcarpd-$1-master.log
 MSG=$OBJDIR/dcarpd-$1.msg
 
 cleanup() {
-	for p in $bpid $cpid; do
+	for p in $bpid $cpid $mpid; do
 		kill $p 2>/dev/null
 		wait $p 2>/dev/null
 	done
 	bpid=
 	cpid=
+	mpid=
 	for i in $INTERFACES; do
 		ifconfig $i destroy 2>/dev/null
 	done
@@ -76,13 +78,20 @@ run() {
 	"$@" || fail "$*"
 }
 
-# Retry the command given as arguments once a second for ten seconds.
-retry() {
-	for i in 1 2 3 4 5 6 7 8 9 10; do
+# Retry the command given after the count once a second, count times.
+retry_for() {
+	n=$1
+	shift
+	while [ $n -gt 0 ]; do
 		"$@" && return 0
 		sleep 1
+		n=$((n - 1))
 	done
 	return 1
+}
+
+retry() {
+	retry_for 10 "$@"
 }
 
 carp_is() {	# $1 = interface, $2 = state
@@ -172,7 +181,25 @@ master() {	# $1 = gateway, then extra dcarpd arguments
 	ok=$?
 	kill $mpid 2>/dev/null
 	wait $mpid 2>/dev/null
+	mpid=
 	return $ok
+}
+
+# Start a master dcarpd that keeps running, for its periodic resends.
+start_master() {	# $1 = gateway, then extra dcarpd arguments
+	gw=$1
+	shift
+	echo "--- master -g $gw $*" >> $MLOG
+	route -T $RM exec $DCARPD -d -v -i carp$RM -g $gw -k $KEY "$@" \
+	    >> $MLOG 2>&1 &
+	mpid=$!
+	retry listening $mpid || fail "master dcarpd did not start"
+}
+
+stop_master() {
+	kill $mpid 2>/dev/null || fail "master dcarpd died"
+	wait $mpid 2>/dev/null
+	mpid=
 }
 
 # Record the next message on the carp net from the attacker's rdomain.
@@ -309,6 +336,60 @@ sync-interface)
 	rejected $PREFIX.77 "received on carp$RB, not on vport79" ||
 	    fail "message on the wrong interface not logged"
 	;;
+periodic)
+	# A backup that starts after the master's first message gets the
+	# configuration from a resend, and applies it only once.
+	setup default
+	start_master $PREFIX.254
+	sleep 2
+	start_backup
+	retry_for 15 route_is $PREFIX.254 ||
+	    fail "backup did not get the configuration from a resend"
+	sleep 21	# two more resends
+	stop_backup
+	stop_master
+	n=$(grep -c "default route changed via $PREFIX.254" $BLOG)
+	[ $n -eq 1 ] || fail "configuration applied $n times, not once"
+	grep -q "Gateway IP: $PREFIX.254, unchanged" $BLOG ||
+	    fail "no unchanged resend seen by the backup"
+	grep -q "resent unchanged configuration" $MLOG ||
+	    fail "master did not resend"
+	;;
+address-change)
+	# When the master's address changes, the master sends it without
+	# waiting for the next resend.  Changing the address sends carp(4)
+	# through INIT, so this happens when it is master again, after
+	# about three seconds, and the master must not try to send while
+	# carp is in INIT.  Wait for a resend first, so that the next one is
+	# ten seconds away.
+	setup default
+	start_master $PREFIX.254
+	retry_for 15 grep -q "resent unchanged configuration" $MLOG ||
+	    fail "master did not resend"
+	run ifconfig carp$RM inet $PREFIX.78/24
+	retry_for 6 grep -q "sent $PREFIX.78 netmask" $MLOG ||
+	    fail "new address not sent before the next resend"
+	! grep -q "sendto failed" $MLOG || fail "master sent while not master"
+	stop_master
+	;;
+split-brain)
+	# Known problem, expected to fail: carp(4) authenticates the virtual
+	# addresses, so when the master's address changes the backup
+	# discards its advertisements and becomes master as well.  As
+	# master, dcarpd then ignores the new configuration.
+	setup default
+	start_backup
+	start_master $PREFIX.254
+	retry route_is $PREFIX.254 ||
+	    fail "default route not changed to $PREFIX.254"
+	run ifconfig carp$RM inet $PREFIX.78/24
+	sleep 10
+	state=$(ifconfig carp$RB | sed -n 's/.*carp: \([A-Z]*\) .*/\1/p')
+	[ "$state" = BACKUP ] ||
+	    fail "carp$RB is $state after the master's address changed"
+	stop_backup
+	stop_master
+	;;
 stale)
 	# A recorded message is rejected once it is too old, also by a
 	# backup that has never seen its sender.
@@ -329,7 +410,8 @@ stale)
 *)
 	echo "usage: dcarpd-test route-change | route-add | other-carp |" \
 	    "log-live | replay | tampered | wrong-key | encrypted |" \
-	    "sync-interface | stale" >&2
+	    "sync-interface | periodic | address-change | split-brain |" \
+	    "stale" >&2
 	exit 2
 	;;
 esac
