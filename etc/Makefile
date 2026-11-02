@@ -59,7 +59,7 @@ EXAMPLES_600=bgpd.conf doas.conf dvmrpd.conf eigrpd.conf hostapd.conf \
 
 # -r-xr-xr-x
 RCDAEMONS=amd apmd bgpd bgplgd bootparamd bpflogd cron \
-	dhcpd dhcpleased dhcp6leased dhcrelay dhcrelay6 \
+	dcarpd dhcpd dhcpleased dhcp6leased dhcrelay dhcrelay6 \
 	dvmrpd eigrpd ftpd ftpproxy ftpproxy6 hostapd \
 	hotplugd httpd identd ifstated iked inetd isakmpd iscsid ldapd \
 	ldattach ldomd ldpd lldpd lockd lpd mopd mountd mrouted \
