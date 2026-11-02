@@ -55,6 +55,9 @@ int routing_socket = -1;
 // Global variable to track the current CARP state
 int current_carp_state = CARP_STATE_INIT;
 
+/* Interface index of the carp interface given with -i */
+unsigned int carp_ifindex;
+
 void log_init() {
 	if (global_options.foreground) {
 		// In debug mode, log to stderr
@@ -274,9 +277,11 @@ int configure_interface(const char *interface, const in_addr_t ip, const in_addr
 	memset(&ifra, 0, sizeof(ifra));
 	strncpy(ifra.ifra_name, interface, sizeof(ifra.ifra_name));
 	sin = (struct sockaddr_in *)&ifra.ifra_addr;
+	sin->sin_len = sizeof(*sin);	/* the kernel rejects sin_len 0 */
 	sin->sin_family = AF_INET;
 	sin->sin_addr.s_addr = ip;
 	sin = (struct sockaddr_in *)&ifra.ifra_mask;
+	sin->sin_len = sizeof(*sin);
 	sin->sin_family = AF_INET;
 	sin->sin_addr.s_addr = netmask;
 	if (ioctl(sockfd, SIOCAIFADDR, &ifra) < 0) {
@@ -293,43 +298,69 @@ int configure_interface(const char *interface, const in_addr_t ip, const in_addr
 }
 
 int configure_default_gateway(const in_addr_t gateway_ip) {
-	int sockfd = socket(PF_ROUTE, SOCK_RAW, 0);
-	struct rt_msghdr rt;
-	struct sockaddr_in dst, gateway;
+	struct {
+		struct rt_msghdr	hdr;
+		struct sockaddr_in	dst;
+		struct sockaddr_in	gateway;
+		struct sockaddr_in	netmask;
+	} rtmsg;
+	char gateway_ip_str[INET_ADDRSTRLEN];
+	int sockfd;
 
+	inet_ntop(AF_INET, &gateway_ip, gateway_ip_str, sizeof(gateway_ip_str));
+
+	sockfd = socket(AF_ROUTE, SOCK_RAW, AF_INET);
 	if (sockfd < 0) {
 		log_perror("socket");
 		return (-1);
 	}
 
-	memset(&rt, 0, sizeof(rt));
-	memset(&dst, 0, sizeof(dst));
-	memset(&gateway, 0, sizeof(gateway));
+	/*
+	 * The kernel takes exactly one routing message per write(2), so the
+	 * header and the sockaddrs, in RTA_* bit order, go out in one buffer.
+	 */
+	memset(&rtmsg, 0, sizeof(rtmsg));
+	rtmsg.hdr.rtm_msglen = sizeof(rtmsg);
+	rtmsg.hdr.rtm_hdrlen = sizeof(rtmsg.hdr);
+	rtmsg.hdr.rtm_version = RTM_VERSION;
+	rtmsg.hdr.rtm_type = RTM_CHANGE;
+	rtmsg.hdr.rtm_tableid = getrtable();
+	rtmsg.hdr.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
+	rtmsg.hdr.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
 
-	// Set up the route message
-	rt.rtm_msglen = sizeof(rt) + sizeof(struct sockaddr_in) * 2;
-	rt.rtm_version = RTM_VERSION;
-	rt.rtm_type = RTM_CHANGE;
-	rt.rtm_flags = RTF_UP | RTF_GATEWAY;
-	rt.rtm_addrs = RTA_DST | RTA_GATEWAY;
+	/* Destination and netmask 0.0.0.0/0: the default route */
+	rtmsg.dst.sin_len = sizeof(rtmsg.dst);
+	rtmsg.dst.sin_family = AF_INET;
+	rtmsg.netmask.sin_len = sizeof(rtmsg.netmask);
+	rtmsg.netmask.sin_family = AF_INET;
 
-	// Destination address (default route: 0.0.0.0)
-	dst.sin_family = AF_INET;
-	dst.sin_len = sizeof(struct sockaddr_in);
-	dst.sin_addr.s_addr = htonl(INADDR_ANY);
+	rtmsg.gateway.sin_len = sizeof(rtmsg.gateway);
+	rtmsg.gateway.sin_family = AF_INET;
+	rtmsg.gateway.sin_addr.s_addr = gateway_ip;
 
-	// Gateway address
-	gateway.sin_family = AF_INET;
-	gateway.sin_len = sizeof(struct sockaddr_in);
-	gateway.sin_addr.s_addr = gateway_ip;
-
-	// Write the route message
-	write(sockfd, &rt, sizeof(rt));
-	write(sockfd, &dst, sizeof(dst));
-	write(sockfd, &gateway, sizeof(gateway));
+	/* Change the existing default route, or add one if there is none */
+	if (write(sockfd, &rtmsg, sizeof(rtmsg)) == -1) {
+		if (errno != ESRCH) {
+			log_perror("RTM_CHANGE default route");
+			goto fail;
+		}
+		rtmsg.hdr.rtm_type = RTM_ADD;
+		if (write(sockfd, &rtmsg, sizeof(rtmsg)) == -1) {
+			log_perror("RTM_ADD default route");
+			goto fail;
+		}
+	}
 
 	close(sockfd);
+	log_message(LOG_NOTICE, "default route %s via %s",
+	    rtmsg.hdr.rtm_type == RTM_ADD ? "added" : "changed", gateway_ip_str);
 	return (0);
+
+fail:
+	close(sockfd);
+	log_message(LOG_ERR, "could not set default route via %s",
+	    gateway_ip_str);
+	return (-1);
 }
 
 int get_carp_interface_state(const char *if_name) {
@@ -422,7 +453,9 @@ void routing_callback(int fd, short event, void *arg) {
 			return;
 		}
 
-		if (ifm->ifm_data.ifi_type != IFT_CARP) {
+		/* Only our own carp interface, not every carp(4) on the host */
+		if (ifm->ifm_data.ifi_type != IFT_CARP ||
+		    ifm->ifm_index != carp_ifindex) {
 			return;
 		}
                 int new_state = determine_carp_state(ifm);
@@ -519,6 +552,13 @@ int main(int argc, char *argv[]) {
 	
 	if (!global_options.dry_run && getuid() != 0) {
 		log_message(LOG_ERR, "must be run as root.");
+		goto err;
+	}
+
+	carp_ifindex = if_nametoindex(global_options.interface_name);
+	if (carp_ifindex == 0) {
+		log_message(LOG_ERR, "%s: no such interface",
+		    global_options.interface_name);
 		goto err;
 	}
 
@@ -666,10 +706,8 @@ void handle_signal(int signal)
 }
 
 void setup_multicast_socket() {
-	struct ip_mreq mreq;
+	struct ip_mreqn mreqn;
 	struct sockaddr_in addr;
-	struct in_addr interface_addr;
-	in_addr_t interface_netmask;
 	int yes = 1;
 
 	/* Create a UDP socket */
@@ -710,18 +748,24 @@ void setup_multicast_socket() {
 		exit(EXIT_FAILURE);
 	}
 
-	mreq.imr_multiaddr.s_addr = multicast_address.s_addr;
-	mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-	if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+	/*
+	 * Join and send on the carp interface, selected by index.  With
+	 * INADDR_ANY the kernel would pick the interface of the route to the
+	 * group, i.e. usually the default route, and the address cannot be
+	 * used either: it changes with the DHCP lease on the master and may
+	 * be missing when the daemon starts.
+	 */
+	memset(&mreqn, 0, sizeof(mreqn));
+	mreqn.imr_multiaddr = multicast_address;
+	mreqn.imr_ifindex = carp_ifindex;
+	if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreqn, sizeof(mreqn)) < 0) {
 		log_perror("setsockopt(IP_ADD_MEMBERSHIP)");
 		close(sock);
 		log_close();
 		exit(EXIT_FAILURE);
 	}
-	if (get_interface_ip_and_netmask(global_options.interface_name, &interface_addr.s_addr, &interface_netmask) != 0) {
-		log_message(LOG_INFO, "could not get carp interface address");
-	} else if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, 
-	    (char *)&interface_addr, sizeof(interface_addr)) < 0) {
+	if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, &mreqn,
+	    sizeof(mreqn)) < 0) {
 		log_perror("setsockopt(IP_MULTICAST_IF)");
 		close(sock);
 		log_close();
