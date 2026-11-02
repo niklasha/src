@@ -30,7 +30,7 @@
 #
 # The Makefile skips the test when any of these interfaces exist.
 #
-# usage: dcarpd-test route-change | route-add | other-carp | log-live |
+# usage: dcarpd-test state-file | gateway-from-route | other-carp | log-live |
 #	 replay | tampered | wrong-key | encrypted | sync-interface |
 #	 periodic | address-change | split-brain | address-follow |
 #	 older-generation |
@@ -51,6 +51,8 @@ INTERFACES="carp$RB carp$RM carp79 veb77 veb79 vport76 vport77 vport78
 KEY=$OBJDIR/dcarp.key
 BLOG=$OBJDIR/dcarpd-$1-backup.log
 MLOG=$OBJDIR/dcarpd-$1-master.log
+BSTATE=$OBJDIR/dcarpd-$1-backup.state
+MSTATE=$OBJDIR/dcarpd-$1-master.state
 MSG=$OBJDIR/dcarpd-$1.msg
 
 cleanup() {
@@ -100,12 +102,21 @@ carp_is() {	# $1 = interface, $2 = state
 	[ "$(ifconfig $1 | sed -n 's/.*carp: \([A-Z]*\) .*/\1/p')" = $2 ]
 }
 
-defroute() {
-	route -T $RB -n show -inet | awk '$1 == "default" { print $2 }'
+defroute() {	# $1 = rdomain, the backup's by default
+	route -T ${1:-$RB} -n show -inet | awk '$1 == "default" { print $2 }'
 }
 
-route_is() {	# $1 = gateway
-	[ "$(defroute)" = $1 ]
+route_is() {	# $1 = gateway, $2 = rdomain
+	[ "$(defroute $2)" = "$1" ]
+}
+
+# A variable from a state file, sourced as ifstated(8) scripts would
+state() {	# $1 = variable, $2 = state file, the backup's by default
+	(. ${2:-$BSTATE} 2>/dev/null && eval echo "\$$1")
+}
+
+gateway_is() {	# $1 = gateway the backup holds
+	[ "$(state DCARP_GATEWAY)" = $1 ]
 }
 
 addresses() {	# $1 = interface
@@ -165,12 +176,12 @@ setup() {	# $1 = "default" to give the backup an internal default route
 	(umask 077; echo dcarpd-regress-key > $KEY) || fail "cannot write $KEY"
 	: > $BLOG
 	: > $MLOG
-	rm -f $MSG
+	rm -f $MSG $BSTATE* $MSTATE*
 }
 
 start_backup() {	# extra dcarpd arguments
 	route -T $RB exec $DCARPD -d -v -i carp$RB -g $PREFIX.250 -k $KEY \
-	    "$@" > $BLOG 2>&1 &
+	    -f $BSTATE "$@" > $BLOG 2>&1 &
 	bpid=$!
 	retry listening $bpid || fail "backup dcarpd did not start"
 }
@@ -184,15 +195,18 @@ stop_backup() {
 }
 
 # Run a master dcarpd, which distributes its configuration when it starts,
-# and wait until the backup's default route points to the given gateway.
+# and wait until the backup holds the given gateway.  "route:" before the
+# gateway runs the master without -g, to use its default route.
 master() {	# $1 = gateway, then extra dcarpd arguments
-	gw=$1
+	gw=${1#route:}
+	g="-g $gw"
+	[ "$1" = "route:$gw" ] && g=
 	shift
-	echo "--- master -g $gw $*" >> $MLOG
-	route -T $RM exec $DCARPD -d -v -i carp$RM -g $gw -k $KEY "$@" \
-	    >> $MLOG 2>&1 &
+	echo "--- master $g $*" >> $MLOG
+	route -T $RM exec $DCARPD -d -v -i carp$RM $g -k $KEY -f $MSTATE \
+	    "$@" >> $MLOG 2>&1 &
 	mpid=$!
-	retry route_is $gw
+	retry gateway_is $gw
 	ok=$?
 	kill $mpid 2>/dev/null
 	wait $mpid 2>/dev/null
@@ -205,8 +219,8 @@ start_master() {	# $1 = gateway, then extra dcarpd arguments
 	gw=$1
 	shift
 	echo "--- master -g $gw $*" >> $MLOG
-	route -T $RM exec $DCARPD -d -v -i carp$RM -g $gw -k $KEY "$@" \
-	    >> $MLOG 2>&1 &
+	route -T $RM exec $DCARPD -d -v -i carp$RM -g $gw -k $KEY -f $MSTATE \
+	    "$@" >> $MLOG 2>&1 &
 	mpid=$!
 	retry listening $mpid || fail "master dcarpd did not start"
 }
@@ -240,27 +254,41 @@ rejected() {	# $1 = source address, $2 = reason (regular expression),
 }
 
 case $1 in
-route-change)
-	# The backup changes its existing default route, each time a
-	# master announces a gateway.
+state-file)
+	# The backup writes each configuration a master announces to its
+	# state file, which a shell can source, and never changes a route:
+	# those are ifstated(8)'s.
 	setup default
 	start_backup
-	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
-	master $PREFIX.253 || fail "default route not changed to $PREFIX.253"
+	master $PREFIX.254 || fail "gateway not changed to $PREFIX.254"
+	master $PREFIX.253 || fail "gateway not changed to $PREFIX.253"
 	stop_backup
-	grep -q "default route changed via $PREFIX.253" $BLOG ||
-	    fail "route change not logged"
+	[ "$(state DCARP_INTERFACE) $(state DCARP_ADDRESS) $(state DCARP_NETMASK) $(state DCARP_GENERATION)" = \
+	    "carp$RB $PREFIX.77 255.255.255.0 0" ] ||
+	    fail "state file: $(cat $BSTATE)"
+	[ "$(stat -f %Sp $BSTATE)" = "-rw-r--r--" ] ||
+	    fail "state file mode $(stat -f %Sp $BSTATE)"
+	[ -z "$(ls $BSTATE.* 2>/dev/null)" ] ||
+	    fail "temporary files left: $(ls $BSTATE.*)"
+	route_is $INTERNAL.254 ||
+	    fail "backup's default route changed to $(defroute)"
+	grep -q "wrote $BSTATE: .* gateway $PREFIX.253" $BLOG ||
+	    fail "state file write not logged"
 	! grep -q SIOCAIFADDR $BLOG || fail "address configuration failed"
 	;;
-route-add)
-	# Without a default route the backup adds one.
+gateway-from-route)
+	# Without -g the master announces its default route through the
+	# carp interface.  The backup, which has no default route, gets
+	# none from dcarpd.
 	setup
-	[ -z "$(defroute)" ] || fail "backup has a default route already"
+	run route -T $RM -qn add default $PREFIX.254
 	start_backup
-	master $PREFIX.254 || fail "default route not added via $PREFIX.254"
+	master route:$PREFIX.254 ||
+	    fail "gateway $PREFIX.254 of the master's default route not held"
 	stop_backup
-	grep -q "default route added via $PREFIX.254" $BLOG ||
-	    fail "route addition not logged"
+	[ -z "$(defroute)" ] || fail "backup got a default route $(defroute)"
+	[ "$(state DCARP_GATEWAY $MSTATE)" = $PREFIX.254 ] ||
+	    fail "master's state file: $(cat $MSTATE)"
 	;;
 other-carp)
 	# A state change of another carp(4) does not change our state:
@@ -289,13 +317,13 @@ replay)
 	setup default
 	start_backup
 	capture
-	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
+	master $PREFIX.254 || fail "gateway not changed to $PREFIX.254"
 	wait_capture
-	master $PREFIX.253 || fail "default route not changed to $PREFIX.253"
+	master $PREFIX.253 || fail "gateway not changed to $PREFIX.253"
 	replay
 	sleep 2
-	route_is $PREFIX.253 ||
-	    fail "replayed message changed the default route to $(defroute)"
+	gateway_is $PREFIX.253 ||
+	    fail "replayed message changed the gateway to $(state DCARP_GATEWAY)"
 	stop_backup
 	rejected $PREFIX.$RA "replay: " || fail "replay not logged"
 	;;
@@ -306,12 +334,12 @@ tampered)
 	setup default
 	start_backup
 	capture
-	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
+	master $PREFIX.254 || fail "gateway not changed to $PREFIX.254"
 	wait_capture
 	replay -x 36
 	sleep 2
-	route_is $PREFIX.254 ||
-	    fail "tampered message changed the default route to $(defroute)"
+	gateway_is $PREFIX.254 ||
+	    fail "tampered message changed the gateway to $(state DCARP_GATEWAY)"
 	stop_backup
 	rejected $PREFIX.$RA "authentication failed" ||
 	    fail "tampered message not logged"
@@ -322,7 +350,7 @@ wrong-key)
 	(umask 077; echo another-key > $KEY.other) || fail "cannot write key"
 	start_backup
 	! master $PREFIX.254 -k $KEY.other ||
-	    fail "message with another key changed the default route"
+	    fail "message with another key changed the gateway"
 	stop_backup
 	rejected $PREFIX.77 "authentication failed" ||
 	    fail "message with another key not logged"
@@ -332,7 +360,7 @@ encrypted)
 	setup default
 	start_backup
 	capture
-	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
+	master $PREFIX.254 || fail "gateway not changed to $PREFIX.254"
 	wait_capture
 	stop_backup
 	hex=$(od -An -tx1 -v $MSG | tr -d ' \n')
@@ -359,13 +387,13 @@ periodic)
 	start_master $PREFIX.254
 	sleep 2
 	start_backup
-	retry_for 15 route_is $PREFIX.254 ||
+	retry_for 15 gateway_is $PREFIX.254 ||
 	    fail "backup did not get the configuration from a resend"
 	sleep 21	# two more resends
 	stop_backup
 	stop_master
-	n=$(grep -c "default route changed via $PREFIX.254" $BLOG)
-	[ $n -eq 1 ] || fail "configuration applied $n times, not once"
+	n=$(grep -c "wrote $BSTATE: .* gateway $PREFIX.254" $BLOG)
+	[ $n -eq 1 ] || fail "configuration taken $n times, not once"
 	grep -q "Gateway IP: $PREFIX.254, unchanged" $BLOG ||
 	    fail "no unchanged resend seen by the backup"
 	grep -q "resent unchanged configuration" $MLOG ||
@@ -399,8 +427,8 @@ split-brain)
 	setup default
 	start_backup
 	start_master $PREFIX.254
-	retry route_is $PREFIX.254 ||
-	    fail "default route not changed to $PREFIX.254"
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
 	run ifconfig veb77 del vport$RB
 	run ifconfig carp$RM inet $PREFIX.78/24
 	retry carp_is carp$RB MASTER || fail "cut off carp$RB did not become MASTER"
@@ -425,8 +453,8 @@ address-follow)
 	setup default
 	start_backup
 	start_master $PREFIX.254
-	retry route_is $PREFIX.254 ||
-	    fail "default route not changed to $PREFIX.254"
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
 	run ifconfig carp$RM inet $PREFIX.78/24
 	retry_for 15 only_address carp$RB $PREFIX.78 ||
 	    fail "carp$RB has $(addresses carp$RB), not only $PREFIX.78"
@@ -446,16 +474,16 @@ older-generation)
 	setup default
 	start_backup
 	start_master $PREFIX.254
-	retry route_is $PREFIX.254 ||
-	    fail "default route not changed to $PREFIX.254"
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
 	run ifconfig carp$RM inet $PREFIX.78/24
 	retry_for 15 only_address carp$RB $PREFIX.78 ||
 	    fail "carp$RB has $(addresses carp$RB), not only $PREFIX.78"
 	stop_master
 	start_master $PREFIX.253
 	sleep 3
-	route_is $PREFIX.254 ||
-	    fail "older configuration changed the default route to $(defroute)"
+	gateway_is $PREFIX.254 ||
+	    fail "older configuration changed the gateway to $(state DCARP_GATEWAY)"
 	stop_backup
 	stop_master
 	rejected $PREFIX.78 "older configuration" ||
@@ -468,14 +496,15 @@ lower-priority)
 	setup default
 	start_backup
 	start_master $PREFIX.254
-	retry route_is $PREFIX.254 ||
-	    fail "default route not changed to $PREFIX.254"
-	before=$(route -T $RM -n show -inet | awk '$1 == "default" { print $2 }')
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	[ "$(state DCARP_GATEWAY $MSTATE)" = $PREFIX.254 ] ||
+	    fail "master's state file: $(cat $MSTATE)"
 	run ifconfig carp$RB state master
 	sleep 3
-	gw=$(route -T $RM -n show -inet | awk '$1 == "default" { print $2 }')
-	[ "$gw" = "$before" ] ||
-	    fail "master's default route changed from '$before' to '$gw'"
+	gw=$(state DCARP_GATEWAY $MSTATE)
+	[ "$gw" = $PREFIX.254 ] ||
+	    fail "master took the backup's gateway $gw"
 	stop_backup
 	stop_master
 	grep -q "rejected message from $PREFIX.77: configuration .* no better priority" $MLOG ||
@@ -487,7 +516,7 @@ stale)
 	setup default
 	start_backup
 	capture
-	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
+	master $PREFIX.254 || fail "gateway not changed to $PREFIX.254"
 	wait_capture
 	stop_backup
 	sleep $((MAX_AGE + 2))
@@ -499,7 +528,7 @@ stale)
 	    fail "stale message not logged"
 	;;
 *)
-	echo "usage: dcarpd-test route-change | route-add | other-carp |" \
+	echo "usage: dcarpd-test state-file | gateway-from-route | other-carp |" \
 	    "log-live | replay | tampered | wrong-key | encrypted |" \
 	    "sync-interface | periodic | address-change | split-brain |" \
 	    "address-follow |" \
