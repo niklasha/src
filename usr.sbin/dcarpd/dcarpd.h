@@ -29,6 +29,7 @@ struct options {
 	char *keyfile_path;
 	char *key;
 	char *interface_name;
+	char *sync_interface;	/* -s, carries the messages; default -i */
 	char *gateway_ip;
 	int foreground;
 	int verbose;
@@ -42,16 +43,24 @@ struct options {
 
 #define HMAC_LENGTH 32  // Length of HMAC SHA-256 output
 
+/* All integers in network byte order; the HMAC covers everything before it */
 struct dcarp_message {
-	int message_type;
+	uint32_t message_type;
 	in_addr_t carp_ip;
 	in_addr_t netmask;
 	in_addr_t gateway_ip;
+	uint64_t sender;	/* random, chosen when the sender starts */
+	uint64_t sequence;	/* per sender, starts at 1 */
+	int64_t timestamp;	/* seconds since the epoch */
 	// Future fields (e.g., DNS servers) can be noted here for later implementation
 	unsigned char hmac[HMAC_LENGTH];  // HMAC signature
 };
 
 #define MSG_TYPE_IP_DISTRIBUTION 1    // Message type for IP distribution
+
+#define DCARP_MAX_AGE		30	/* seconds a message is accepted */
+#define DCARP_SENDERS		8	/* senders remembered against replay */
+#define DCARP_REJECT_LOG_INTERVAL 10	/* seconds between logged rejects */
 
 int add_hmac_signature(struct dcarp_message *);
 void close_multicast_socket(void);
@@ -66,12 +75,15 @@ void log_close(void);
 void log_init(void);
 void log_message(int, const char *, ...);
 void log_perror(const char *);
-int process_received_message(const struct dcarp_message *);
+int process_received_message(const struct dcarp_message *,
+    const struct sockaddr_in *);
 char *read_keyfile(const char *);
 int receive_message(void);
 int send_message(const struct dcarp_message *);
 void setup_multicast_socket(void);
 void update_carp_state(int);
-int validate_message(const struct dcarp_message *);
+int validate_message(const struct dcarp_message *, const struct sockaddr_in *);
+void log_rejected(const struct sockaddr_in *, const char *, ...)
+    __attribute__((__format__ (printf, 2, 3)));
 
 #endif // _DCARPD_H

@@ -76,7 +76,7 @@ DCARP employs a structured message format for communication between the Master a
 
 4.1 Message Structure
 
-A DCARP message consists of the following fields:
+A DCARP message consists of the following fields, all integers in network byte order:
 
     Message Type (4 bytes): A field that identifies the type of the DCARP message. For DCARP IP distribution messages, this is set to a predefined value (e.g., 0x00000001).
 
@@ -86,11 +86,15 @@ A DCARP message consists of the following fields:
 
     Gateway IP (4 bytes): The default gateway IP address in network byte order.
 
+    Sender (8 bytes): A random value the sender chooses when it starts, identifying it for replay detection.
+
+    Sequence (8 bytes): A per-sender counter, starting at 1 and incremented for every message.
+
+    Timestamp (8 bytes): The time the message was sent, in seconds since 1970-01-01 00:00:00 UTC.
+
     HMAC (32 bytes): The HMAC, computed using SHA-256, ensures the message's integrity and authenticity.
 
-The total length of a DCARP message is thus 48 bytes.
-
-diff
+The total length of a DCARP message is thus 72 bytes.
 
  0                   1                   2                   3
   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -104,6 +108,18 @@ diff
   |                         Gateway IP                            |
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   |                                                               |
+  +                            Sender                             +
+  |                                                               |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                                                               |
+  +                           Sequence                            +
+  |                                                               |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                                                               |
+  +                           Timestamp                           +
+  |                                                               |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                                                               |
   +                                                               +
   |                                                               |
   +                              HMAC                             +
@@ -115,11 +131,23 @@ diff
 
 4.2 Message Integrity and Authentication
 
-The HMAC field is a critical component of the DCARP message format. It is computed using the shared secret key known to all nodes in the DCARP setup. The HMAC covers the Message Type, CARP IP, Netmask, and Gateway IP fields. Upon receipt of a DCARP message, nodes must verify the HMAC before accepting the message contents. This verification process protects against unauthorized or tampered messages within the network.
+The HMAC field is a critical component of the DCARP message format. It is computed using the shared secret key known to all nodes in the DCARP setup. The HMAC covers all fields that precede it. Upon receipt of a DCARP message, nodes must verify the HMAC before accepting the message contents. This verification process protects against unauthorized or tampered messages within the network.
+
+4.2.1 Replay Protection
+
+A valid HMAC alone does not stop an attacker from sending a recorded message again later, which would make Backup nodes revert to an old configuration. A receiver therefore also requires that:
+
+    The Timestamp is no more than 30 seconds before or after its own clock. This bounds replays of messages from senders the receiver does not remember, for example after it restarts. The clocks of the nodes must agree within this limit.
+
+    The Sequence is higher than the last one accepted from the same Sender. A receiver remembers a small number of recent senders.
+
+Messages that fail any check are discarded and should be logged with their source address, at a limited rate.
 
 4.3 Multicast Transmission
 
 DCARP messages are transmitted using UDP multicast, ensuring efficient and simultaneous delivery to all Backup nodes. The multicast address and port used for DCARP communication are predetermined and should be configurable in the implementation to adapt to specific network environments.
+
+By default the messages are sent on the CARP interface itself. An implementation should allow them to be sent on another interface instead, such as a dedicated link between the nodes, and should then discard messages received on any other interface.
 
 5. Operational Details
 

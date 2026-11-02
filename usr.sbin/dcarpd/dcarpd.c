@@ -14,17 +14,21 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <syslog.h>
+#include <endian.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <net/if.h>
+#include <net/if_dl.h>
 #include <net/if_types.h>
 #include <net/route.h>
 #include <netinet/in.h>
@@ -58,14 +62,28 @@ int current_carp_state = CARP_STATE_INIT;
 /* Interface index of the carp interface given with -i */
 unsigned int carp_ifindex;
 
+/* Interface index of the interface carrying the messages, -s or -i */
+unsigned int sync_ifindex;
+
+/* Our identity and message counter as a sender */
+uint64_t my_sender;
+uint64_t my_sequence;
+
+/* Last sequence number accepted per sender, against replays */
+struct {
+	uint64_t sender;
+	uint64_t sequence;
+	time_t seen;
+} senders[DCARP_SENDERS];
+
 void log_init() {
 	if (global_options.foreground) {
 		// In debug mode, log to stderr
 		setlogmask(LOG_UPTO(LOG_INFO));
-		openlog("dcarpd", LOG_CONS | LOG_NDELAY | LOG_PERROR, LOG_LOCAL1);
+		openlog("dcarpd", LOG_CONS | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
 	} else {
 		// In normal mode, log to syslog
-		openlog("dcarpd", LOG_CONS | LOG_NDELAY, LOG_LOCAL1);
+		openlog("dcarpd", LOG_CONS | LOG_NDELAY, LOG_DAEMON);
 	}
 }
 
@@ -75,8 +93,9 @@ void log_message(int level, const char *format, ...) {
 
 	if (level <= LOG_INFO + global_options.verbose) {
 		if (global_options.foreground) {
-			vfprintf(level > LOG_ERR ? stdout : stderr, format, args);
-			fprintf(level > LOG_ERR ? stdout : stderr, "\n");
+			/* stderr is unbuffered: lines show up as they happen */
+			vfprintf(stderr, format, args);
+			fprintf(stderr, "\n");
 		} else {
 			vsyslog(level, format, args);
 		}
@@ -87,6 +106,40 @@ void log_message(int level, const char *format, ...) {
 
 void log_close() {
 	closelog();
+}
+
+/*
+ * Log why a message was rejected, with its source address.  Anyone on
+ * the segment can send to us, so log at most one rejection every
+ * DCARP_REJECT_LOG_INTERVAL seconds and count the ones left out.
+ */
+void log_rejected(const struct sockaddr_in *from, const char *format, ...) {
+	static time_t last;
+	static unsigned int suppressed;
+	char from_str[INET_ADDRSTRLEN];
+	char reason[128];
+	time_t now = time(NULL);
+	va_list args;
+
+	if (last != 0 && now - last < DCARP_REJECT_LOG_INTERVAL) {
+		suppressed++;
+		return;
+	}
+
+	va_start(args, format);
+	vsnprintf(reason, sizeof(reason), format, args);
+	va_end(args);
+	inet_ntop(AF_INET, &from->sin_addr, from_str, sizeof(from_str));
+
+	if (suppressed > 0)
+		log_message(LOG_WARNING, "rejected message from %s: %s "
+		    "(%u more rejected since the last report)", from_str,
+		    reason, suppressed);
+	else
+		log_message(LOG_WARNING, "rejected message from %s: %s",
+		    from_str, reason);
+	last = now;
+	suppressed = 0;
 }
 
 void log_perror(const char *message) {
@@ -127,21 +180,61 @@ void monitor_carp_state() {
 
 int receive_message() {
 	struct sockaddr_in from_addr;
-	socklen_t from_addr_len = sizeof(from_addr);
 	struct dcarp_message message;
+	/* One byte extra, to notice messages that are too long */
+	unsigned char buf[sizeof(message) + 1];
+	union {
+		struct cmsghdr hdr;
+		unsigned char buf[CMSG_SPACE(sizeof(struct sockaddr_dl))];
+	} cmsgbuf;
+	struct cmsghdr *cmsg;
+	struct msghdr msg;
+	struct iovec iov;
+	unsigned int ifindex = 0;
+	char ifname[IF_NAMESIZE];
+	ssize_t received_bytes;
 
-	int received_bytes = recvfrom(global_multicast_socket, &message, sizeof(message), 0,
-	    (struct sockaddr *)&from_addr, &from_addr_len);
+	memset(&msg, 0, sizeof(msg));
+	iov.iov_base = buf;
+	iov.iov_len = sizeof(buf);
+	msg.msg_name = &from_addr;
+	msg.msg_namelen = sizeof(from_addr);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = &cmsgbuf.buf;
+	msg.msg_controllen = sizeof(cmsgbuf.buf);
 
+	received_bytes = recvmsg(global_multicast_socket, &msg, 0);
 	if (received_bytes < 0) {
-		log_perror("recvfrom failed");
+		log_perror("recvmsg failed");
 		return (-1);
 	}
 
-	if (validate_message(&message) != 1)
+	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+	    cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+		if (cmsg->cmsg_level == IPPROTO_IP &&
+		    cmsg->cmsg_type == IP_RECVIF)
+			ifindex = ((struct sockaddr_dl *)CMSG_DATA(cmsg))->sdl_index;
+	}
+	if (ifindex != sync_ifindex) {
+		if (if_indextoname(ifindex, ifname) == NULL)
+			snprintf(ifname, sizeof(ifname), "index %u", ifindex);
+		log_rejected(&from_addr, "received on %s, not on %s", ifname,
+		    global_options.sync_interface);
+		return (-1);
+	}
+
+	if (received_bytes != sizeof(message)) {
+		log_rejected(&from_addr, "%zd bytes, expected %zu",
+		    received_bytes, sizeof(message));
+		return (-1);
+	}
+	memcpy(&message, buf, sizeof(message));
+
+	if (validate_message(&message, &from_addr) != 1)
 		return (-1);
 
-	return (process_received_message(&message));
+	return (process_received_message(&message, &from_addr));
 }
 
 int send_message(const struct dcarp_message *message) {
@@ -184,8 +277,12 @@ int add_hmac_signature(struct dcarp_message *message) {
 
 int distribute_ip_addresses() {
 	struct dcarp_message message;
+	char carp_ip_str[INET_ADDRSTRLEN];
+	char netmask_str[INET_ADDRSTRLEN];
+	int rv;
 
-	message.message_type = MSG_TYPE_IP_DISTRIBUTION;
+	memset(&message, 0, sizeof(message));
+	message.message_type = htonl(MSG_TYPE_IP_DISTRIBUTION);
 
 	if (get_interface_ip_and_netmask(global_options.interface_name, &message.carp_ip, &message.netmask) != 0) {
 		log_message(LOG_ERR, "Failed to retrieve IP and netmask for interface %s", global_options.interface_name);
@@ -195,25 +292,48 @@ int distribute_ip_addresses() {
 	// Convert the gateway IP from string to binary format
 	inet_pton(AF_INET, global_options.gateway_ip, &message.gateway_ip);
 
+	message.sender = htobe64(my_sender);
+	message.sequence = htobe64(++my_sequence);
+	message.timestamp = htobe64(time(NULL));
+
 	if (add_hmac_signature(&message) == -1)
 		return (-1);
-	
-	return (send_message(&message));
+
+	rv = send_message(&message);
+	if (rv == 0) {
+		inet_ntop(AF_INET, &message.carp_ip, carp_ip_str,
+		    sizeof(carp_ip_str));
+		inet_ntop(AF_INET, &message.netmask, netmask_str,
+		    sizeof(netmask_str));
+		log_message(LOG_INFO, "sent %s netmask %s gateway %s on %s "
+		    "(sender %016llx sequence %llu)", carp_ip_str, netmask_str,
+		    global_options.gateway_ip, global_options.sync_interface,
+		    (unsigned long long)my_sender,
+		    (unsigned long long)my_sequence);
+	}
+	return (rv);
 }
 
-int process_received_message(const struct dcarp_message *message) {
+int process_received_message(const struct dcarp_message *message,
+    const struct sockaddr_in *from) {
 	char carp_ip_str[INET_ADDRSTRLEN];
 	char netmask_str[INET_ADDRSTRLEN];
 	char gateway_ip_str[INET_ADDRSTRLEN];
+	char from_str[INET_ADDRSTRLEN];
 
-	switch (message->message_type) {
+	switch (ntohl(message->message_type)) {
         case MSG_TYPE_IP_DISTRIBUTION:
 		inet_ntop(AF_INET, &message->carp_ip, carp_ip_str, INET_ADDRSTRLEN);
 		inet_ntop(AF_INET, &message->netmask, netmask_str, INET_ADDRSTRLEN);
 		inet_ntop(AF_INET, &message->gateway_ip, gateway_ip_str, INET_ADDRSTRLEN);
+		inet_ntop(AF_INET, &from->sin_addr, from_str, INET_ADDRSTRLEN);
 
-		log_message(LOG_INFO, "Received IP distribution message: CARP IP: %s, Netmask: %s, Gateway IP: %s",
-		       carp_ip_str, netmask_str, gateway_ip_str);
+		log_message(LOG_INFO, "Received IP distribution message from %s "
+		    "(sender %016llx sequence %llu): CARP IP: %s, Netmask: %s, "
+		    "Gateway IP: %s", from_str,
+		    (unsigned long long)be64toh(message->sender),
+		    (unsigned long long)be64toh(message->sequence),
+		    carp_ip_str, netmask_str, gateway_ip_str);
 		if (current_carp_state == CARP_STATE_BACKUP) {
 			if (global_options.dry_run) {
 				log_message(LOG_WARNING, "Dry-run mode: Skipping network reconfiguration.");
@@ -226,15 +346,27 @@ int process_received_message(const struct dcarp_message *message) {
 		break;
 
         default:
-		log_message(LOG_ERR, "Unknown message type received: %d", message->message_type);
+		log_rejected(from, "unknown message type %u",
+		    ntohl(message->message_type));
 		return (-1);
 	}
 	return (0);
 }
 
-int validate_message(const struct dcarp_message *message) {
+/*
+ * Accept a message only if its HMAC is right, it is at most DCARP_MAX_AGE
+ * seconds old (or early, for clocks that differ), and its sequence number
+ * is higher than the last one accepted from the same sender.  The age
+ * limit covers senders we do not remember, e.g. after a restart.
+ */
+int validate_message(const struct dcarp_message *message,
+    const struct sockaddr_in *from) {
 	unsigned char calculated_hmac[HMAC_LENGTH];
 	unsigned int len;
+	uint64_t sender, sequence;
+	long long age;
+	time_t now;
+	int i, slot;
 
 	// Assuming global_options.key contains the HMAC key
 	if (global_options.key == NULL) {
@@ -246,11 +378,46 @@ int validate_message(const struct dcarp_message *message) {
 	     (unsigned char*)message, sizeof(*message) - HMAC_LENGTH, calculated_hmac, &len);
 
 	// Compare the received HMAC with the calculated one
-	if (len == HMAC_LENGTH && memcmp(message->hmac, calculated_hmac, HMAC_LENGTH) == 0) {
-		return (1);  // Valid message
-	} else {
-		return (0);  // Invalid or tampered message
+	if (len != HMAC_LENGTH ||
+	    timingsafe_bcmp(message->hmac, calculated_hmac, HMAC_LENGTH) != 0) {
+		log_rejected(from, "invalid HMAC (wrong key, or tampered with)");
+		return (0);
 	}
+
+	sender = be64toh(message->sender);
+	sequence = be64toh(message->sequence);
+	now = time(NULL);
+	age = (long long)now - (long long)be64toh(message->timestamp);
+	if (age > DCARP_MAX_AGE || age < -DCARP_MAX_AGE) {
+		log_rejected(from, "timestamp %lld seconds %s (sender %016llx "
+		    "sequence %llu); clocks out of sync, or a replay",
+		    age < 0 ? -age : age, age < 0 ? "ahead" : "old",
+		    (unsigned long long)sender, (unsigned long long)sequence);
+		return (0);
+	}
+
+	/* Find the sender, or else the slot seen least recently */
+	slot = 0;
+	for (i = 0; i < DCARP_SENDERS; i++) {
+		if (senders[i].seen != 0 && senders[i].sender == sender) {
+			slot = i;
+			break;
+		}
+		if (senders[i].seen < senders[slot].seen)
+			slot = i;
+	}
+	if (i < DCARP_SENDERS && sequence <= senders[slot].sequence) {
+		log_rejected(from, "replay: sender %016llx sequence %llu, "
+		    "already at %llu", (unsigned long long)sender,
+		    (unsigned long long)sequence,
+		    (unsigned long long)senders[slot].sequence);
+		return (0);
+	}
+	senders[slot].sender = sender;
+	senders[slot].sequence = sequence;
+	senders[slot].seen = now;
+
+	return (1);
 }
 
 // Call this function in handle_master_transition
@@ -516,7 +683,7 @@ void multicast_callback(int fd, short event, void *arg) {
 int main(int argc, char *argv[]) {
 	int ch;
 
-	while ((ch = getopt(argc, argv, "dnvi:g:k:")) != -1) {
+	while ((ch = getopt(argc, argv, "dnvi:g:k:s:")) != -1) {
 		switch (ch) {
 		case 'd':
 			global_options.foreground = 1;
@@ -535,6 +702,9 @@ int main(int argc, char *argv[]) {
 			break;
 		case 'k':
 			global_options.keyfile_path = optarg;
+			break;
+		case 's':
+			global_options.sync_interface = optarg;
 			break;
 		default:
 			usage();
@@ -561,6 +731,15 @@ int main(int argc, char *argv[]) {
 		    global_options.interface_name);
 		goto err;
 	}
+	if (global_options.sync_interface == NULL)
+		global_options.sync_interface = global_options.interface_name;
+	sync_ifindex = if_nametoindex(global_options.sync_interface);
+	if (sync_ifindex == 0) {
+		log_message(LOG_ERR, "%s: no such interface",
+		    global_options.sync_interface);
+		goto err;
+	}
+	arc4random_buf(&my_sender, sizeof(my_sender));
 
 	if (!global_options.foreground) {
 		daemonize();
@@ -749,15 +928,16 @@ void setup_multicast_socket() {
 	}
 
 	/*
-	 * Join and send on the carp interface, selected by index.  With
-	 * INADDR_ANY the kernel would pick the interface of the route to the
-	 * group, i.e. usually the default route, and the address cannot be
-	 * used either: it changes with the DHCP lease on the master and may
-	 * be missing when the daemon starts.
+	 * Join and send on the sync interface (the carp interface unless -s
+	 * is given), selected by index.  With INADDR_ANY the kernel would pick
+	 * the interface of the route to the group, i.e. usually the default
+	 * route, and the carp address cannot be used either: it changes with
+	 * the DHCP lease on the master and may be missing when the daemon
+	 * starts.
 	 */
 	memset(&mreqn, 0, sizeof(mreqn));
 	mreqn.imr_multiaddr = multicast_address;
-	mreqn.imr_ifindex = carp_ifindex;
+	mreqn.imr_ifindex = sync_ifindex;
 	if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreqn, sizeof(mreqn)) < 0) {
 		log_perror("setsockopt(IP_ADD_MEMBERSHIP)");
 		close(sock);
@@ -767,6 +947,13 @@ void setup_multicast_socket() {
 	if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, &mreqn,
 	    sizeof(mreqn)) < 0) {
 		log_perror("setsockopt(IP_MULTICAST_IF)");
+		close(sock);
+		log_close();
+		exit(EXIT_FAILURE);
+	}
+	/* Report the receiving interface, to drop messages from elsewhere */
+	if (setsockopt(sock, IPPROTO_IP, IP_RECVIF, &yes, sizeof(yes)) < 0) {
+		log_perror("setsockopt(IP_RECVIF)");
 		close(sock);
 		log_close();
 		exit(EXIT_FAILURE);
@@ -784,7 +971,7 @@ void close_multicast_socket() {
 void usage(void) {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-d] [-v] [-n] -i interface -g gateway_ip [-k key_file]\n",
-		__progname);
+	fprintf(stderr, "usage: %s [-d] [-v] [-n] -i interface -g gateway_ip "
+	    "[-k key_file] [-s sync_interface]\n", __progname);
 	exit(EXIT_FAILURE);
 }
