@@ -1,0 +1,203 @@
+#!/bin/sh
+#	$OpenBSD$
+#
+# Copyright (c) 2026 Niklas Hallqvist
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# Run dcarpd(8) as master and backup on one host, in two routing domains
+# joined by veb(4).  No physical interface is involved.
+#
+#   rdomain 78	master	carp78 on vport78
+#   rdomain 77	backup	carp77 on vport77, and vether79 as an internal
+#			net with the default route and a second carp(4),
+#			carp79, whose state changes must be ignored
+#
+# The Makefile skips the test when any of these interfaces exist.
+#
+# usage: dcarpd-test route-change | route-add | other-carp
+
+: ${OBJDIR?} ${DCARPD?}
+
+RB=77			# backup rdomain
+RM=78			# master rdomain
+VHID=177
+PREFIX=10.77.0		# carp net, the master's DHCP-provisioned uplink
+INTERNAL=10.79.0	# internal net of the backup
+INTERFACES="carp$RB carp$RM carp79 veb$RB vport$RB vport$RM vether79"
+
+KEY=$OBJDIR/dcarp.key
+BLOG=$OBJDIR/dcarpd-$1-backup.log
+MLOG=$OBJDIR/dcarpd-$1-master.log
+
+cleanup() {
+	if [ -n "$bpid" ]; then
+		kill $bpid 2>/dev/null
+		wait $bpid 2>/dev/null
+		bpid=
+	fi
+	for i in $INTERFACES; do
+		ifconfig $i destroy 2>/dev/null
+	done
+}
+
+fail() {
+	echo "FAILED: $*"
+	cleanup
+	echo "--- backup dcarpd log"
+	cat $BLOG 2>/dev/null
+	echo "--- master dcarpd log"
+	cat $MLOG 2>/dev/null
+	exit 1
+}
+
+run() {
+	"$@" || fail "$*"
+}
+
+# Retry the command given as arguments once a second for ten seconds.
+retry() {
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		"$@" && return 0
+		sleep 1
+	done
+	return 1
+}
+
+carp_is() {	# $1 = interface, $2 = state
+	[ "$(ifconfig $1 | sed -n 's/.*carp: \([A-Z]*\) .*/\1/p')" = $2 ]
+}
+
+defroute() {
+	route -T $RB -n show -inet | awk '$1 == "default" { print $2 }'
+}
+
+route_is() {	# $1 = gateway
+	[ "$(defroute)" = $1 ]
+}
+
+mkcarp() {	# $1 = if, $2 = rdomain, $3 = carpdev, $4 = vhid, $5 = advskew,
+		# $6 = address
+	run ifconfig $1 create
+	run ifconfig $1 rdomain $2
+	run ifconfig $1 carpdev $3 vhid $4 pass dcarpd-regress advskew $5
+	run ifconfig $1 inet $6 up
+}
+
+setup() {	# $1 = "default" to give the backup an internal default route
+	for r in $RB $RM; do
+		run ifconfig vport$r create
+		run ifconfig vport$r rdomain $r
+		run ifconfig vport$r up
+	done
+	run ifconfig veb$RB create
+	run ifconfig veb$RB add vport$RB add vport$RM up
+	run ifconfig vether79 create
+	run ifconfig vether79 rdomain $RB
+	run ifconfig vether79 inet $INTERNAL.1/24 up
+	if [ "$1" = default ]; then
+		run route -T $RB -qn add default $INTERNAL.254
+	fi
+
+	mkcarp carp$RM $RM vport$RM $VHID 0 $PREFIX.77/24
+	retry carp_is carp$RM MASTER || fail "carp$RM did not become MASTER"
+	mkcarp carp$RB $RB vport$RB $VHID 100 $PREFIX.77/24
+	mkcarp carp79 $RB vether79 179 0 $INTERNAL.79/24
+	retry carp_is carp$RB BACKUP || fail "carp$RB did not become BACKUP"
+	retry carp_is carp79 MASTER || fail "carp79 did not become MASTER"
+
+	(umask 077; echo dcarpd-regress-key > $KEY) || fail "cannot write $KEY"
+	: > $BLOG
+	: > $MLOG
+}
+
+listening() {
+	fstat -p $bpid 2>/dev/null | grep -q ':3522'
+}
+
+# With -d dcarpd logs to stdout, which is block buffered in a file: only
+# read the log after the daemon has exited.
+start_backup() {
+	route -T $RB exec $DCARPD -d -v -i carp$RB -g $PREFIX.250 -k $KEY \
+	    > $BLOG 2>&1 &
+	bpid=$!
+	retry listening || fail "backup dcarpd did not start"
+}
+
+stop_backup() {
+	kill $bpid 2>/dev/null || fail "backup dcarpd died"
+	wait $bpid 2>/dev/null
+	bpid=
+	grep -q "carp$RB is in BACKUP state" $BLOG ||
+	    fail "backup dcarpd did not see carp$RB as BACKUP"
+}
+
+# Run a master dcarpd, which distributes its configuration when it starts,
+# and wait until the backup's default route points to the given gateway.
+master() {	# $1 = gateway
+	echo "--- master -g $1" >> $MLOG
+	route -T $RM exec $DCARPD -d -v -i carp$RM -g $1 -k $KEY \
+	    >> $MLOG 2>&1 &
+	mpid=$!
+	retry route_is $1
+	ok=$?
+	kill $mpid 2>/dev/null
+	wait $mpid 2>/dev/null
+	return $ok
+}
+
+case $1 in
+route-change)
+	# The backup changes its existing default route, each time a
+	# master announces a gateway.
+	setup default
+	start_backup
+	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
+	master $PREFIX.253 || fail "default route not changed to $PREFIX.253"
+	stop_backup
+	grep -q "default route changed via $PREFIX.253" $BLOG ||
+	    fail "route change not logged"
+	! grep -q SIOCAIFADDR $BLOG || fail "address configuration failed"
+	;;
+route-add)
+	# Without a default route the backup adds one.
+	setup
+	[ -z "$(defroute)" ] || fail "backup has a default route already"
+	start_backup
+	master $PREFIX.254 || fail "default route not added via $PREFIX.254"
+	stop_backup
+	grep -q "default route added via $PREFIX.254" $BLOG ||
+	    fail "route addition not logged"
+	;;
+other-carp)
+	# A state change of another carp(4) does not change our state:
+	# the backup still applies the master's configuration afterwards.
+	setup default
+	start_backup
+	run ifconfig carp79 state backup
+	retry carp_is carp79 BACKUP || fail "carp79 did not become BACKUP"
+	retry carp_is carp79 MASTER || fail "carp79 did not return to MASTER"
+	master $PREFIX.252 ||
+	    fail "backup ignored the master after carp79 changed state"
+	stop_backup
+	! grep -q "CARP state changed" $BLOG ||
+	    fail "state change of carp79 taken as our own"
+	;;
+*)
+	echo "usage: dcarpd-test route-change | route-add | other-carp" >&2
+	exit 2
+	;;
+esac
+
+cleanup
+exit 0

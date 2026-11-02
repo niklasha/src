@@ -4,6 +4,7 @@ SUBDIR += acme-client
 SUBDIR += arp
 SUBDIR += bgpd
 SUBDIR += btrace
+SUBDIR += dcarpd
 SUBDIR += httpd
 SUBDIR += ifstated
 SUBDIR += installboot
