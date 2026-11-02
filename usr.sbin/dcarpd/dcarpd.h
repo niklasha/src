@@ -33,6 +33,7 @@ struct options {
 				   members, their gateway while they are backup
 				   and we are master */
 	char *state_file;	/* -f, the configuration for ifstated(8) */
+	char *hook;		/* -x, run when it or the carp state changes */
 	int foreground;
 	int verbose;
 	int dry_run;
@@ -95,13 +96,17 @@ struct dcarp_config {
 #define DCARP_INTERVAL		10	/* seconds between resends of a master;
 					   must stay below DCARP_MAX_AGE */
 #define DCARP_MAX_AGE		30	/* seconds a message is accepted */
-#define DCARP_SENDERS		8	/* senders remembered against replay */
+#define DCARP_SENDERS		64	/* senders remembered against replay,
+					   at least the members of a group */
 #define DCARP_REJECT_LOG_INTERVAL 10	/* seconds between logged rejects */
 
+const char *carp_state_name(int);
 void close_multicast_socket(void);
 int get_default_gateway(in_addr_t *);
 int write_state_file(const struct dcarp_message *, in_addr_t);
-in_addr_t read_state_backup_gateway(void);
+in_addr_t read_state_address(const char *);
+void run_hook(void);
+void start_hook(void);
 int configure_interface(const char *, in_addr_t, in_addr_t);
 void daemonize(void);
 int determine_carp_state(struct if_msghdr *);
