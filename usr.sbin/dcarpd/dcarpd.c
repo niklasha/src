@@ -72,6 +72,12 @@ uint64_t my_sequence;
 /* XChaCha20-Poly1305 keyed from the key file */
 EVP_AEAD_CTX *aead_ctx;
 
+/* Resends the configuration every DCARP_INTERVAL seconds as master */
+struct event send_timer;
+
+/* What we last sent as master and applied as backup */
+struct dcarp_config last_sent, last_applied;
+
 /* Additional data bound to every message, separating it from other uses */
 static const unsigned char dcarp_ad[] = "DCARP 1";
 
@@ -166,10 +172,33 @@ void log_perror(const char *message) {
 	}
 }
 
+int config_matches(const struct dcarp_config *config,
+    const struct dcarp_message *message) {
+	return (config->valid && config->carp_ip == message->carp_ip &&
+	    config->netmask == message->netmask &&
+	    config->gateway_ip == message->gateway_ip);
+}
+
+void config_record(struct dcarp_config *config,
+    const struct dcarp_message *message) {
+	config->valid = 1;
+	config->carp_ip = message->carp_ip;
+	config->netmask = message->netmask;
+	config->gateway_ip = message->gateway_ip;
+}
+
 void update_carp_state(int new_state) {
 	if (new_state != current_carp_state) {
 		current_carp_state = new_state;
 		log_message(LOG_INFO, "CARP state changed to: %d", current_carp_state);
+
+		/*
+		 * Report the first message sent in the new state, and apply
+		 * the master's configuration again as a new backup: routes
+		 * may have been changed while we were master.
+		 */
+		last_sent.valid = 0;
+		last_applied.valid = 0;
 
 		if (new_state == CARP_STATE_MASTER) {
 			distribute_ip_addresses();
@@ -306,6 +335,7 @@ int send_message(const struct dcarp_message *message) {
 }
 
 int distribute_ip_addresses() {
+	static int no_address;
 	struct dcarp_message message;
 	char carp_ip_str[INET_ADDRSTRLEN];
 	char netmask_str[INET_ADDRSTRLEN];
@@ -314,10 +344,14 @@ int distribute_ip_addresses() {
 	memset(&message, 0, sizeof(message));
 	message.message_type = htonl(MSG_TYPE_IP_DISTRIBUTION);
 
+	/* Called every DCARP_INTERVAL seconds: complain only once */
 	if (get_interface_ip_and_netmask(global_options.interface_name, &message.carp_ip, &message.netmask) != 0) {
-		log_message(LOG_ERR, "Failed to retrieve IP and netmask for interface %s", global_options.interface_name);
+		if (!no_address)
+			log_message(LOG_ERR, "Failed to retrieve IP and netmask for interface %s, not sending until it has one", global_options.interface_name);
+		no_address = 1;
 		return (0);
 	}
+	no_address = 0;
 
 	// Convert the gateway IP from string to binary format
 	inet_pton(AF_INET, global_options.gateway_ip, &message.gateway_ip);
@@ -327,18 +361,33 @@ int distribute_ip_addresses() {
 	message.timestamp = htobe64(time(NULL));
 
 	rv = send_message(&message);
-	if (rv == 0) {
-		inet_ntop(AF_INET, &message.carp_ip, carp_ip_str,
-		    sizeof(carp_ip_str));
-		inet_ntop(AF_INET, &message.netmask, netmask_str,
-		    sizeof(netmask_str));
-		log_message(LOG_INFO, "sent %s netmask %s gateway %s on %s "
-		    "(sender %016llx sequence %llu)", carp_ip_str, netmask_str,
-		    global_options.gateway_ip, global_options.sync_interface,
-		    (unsigned long long)my_sender,
+	if (rv != 0)
+		return (rv);
+
+	/* Log the resends of an unchanged configuration only with -v */
+	if (config_matches(&last_sent, &message)) {
+		log_message(LOG_DEBUG, "resent unchanged configuration on %s "
+		    "(sequence %llu)", global_options.sync_interface,
 		    (unsigned long long)my_sequence);
+		return (0);
 	}
-	return (rv);
+	inet_ntop(AF_INET, &message.carp_ip, carp_ip_str, sizeof(carp_ip_str));
+	inet_ntop(AF_INET, &message.netmask, netmask_str, sizeof(netmask_str));
+	log_message(LOG_INFO, "sent %s netmask %s gateway %s on %s "
+	    "(sender %016llx sequence %llu)", carp_ip_str, netmask_str,
+	    global_options.gateway_ip, global_options.sync_interface,
+	    (unsigned long long)my_sender, (unsigned long long)my_sequence);
+	config_record(&last_sent, &message);
+	return (0);
+}
+
+/* Resend our configuration as master; the timer runs in all states */
+void send_timer_callback(int fd, short event, void *arg) {
+	struct timeval tv = { DCARP_INTERVAL, 0 };
+
+	if (current_carp_state == CARP_STATE_MASTER)
+		distribute_ip_addresses();
+	evtimer_add(&send_timer, &tv);
 }
 
 int process_received_message(const struct dcarp_message *message,
@@ -355,21 +404,38 @@ int process_received_message(const struct dcarp_message *message,
 		inet_ntop(AF_INET, &message->gateway_ip, gateway_ip_str, INET_ADDRSTRLEN);
 		inet_ntop(AF_INET, &from->sin_addr, from_str, INET_ADDRSTRLEN);
 
+		/*
+		 * A master resends every DCARP_INTERVAL seconds; only a
+		 * changed configuration is logged without -v and applied.
+		 */
+		if (current_carp_state != CARP_STATE_BACKUP ||
+		    config_matches(&last_applied, message)) {
+			log_message(LOG_DEBUG, "Received IP distribution message "
+			    "from %s (sender %016llx sequence %llu): CARP IP: %s, "
+			    "Netmask: %s, Gateway IP: %s%s", from_str,
+			    (unsigned long long)be64toh(message->sender),
+			    (unsigned long long)be64toh(message->sequence),
+			    carp_ip_str, netmask_str, gateway_ip_str,
+			    current_carp_state == CARP_STATE_BACKUP ?
+			    ", unchanged" : ", not backup");
+			return (0);
+		}
 		log_message(LOG_INFO, "Received IP distribution message from %s "
 		    "(sender %016llx sequence %llu): CARP IP: %s, Netmask: %s, "
 		    "Gateway IP: %s", from_str,
 		    (unsigned long long)be64toh(message->sender),
 		    (unsigned long long)be64toh(message->sequence),
 		    carp_ip_str, netmask_str, gateway_ip_str);
-		if (current_carp_state == CARP_STATE_BACKUP) {
-			if (global_options.dry_run) {
-				log_message(LOG_WARNING, "Dry-run mode: Skipping network reconfiguration.");
-				return (0);
-			}
+		if (global_options.dry_run) {
+			log_message(LOG_WARNING, "Dry-run mode: Skipping network reconfiguration.");
+		} else {
+			/* On failure, the next resend tries again */
 			if (configure_interface(global_options.interface_name, message->carp_ip, message->netmask) != 0)
 				return (-1);
-			return (configure_default_gateway(message->gateway_ip));
+			if (configure_default_gateway(message->gateway_ip) != 0)
+				return (-1);
 		}
+		config_record(&last_applied, message);
 		break;
 
         default:
@@ -614,13 +680,46 @@ void routing_callback(int fd, short event, void *arg) {
 
 	switch (rtm->rtm_type) {
 	case RTM_NEWADDR:
-		log_message(LOG_DEBUG, "Received RTM_NEWADDR");
-		// Handle RTM_NEWADDR
+	case RTM_DELADDR: {
+		struct ifa_msghdr *ifam = (struct ifa_msghdr *)msg;
+		in_addr_t ip, netmask;
+
+		if (n < sizeof(*ifam) || ifam->ifam_index != carp_ifindex)
+			return;
+		log_message(LOG_DEBUG, "Received %s for %s",
+		    rtm->rtm_type == RTM_NEWADDR ? "RTM_NEWADDR" : "RTM_DELADDR",
+		    global_options.interface_name);
+
+		/*
+		 * The master's address changed, e.g. a new DHCP lease:
+		 * tell the backups now rather than at the next resend.  A
+		 * renewal may remove the old address before adding the new.
+		 * Changing the addresses of a carp(4) interface usually
+		 * sends it through INIT, and it cannot send until it is
+		 * master again; RTM_IFINFO for that follows, and we send
+		 * then.  So ask the kernel rather than trusting our state,
+		 * which the queued RTM_IFINFO has not updated yet.
+		 */
+		if (current_carp_state != CARP_STATE_MASTER)
+			break;
+		if (get_interface_ip_and_netmask(global_options.interface_name,
+		    &ip, &netmask) != 0) {
+			log_message(LOG_INFO, "%s has no address now",
+			    global_options.interface_name);
+			break;
+		}
+		if (get_carp_interface_state(global_options.interface_name) !=
+		    CARP_STATE_MASTER) {
+			log_message(LOG_INFO, "address of %s changed, sending "
+			    "when it is master again",
+			    global_options.interface_name);
+			break;
+		}
+		log_message(LOG_INFO, "address of %s changed, sending",
+		    global_options.interface_name);
+		distribute_ip_addresses();
 		break;
-	case RTM_DELADDR:
-		log_message(LOG_DEBUG, "Received RTM_DELADDR");
-		// Handle RTM_DELADDR
-		break;
+	}
 	case RTM_IFINFO: {
 		struct if_msghdr *ifm = (struct if_msghdr *)msg;
 
@@ -793,6 +892,10 @@ int main(int argc, char *argv[]) {
 	// Add the events
 	event_add(&multicast_event, NULL);
 	event_add(&routing_event, NULL);
+
+	struct timeval send_interval = { DCARP_INTERVAL, 0 };
+	evtimer_set(&send_timer, send_timer_callback, NULL);
+	evtimer_add(&send_timer, &send_interval);
 
 	// Start monitoring CARP state changes
 	monitor_carp_state();

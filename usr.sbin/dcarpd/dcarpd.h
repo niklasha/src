@@ -56,6 +56,14 @@ struct dcarp_message {
 	// Future fields (e.g., DNS servers) can be noted here for later implementation
 };
 
+/* A configuration last sent or applied, to notice changes */
+struct dcarp_config {
+	int valid;
+	in_addr_t carp_ip;
+	in_addr_t netmask;
+	in_addr_t gateway_ip;
+};
+
 #define DCARP_KEY_LEN		32	/* XChaCha20-Poly1305 key */
 #define DCARP_NONCE_LEN		24
 #define DCARP_TAG_LEN		16
@@ -64,6 +72,8 @@ struct dcarp_message {
 
 #define MSG_TYPE_IP_DISTRIBUTION 1    // Message type for IP distribution
 
+#define DCARP_INTERVAL		10	/* seconds between resends of a master;
+					   must stay below DCARP_MAX_AGE */
 #define DCARP_MAX_AGE		30	/* seconds a message is accepted */
 #define DCARP_SENDERS		8	/* senders remembered against replay */
 #define DCARP_REJECT_LOG_INTERVAL 10	/* seconds between logged rejects */
