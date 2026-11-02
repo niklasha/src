@@ -7,7 +7,8 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl dnv
-.Fl g Ar gateway_ip
+.Op Fl f Ar state_file
+.Op Fl g Ar gateway
 .Fl i Ar interface
 .Op Fl k Ar key_file
 .Op Fl s Ar sync_interface
@@ -15,6 +16,16 @@
 The
 .Nm
 daemon implements the DCARP protocol for dynamic IP address sharing.
+It gives the address of a
+.Xr carp 4
+interface, which the master may get from DHCP,
+to the backups,
+and writes it with the gateway of that network to a state file,
+from which
+.Xr ifstated 8
+or other scripts set the routes.
+.Nm
+changes no routes itself.
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
@@ -22,20 +33,37 @@ The options are as follows:
 Do not daemonize. If this option is specified,
 .Nm
 will run in the foreground.
-.It Fl n
-Run in dry-run mode. In this mode, the daemon goes through all the motions but does not actually reconfigure network interfaces or routes. This is useful for testing.
-.It Fl v
-Increase verbosity. Can be specified multiple times.
+.It Fl f Ar state_file
+Write the configuration held to
+.Ar state_file
+instead of
+.Pa /var/db/dcarpd/ Ns Ar interface .
+.It Fl g Ar gateway
+The gateway on the network of the
+.Fl i
+interface that this host announces as master,
+for example the ISP's router.
+Without
+.Fl g ,
+it announces the gateway of its default route if that goes through the
+.Fl i
+interface, as one added by
+.Xr dhcpleased 8 ,
+and else none.
 .It Fl i Ar interface
-Specify the network interface that the daemon should listen to and manage.
-.It Fl g Ar gateway_ip
-Specify the IP address to be used by peers as gateway when this host is the master.
+The
+.Xr carp 4
+interface whose address
+.Nm
+manages.
 .It Fl k Ar key_file
 Read the shared key from
 .Ar key_file
 instead of
 .Pa /etc/dcarp.key .
 The file must be owned by root and not readable by group or others.
+.It Fl n
+Run in dry-run mode. In this mode, the daemon goes through all the motions but does not actually reconfigure network interfaces. This is useful for testing.
 .It Fl s Ar sync_interface
 Send and receive the DCARP messages on
 .Ar sync_interface ,
@@ -44,15 +72,15 @@ instead of on the
 .Fl i
 interface.
 Messages received on any other interface are rejected.
+.It Fl v
+Increase verbosity. Can be specified multiple times.
 .El
 .Pp
 As master,
 .Nm
 sends the address and netmask of the
 .Fl i
-interface and the
-.Fl g
-gateway when it becomes master,
+interface and the gateway when it becomes master,
 when that address changes,
 and every 10 seconds.
 .Pp
@@ -83,8 +111,28 @@ To take a configuration,
 .Nm
 makes its address the only IPv4 address of the
 .Fl i
-interface and sets the default route,
-but only when they differ from the ones it took last.
+interface and writes it to the state file,
+but only when it differs from the one it took last.
+As master it writes the configuration it sends.
+The state file consists of
+.Xr sh 1
+variable assignments, replaced atomically:
+.Bl -tag -width DCARP_GENERATION
+.It Ev DCARP_INTERFACE
+The
+.Fl i
+interface.
+.It Ev DCARP_ADDRESS
+Its address.
+.It Ev DCARP_NETMASK
+Its netmask.
+.It Ev DCARP_GATEWAY
+The gateway on its network, or empty if there is none.
+.It Ev DCARP_GENERATION
+The generation, in seconds since the Epoch.
+.El
+.Pp
+A backup thus knows the gateway the moment it becomes master.
 .Pp
 Messages are encrypted and authenticated with XChaCha20-Poly1305,
 keyed with the SHA-256 hash of the key file.
@@ -102,14 +150,48 @@ Rejected messages are logged with their source address,
 at most once every 10 seconds.
 The clocks of the nodes must therefore agree within 30 seconds.
 .Sh FILES
-.Bl -tag -width "/var/db/dhcpleased/interface" -compact
+.Bl -tag -width "/etc/examples/ifstated-dcarpd.conf" -compact
 .It Pa /etc/dcarp.key
 The shared key.
+.It Pa /etc/examples/ifstated-dcarpd.conf
+Example
+.Xr ifstated.conf 5
+for a pair of firewalls.
+.It Pa /var/db/dcarpd/ Ns Ar interface
+The state file.
 .It Pa /var/db/dhcpleased/ Ns Ar interface
 The DHCP lease of the carp interface, whose time is the generation.
 .El
+.Sh EXAMPLES
+Run
+.Nm
+on both firewalls of a pair, for carp0, whose address the master gets
+by DHCP:
+.Bd -literal -offset indent
+# dcarpd -i carp0
+.Ed
+.Pp
+In
+.Xr ifstated.conf 5 ,
+route via the gateway from the state file when carp0 becomes master,
+and keep the current route if there is none:
+.Bd -literal -offset indent
+if carp0.link.up {
+	run "[ -r /var/db/dcarpd/carp0 ] && . /var/db/dcarpd/carp0 && \e
+	    [ -n \e"$DCARP_GATEWAY\e" ] && \e
+	    { route -q delete default; \e
+	    route -q add default $DCARP_GATEWAY; }"
+}
+.Ed
+.Pp
+A complete example, which also demotes the master if the gateway is
+unreachable and routes via the peer as backup, is in
+.Pa /etc/examples/ifstated-dcarpd.conf .
 .Sh SEE ALSO
 .Xr carp 4 ,
+.Xr ifstated.conf 5 ,
+.Xr dhcpleased 8 ,
+.Xr ifstated 8 ,
 .Xr syslogd 8
 .Sh HISTORY
 The

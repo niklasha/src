@@ -29,7 +29,9 @@ struct options {
 	char *keyfile_path;
 	char *interface_name;
 	char *sync_interface;	/* -s, carries the messages; default -i */
-	char *gateway_ip;
+	char *gateway_ip;	/* -g, the carp network's gateway as master;
+				   default the default route through -i */
+	char *state_file;	/* -f, the configuration for ifstated(8) */
 	int foreground;
 	int verbose;
 	int dry_run;
@@ -65,12 +67,16 @@ struct dcarp_message {
 /* The DHCP lease of the carp interface, whose time is the generation */
 #define DCARP_LEASE_DIR		"/var/db/dhcpleased"
 
+/* Where the configuration held is written, per carp interface */
+#define DCARP_STATE_DIR		"/var/db/dcarpd"
+
 /* A configuration last sent or applied, to notice changes */
 struct dcarp_config {
 	int valid;
 	in_addr_t carp_ip;
 	in_addr_t netmask;
 	in_addr_t gateway_ip;
+	int64_t generation;
 };
 
 #define DCARP_KEY_LEN		32	/* XChaCha20-Poly1305 key */
@@ -88,7 +94,8 @@ struct dcarp_config {
 #define DCARP_REJECT_LOG_INTERVAL 10	/* seconds between logged rejects */
 
 void close_multicast_socket(void);
-int configure_default_gateway(const in_addr_t);
+int get_default_gateway(in_addr_t *);
+int write_state_file(const struct dcarp_message *);
 int configure_interface(const char *, in_addr_t, in_addr_t);
 void daemonize(void);
 int determine_carp_state(struct if_msghdr *);

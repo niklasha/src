@@ -185,7 +185,8 @@ int config_matches(const struct dcarp_config *config,
     const struct dcarp_message *message) {
 	return (config->valid && config->carp_ip == message->carp_ip &&
 	    config->netmask == message->netmask &&
-	    config->gateway_ip == message->gateway_ip);
+	    config->gateway_ip == message->gateway_ip &&
+	    config->generation == message->generation);
 }
 
 void config_record(struct dcarp_config *config,
@@ -194,6 +195,7 @@ void config_record(struct dcarp_config *config,
 	config->carp_ip = message->carp_ip;
 	config->netmask = message->netmask;
 	config->gateway_ip = message->gateway_ip;
+	config->generation = message->generation;
 }
 
 void update_carp_state(int new_state) {
@@ -348,6 +350,7 @@ int distribute_ip_addresses() {
 	struct dcarp_message message;
 	char carp_ip_str[INET_ADDRSTRLEN];
 	char netmask_str[INET_ADDRSTRLEN];
+	char gateway_ip_str[INET_ADDRSTRLEN];
 	uint32_t demote;
 	int rv;
 
@@ -363,8 +366,15 @@ int distribute_ip_addresses() {
 	}
 	no_address = 0;
 
-	// Convert the gateway IP from string to binary format
-	inet_pton(AF_INET, global_options.gateway_ip, &message.gateway_ip);
+	/*
+	 * The gateway of the carp network, for the backups to use when they
+	 * become master: -g, or else our default route through the carp
+	 * interface, or none.  main() has checked -g.
+	 */
+	if (global_options.gateway_ip != NULL)
+		inet_pton(AF_INET, global_options.gateway_ip, &message.gateway_ip);
+	else if (get_default_gateway(&message.gateway_ip) != 0)
+		message.gateway_ip = INADDR_ANY;
 
 	message.sender = htobe64(my_sender);
 	message.sequence = htobe64(++my_sequence);
@@ -391,14 +401,18 @@ int distribute_ip_addresses() {
 	}
 	inet_ntop(AF_INET, &message.carp_ip, carp_ip_str, sizeof(carp_ip_str));
 	inet_ntop(AF_INET, &message.netmask, netmask_str, sizeof(netmask_str));
+	inet_ntop(AF_INET, &message.gateway_ip, gateway_ip_str,
+	    sizeof(gateway_ip_str));
 	log_message(LOG_INFO, "sent %s netmask %s gateway %s on %s "
 	    "(sender %016llx sequence %llu generation %lld priority "
 	    "%u/%u/%u)", carp_ip_str, netmask_str,
-	    global_options.gateway_ip, global_options.sync_interface,
+	    message.gateway_ip != INADDR_ANY ? gateway_ip_str : "none",
+	    global_options.sync_interface,
 	    (unsigned long long)my_sender, (unsigned long long)my_sequence,
 	    (long long)my_generation, demote, message.advbase,
 	    message.advskew);
 	config_record(&last_sent, &message);
+	write_state_file(&message);
 	return (0);
 }
 
@@ -489,6 +503,10 @@ int process_received_message(const struct dcarp_message *message,
 		    (long long)gen, carp_ip_str, netmask_str, gateway_ip_str,
 		    current_carp_state == CARP_STATE_BACKUP ? "" :
 		    ", taking it although not backup");
+		/*
+		 * Set the address; the routes are left to ifstated(8) and
+		 * the like, which find the gateway in the state file.
+		 */
 		if (global_options.dry_run) {
 			log_message(LOG_WARNING, "Dry-run mode: Skipping network reconfiguration.");
 		} else {
@@ -497,9 +515,9 @@ int process_received_message(const struct dcarp_message *message,
 			/* On failure, the next resend tries again */
 			if (configure_interface(global_options.interface_name, message->carp_ip, message->netmask) != 0)
 				return (-1);
-			if (configure_default_gateway(message->gateway_ip) != 0)
-				return (-1);
 		}
+		if (write_state_file(message) != 0)
+			return (-1);
 		config_record(&last_applied, message);
 		break;
 
@@ -663,17 +681,27 @@ out:
 	return (rv);
 }
 
-int configure_default_gateway(const in_addr_t gateway_ip) {
+#define ROUNDUP(a) \
+	((a) > 0 ? (1 + (((a) - 1) | (sizeof(long) - 1))) : sizeof(long))
+
+/*
+ * The gateway of our best default route, if that goes through the carp
+ * interface: one dhcpleased added from the lease, or ifstated from our
+ * state file.  dcarpd never changes routes itself.
+ */
+int get_default_gateway(in_addr_t *gateway_ip) {
 	struct {
 		struct rt_msghdr	hdr;
 		struct sockaddr_in	dst;
-		struct sockaddr_in	gateway;
 		struct sockaddr_in	netmask;
 	} rtmsg;
-	char gateway_ip_str[INET_ADDRSTRLEN];
-	int sockfd;
-
-	inet_ntop(AF_INET, &gateway_ip, gateway_ip_str, sizeof(gateway_ip_str));
+	static int seq;
+	char buf[2048];
+	struct rt_msghdr *rtm = (struct rt_msghdr *)buf;
+	struct sockaddr *sa;
+	char *cp;
+	ssize_t n;
+	int sockfd, i, rv = -1;
 
 	sockfd = socket(AF_ROUTE, SOCK_RAW, AF_INET);
 	if (sockfd < 0) {
@@ -684,49 +712,114 @@ int configure_default_gateway(const in_addr_t gateway_ip) {
 	/*
 	 * The kernel takes exactly one routing message per write(2), so the
 	 * header and the sockaddrs, in RTA_* bit order, go out in one buffer.
+	 * Destination and netmask 0.0.0.0/0: the default route.
 	 */
 	memset(&rtmsg, 0, sizeof(rtmsg));
 	rtmsg.hdr.rtm_msglen = sizeof(rtmsg);
 	rtmsg.hdr.rtm_hdrlen = sizeof(rtmsg.hdr);
 	rtmsg.hdr.rtm_version = RTM_VERSION;
-	rtmsg.hdr.rtm_type = RTM_CHANGE;
+	rtmsg.hdr.rtm_type = RTM_GET;
+	rtmsg.hdr.rtm_seq = ++seq;
 	rtmsg.hdr.rtm_tableid = getrtable();
-	rtmsg.hdr.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
-	rtmsg.hdr.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
-
-	/* Destination and netmask 0.0.0.0/0: the default route */
+	rtmsg.hdr.rtm_addrs = RTA_DST | RTA_NETMASK;
 	rtmsg.dst.sin_len = sizeof(rtmsg.dst);
 	rtmsg.dst.sin_family = AF_INET;
 	rtmsg.netmask.sin_len = sizeof(rtmsg.netmask);
 	rtmsg.netmask.sin_family = AF_INET;
 
-	rtmsg.gateway.sin_len = sizeof(rtmsg.gateway);
-	rtmsg.gateway.sin_family = AF_INET;
-	rtmsg.gateway.sin_addr.s_addr = gateway_ip;
-
-	/* Change the existing default route, or add one if there is none */
 	if (write(sockfd, &rtmsg, sizeof(rtmsg)) == -1) {
-		if (errno != ESRCH) {
-			log_perror("RTM_CHANGE default route");
-			goto fail;
-		}
-		rtmsg.hdr.rtm_type = RTM_ADD;
-		if (write(sockfd, &rtmsg, sizeof(rtmsg)) == -1) {
-			log_perror("RTM_ADD default route");
-			goto fail;
-		}
+		if (errno != ESRCH)	/* ESRCH: no default route */
+			log_perror("RTM_GET default route");
+		goto out;
 	}
+	do {
+		n = read(sockfd, buf, sizeof(buf));
+	} while (n > 0 && (rtm->rtm_version != RTM_VERSION ||
+	    rtm->rtm_type != RTM_GET || rtm->rtm_seq != seq ||
+	    rtm->rtm_pid != getpid()));
+	if (n < (ssize_t)sizeof(*rtm) || rtm->rtm_errno != 0 ||
+	    rtm->rtm_index != carp_ifindex || !(rtm->rtm_addrs & RTA_GATEWAY))
+		goto out;
 
+	cp = buf + rtm->rtm_hdrlen;
+	for (i = 0; i < RTAX_MAX && cp < buf + n; i++) {
+		if (!(rtm->rtm_addrs & (1 << i)))
+			continue;
+		sa = (struct sockaddr *)cp;
+		if (i == RTAX_GATEWAY) {
+			if (sa->sa_family == AF_INET) {
+				*gateway_ip =
+				    ((struct sockaddr_in *)sa)->sin_addr.s_addr;
+				rv = 0;
+			}
+			break;
+		}
+		cp += ROUNDUP(sa->sa_len);
+	}
+out:
 	close(sockfd);
-	log_message(LOG_NOTICE, "default route %s via %s",
-	    rtmsg.hdr.rtm_type == RTM_ADD ? "added" : "changed", gateway_ip_str);
+	return (rv);
+}
+
+/*
+ * Write the configuration we hold, as master or backup, for ifstated(8)
+ * and other scripts to source: shell variable assignments, replaced
+ * atomically.  The routes are theirs to set; this is what they need.
+ */
+int write_state_file(const struct dcarp_message *message) {
+	char tmp[PATH_MAX];
+	char carp_ip_str[INET_ADDRSTRLEN];
+	char netmask_str[INET_ADDRSTRLEN];
+	char gateway_ip_str[INET_ADDRSTRLEN] = "";
+	long long gen = (long long)be64toh(message->generation);
+	FILE *f;
+	int fd;
+
+	inet_ntop(AF_INET, &message->carp_ip, carp_ip_str, sizeof(carp_ip_str));
+	inet_ntop(AF_INET, &message->netmask, netmask_str, sizeof(netmask_str));
+	if (message->gateway_ip != INADDR_ANY)
+		inet_ntop(AF_INET, &message->gateway_ip, gateway_ip_str,
+		    sizeof(gateway_ip_str));
+
+	if (snprintf(tmp, sizeof(tmp), "%s.XXXXXXXXXX",
+	    global_options.state_file) >= (int)sizeof(tmp)) {
+		log_message(LOG_ERR, "state file name too long");
+		return (-1);
+	}
+	if ((fd = mkstemp(tmp)) == -1) {
+		log_perror(tmp);
+		return (-1);
+	}
+	if (fchmod(fd, 0644) == -1 || (f = fdopen(fd, "w")) == NULL) {
+		log_perror(tmp);
+		close(fd);
+		unlink(tmp);
+		return (-1);
+	}
+	fprintf(f, "# %s, written by dcarpd(8): do not edit.\n"
+	    "DCARP_INTERFACE=%s\n"
+	    "DCARP_ADDRESS=%s\n"
+	    "DCARP_NETMASK=%s\n"
+	    "DCARP_GATEWAY=%s\n"
+	    "DCARP_GENERATION=%lld\n", global_options.interface_name,
+	    global_options.interface_name, carp_ip_str, netmask_str,
+	    gateway_ip_str, gen);
+	if (fflush(f) == EOF || fsync(fd) == -1) {
+		log_perror(tmp);
+		fclose(f);
+		unlink(tmp);
+		return (-1);
+	}
+	fclose(f);
+	if (rename(tmp, global_options.state_file) == -1) {
+		log_perror(global_options.state_file);
+		unlink(tmp);
+		return (-1);
+	}
+	log_message(LOG_INFO, "wrote %s: address %s netmask %s gateway %s "
+	    "generation %lld", global_options.state_file, carp_ip_str,
+	    netmask_str, gateway_ip_str[0] ? gateway_ip_str : "none", gen);
 	return (0);
-
-fail:
-	close(sockfd);
-	log_message(LOG_ERR, "could not set default route via %s",
-	    gateway_ip_str);
-	return (-1);
 }
 
 int get_carp_interface_state(const char *if_name) {
@@ -1040,7 +1133,7 @@ int main(int argc, char *argv[]) {
 	in_addr_t ip, netmask;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "dnvi:g:k:s:")) != -1) {
+	while ((ch = getopt(argc, argv, "dnvf:i:g:k:s:")) != -1) {
 		switch (ch) {
 		case 'd':
 			global_options.foreground = 1;
@@ -1063,6 +1156,9 @@ int main(int argc, char *argv[]) {
 		case 's':
 			global_options.sync_interface = optarg;
 			break;
+		case 'f':
+			global_options.state_file = optarg;
+			break;
 		default:
 			usage();
 		}
@@ -1071,8 +1167,17 @@ int main(int argc, char *argv[]) {
 	argc -= optind;
 	argv += optind;
 
-	if (argc != 0 || global_options.interface_name == NULL || global_options.gateway_ip == NULL) {
+	if (argc != 0 || global_options.interface_name == NULL) {
 		usage();
+	}
+	if (global_options.gateway_ip != NULL) {
+		struct in_addr gw;
+
+		if (inet_pton(AF_INET, global_options.gateway_ip, &gw) != 1) {
+			fprintf(stderr, "%s: -g %s: not an IPv4 address\n",
+			    getprogname(), global_options.gateway_ip);
+			usage();
+		}
 	}
 
 	log_init();
@@ -1097,6 +1202,19 @@ int main(int argc, char *argv[]) {
 		goto err;
 	}
 	arc4random_buf(&my_sender, sizeof(my_sender));
+
+	/* By default /var/db/dcarpd/<interface>, creating the directory */
+	if (global_options.state_file == NULL) {
+		if (asprintf(&global_options.state_file, "%s/%s",
+		    DCARP_STATE_DIR, global_options.interface_name) == -1) {
+			log_perror("asprintf");
+			goto err;
+		}
+		if (mkdir(DCARP_STATE_DIR, 0755) == -1 && errno != EEXIST) {
+			log_perror(DCARP_STATE_DIR);
+			goto err;
+		}
+	}
 
 	if (!global_options.foreground) {
 		daemonize();
@@ -1360,7 +1478,8 @@ void close_multicast_socket() {
 void usage(void) {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-d] [-v] [-n] -i interface -g gateway_ip "
-	    "[-k key_file] [-s sync_interface]\n", __progname);
+	fprintf(stderr, "usage: %s [-dnv] [-f state_file] [-g gateway] "
+	    "-i interface [-k key_file]\n"
+	    "              [-s sync_interface]\n", __progname);
 	exit(EXIT_FAILURE);
 }
