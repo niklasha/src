@@ -46,7 +46,15 @@ interface.
 Messages received on any other interface are rejected.
 .El
 .Pp
-A message is accepted only if its HMAC is valid,
+Messages are encrypted and authenticated with XChaCha20-Poly1305,
+keyed with the SHA-256 hash of the key file.
+At startup and when the key file is reread on
+.Dv SIGHUP ,
+.Nm
+logs a fingerprint of the key,
+which must be the same on all nodes.
+.Pp
+A message is accepted only if it authenticates,
 it is at most 30 seconds old,
 and its sequence number is higher than the last one accepted from the
 same sender.

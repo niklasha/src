@@ -35,7 +35,7 @@
 #include <netinet/in_var.h>
 #include <netinet/ip_carp.h>
 #include <arpa/inet.h>
-#include <openssl/hmac.h>
+#include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <ifaddrs.h>
 #include <errno.h>
@@ -68,6 +68,12 @@ unsigned int sync_ifindex;
 /* Our identity and message counter as a sender */
 uint64_t my_sender;
 uint64_t my_sequence;
+
+/* XChaCha20-Poly1305 keyed from the key file */
+EVP_AEAD_CTX *aead_ctx;
+
+/* Additional data bound to every message, separating it from other uses */
+static const unsigned char dcarp_ad[] = "DCARP 1";
 
 /* Last sequence number accepted per sender, against replays */
 struct {
@@ -182,7 +188,7 @@ int receive_message() {
 	struct sockaddr_in from_addr;
 	struct dcarp_message message;
 	/* One byte extra, to notice messages that are too long */
-	unsigned char buf[sizeof(message) + 1];
+	unsigned char buf[DCARP_WIRE_LEN + 1];
 	union {
 		struct cmsghdr hdr;
 		unsigned char buf[CMSG_SPACE(sizeof(struct sockaddr_dl))];
@@ -224,12 +230,17 @@ int receive_message() {
 		return (-1);
 	}
 
-	if (received_bytes != sizeof(message)) {
+	if (received_bytes != DCARP_WIRE_LEN) {
 		log_rejected(&from_addr, "%zd bytes, expected %zu",
-		    received_bytes, sizeof(message));
+		    received_bytes, DCARP_WIRE_LEN);
 		return (-1);
 	}
-	memcpy(&message, buf, sizeof(message));
+
+	if (open_message(buf, &message) != 0) {
+		log_rejected(&from_addr,
+		    "authentication failed (wrong key, or tampered with)");
+		return (-1);
+	}
 
 	if (validate_message(&message, &from_addr) != 1)
 		return (-1);
@@ -237,8 +248,39 @@ int receive_message() {
 	return (process_received_message(&message, &from_addr));
 }
 
+/* Encrypt and authenticate a message into DCARP_WIRE_LEN bytes */
+int seal_message(const struct dcarp_message *message, unsigned char *wire) {
+	size_t len;
+
+	arc4random_buf(wire, DCARP_NONCE_LEN);
+	if (!EVP_AEAD_CTX_seal(aead_ctx, wire + DCARP_NONCE_LEN, &len,
+	    DCARP_WIRE_LEN - DCARP_NONCE_LEN, wire, DCARP_NONCE_LEN,
+	    (const unsigned char *)message, sizeof(*message), dcarp_ad,
+	    sizeof(dcarp_ad)) || len != DCARP_WIRE_LEN - DCARP_NONCE_LEN) {
+		log_message(LOG_ERR, "cannot encrypt message");
+		return (-1);
+	}
+	return (0);
+}
+
+/* Authenticate and decrypt DCARP_WIRE_LEN bytes into a message */
+int open_message(const unsigned char *wire, struct dcarp_message *message) {
+	size_t len;
+
+	if (!EVP_AEAD_CTX_open(aead_ctx, (unsigned char *)message, &len,
+	    sizeof(*message), wire, DCARP_NONCE_LEN, wire + DCARP_NONCE_LEN,
+	    DCARP_WIRE_LEN - DCARP_NONCE_LEN, dcarp_ad, sizeof(dcarp_ad)) ||
+	    len != sizeof(*message))
+		return (-1);
+	return (0);
+}
+
 int send_message(const struct dcarp_message *message) {
 	struct sockaddr_in multicast_addr;
+	unsigned char wire[DCARP_WIRE_LEN];
+
+	if (seal_message(message, wire) != 0)
+		return (-1);
 
 	memset(&multicast_addr, 0, sizeof(multicast_addr));
 	multicast_addr.sin_family = AF_INET;
@@ -250,28 +292,16 @@ int send_message(const struct dcarp_message *message) {
 		return (-1);
 	}
 	
-	int sent_bytes = sendto(global_multicast_socket, message, sizeof(*message), 0,
-	    (struct sockaddr *)&multicast_addr, sizeof(multicast_addr));
+	ssize_t sent_bytes = sendto(global_multicast_socket, wire, sizeof(wire),
+	    0, (struct sockaddr *)&multicast_addr, sizeof(multicast_addr));
 
 	if (sent_bytes < 0) {
 		log_perror("sendto failed");
 		return (-1);
-	} else if (sent_bytes != sizeof(*message)) {
+	} else if (sent_bytes != sizeof(wire)) {
 		log_message(LOG_ERR, "Mismatch in number of sent bytes");
 		return (-1);
 	}
-	return (0);
-}
-
-int add_hmac_signature(struct dcarp_message *message) {
-	if (global_options.key == NULL) {
-		log_message(LOG_ERR, "No key available for signing the message");
-		return (-1);
-	}
-
-	unsigned int len;
-	HMAC(EVP_sha256(), global_options.key, strlen(global_options.key),
-	     (unsigned char*)message, sizeof(*message) - HMAC_LENGTH, message->hmac, &len);
 	return (0);
 }
 
@@ -295,9 +325,6 @@ int distribute_ip_addresses() {
 	message.sender = htobe64(my_sender);
 	message.sequence = htobe64(++my_sequence);
 	message.timestamp = htobe64(time(NULL));
-
-	if (add_hmac_signature(&message) == -1)
-		return (-1);
 
 	rv = send_message(&message);
 	if (rv == 0) {
@@ -354,35 +381,17 @@ int process_received_message(const struct dcarp_message *message,
 }
 
 /*
- * Accept a message only if its HMAC is right, it is at most DCARP_MAX_AGE
+ * Accept an authenticated message only if it is at most DCARP_MAX_AGE
  * seconds old (or early, for clocks that differ), and its sequence number
  * is higher than the last one accepted from the same sender.  The age
  * limit covers senders we do not remember, e.g. after a restart.
  */
 int validate_message(const struct dcarp_message *message,
     const struct sockaddr_in *from) {
-	unsigned char calculated_hmac[HMAC_LENGTH];
-	unsigned int len;
 	uint64_t sender, sequence;
 	long long age;
 	time_t now;
 	int i, slot;
-
-	// Assuming global_options.key contains the HMAC key
-	if (global_options.key == NULL) {
-		log_message(LOG_ERR, "No key available for message validation");
-		return (-1);
-	}
-
-	HMAC(EVP_sha256(), global_options.key, strlen(global_options.key),
-	     (unsigned char*)message, sizeof(*message) - HMAC_LENGTH, calculated_hmac, &len);
-
-	// Compare the received HMAC with the calculated one
-	if (len != HMAC_LENGTH ||
-	    timingsafe_bcmp(message->hmac, calculated_hmac, HMAC_LENGTH) != 0) {
-		log_rejected(from, "invalid HMAC (wrong key, or tampered with)");
-		return (0);
-	}
 
 	sender = be64toh(message->sender);
 	sequence = be64toh(message->sequence);
@@ -745,8 +754,8 @@ int main(int argc, char *argv[]) {
 		daemonize();
 	}
 
-	global_options.key = read_keyfile(global_options.keyfile_path);
-	if (!global_options.key)
+	aead_ctx = read_keyfile(global_options.keyfile_path);
+	if (aead_ctx == NULL)
 		goto err;
     
 	signal(SIGINT, handle_signal);
@@ -799,9 +808,21 @@ err:
 	return (EXIT_FAILURE);
 }
 
-char *read_keyfile(const char *filename) {
-	// Perform checks on the key file
+/*
+ * The XChaCha20-Poly1305 key is the SHA-256 hash of the whole key file (up
+ * to DCARP_KEYFILE_MAX bytes).  Log a fingerprint, a hash of the key, so
+ * the nodes' keys can be compared without showing them.
+ */
+EVP_AEAD_CTX *read_keyfile(const char *filename) {
+	unsigned char buf[DCARP_KEYFILE_MAX];
+	unsigned char key[SHA256_DIGEST_LENGTH];
+	unsigned char fp[SHA256_DIGEST_LENGTH];
+	EVP_AEAD_CTX *ctx;
 	struct stat st;
+	size_t n;
+	FILE *f;
+
+	// Perform checks on the key file
 	if (stat(filename, &st) < 0) {
 		log_perror("stat");
 		return (NULL);
@@ -818,35 +839,39 @@ char *read_keyfile(const char *filename) {
 	}
 
 	// Open and read key file
-	FILE *f = fopen(filename, "r");
+	f = fopen(filename, "r");
 	if (!f) {
 		log_perror("fopen");
 		return (NULL);
 	}
-
-	char key[KEY_LENGTH + 1];
-	int n;
-	if ((n = fread(key, 1, KEY_LENGTH, f)) < 1) {
-		log_message(LOG_ERR, "Keyfile read error or key length is not correct");
+	n = fread(buf, 1, sizeof(buf), f);
+	if (ferror(f) || n == 0) {
+		log_message(LOG_ERR, "Keyfile %s: read error, or empty",
+		    filename);
 		fclose(f);
+		explicit_bzero(buf, sizeof(buf));
 		return (NULL);
 	}
-	key[n] = '\0';
-
 	fclose(f);
 
-	// Hash the key
-	// Using SHA256 here, but you can replace it with your preferred hash function
-	unsigned char hash[SHA256_DIGEST_LENGTH];
-	SHA256((unsigned char*)key, strlen(key), hash);
+	SHA256(buf, n, key);
+	explicit_bzero(buf, sizeof(buf));
+	SHA256(key, sizeof(key), fp);
 
-	// Convert hash to hex string
-	char *hash_str = malloc(SHA256_DIGEST_LENGTH*2 + 1);
-	for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-		snprintf(hash_str + i*2, 3, "%02x", hash[i]);
+	if ((ctx = EVP_AEAD_CTX_new()) == NULL ||
+	    !EVP_AEAD_CTX_init(ctx, EVP_aead_xchacha20_poly1305(), key,
+	    DCARP_KEY_LEN, EVP_AEAD_DEFAULT_TAG_LENGTH, NULL)) {
+		log_message(LOG_ERR, "cannot set up XChaCha20-Poly1305");
+		EVP_AEAD_CTX_free(ctx);
+		explicit_bzero(key, sizeof(key));
+		return (NULL);
 	}
+	explicit_bzero(key, sizeof(key));
 
-	return (hash_str);
+	log_message(LOG_INFO, "key from %s, fingerprint "
+	    "%02x%02x%02x%02x%02x%02x%02x%02x", filename, fp[0], fp[1], fp[2],
+	    fp[3], fp[4], fp[5], fp[6], fp[7]);
+	return (ctx);
 }
 
 void daemonize() {
@@ -868,10 +893,10 @@ void handle_signal(int signal)
 		break;
         case SIGHUP: {
 		// Reread keyfile
-		char *new_key = read_keyfile(global_options.keyfile_path);
-		if (new_key) {
-			free(global_options.key);
-			global_options.key = new_key;
+		EVP_AEAD_CTX *new_ctx = read_keyfile(global_options.keyfile_path);
+		if (new_ctx) {
+			EVP_AEAD_CTX_free(aead_ctx);
+			aead_ctx = new_ctx;
 			log_message(LOG_NOTICE, "Keyfile reloaded successfully");
 		} else {
 			log_message(LOG_WARNING, "Failed to reload keyfile. Using old key.");

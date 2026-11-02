@@ -25,7 +25,7 @@ This document uses the following terms:
 
     DCARP Message: A structured data packet used by DCARP for communication between the Master and Backup Nodes, containing network configuration details.
 
-    HMAC (Hash-based Message Authentication Code): A specific type of message authentication code (MAC) involving a cryptographic hash function and a secret cryptographic key, used in DCARP for message validation.
+    AEAD (Authenticated Encryption with Associated Data): A cipher mode that encrypts a message and authenticates it together with additional data under a secret key. DCARP uses XChaCha20-Poly1305.
 
     Netmask: A network mask that divides the IP address into the network and host segments. In DCARP, it is part of the information distributed by the Master Node.
 
@@ -58,9 +58,9 @@ The primary method of communication in DCARP is the DCARP message, which is used
 
 The message is sent using multicast over the local network, ensuring that all Backup nodes receive the configuration information simultaneously.
 
-3.3 HMAC Authentication
+3.3 Encryption and Authentication
 
-To ensure the integrity and authenticity of DCARP messages, each message includes an HMAC (Hash-based Message Authentication Code) signature. The HMAC is computed using a shared secret key, known to all participating nodes in the DCARP setup. This mechanism protects against tampering and spoofing of DCARP messages.
+Each DCARP message is encrypted and authenticated with XChaCha20-Poly1305 under a secret key known to all participating nodes; see 4.2. This protects against tampering and spoofing of DCARP messages and keeps their contents from observers.
 
 3.4 Handling State Transitions
 
@@ -76,7 +76,13 @@ DCARP employs a structured message format for communication between the Master a
 
 4.1 Message Structure
 
-A DCARP message consists of the following fields, all integers in network byte order:
+On the wire a DCARP message is sealed with XChaCha20-Poly1305 (see 4.2): a 24 byte random nonce, the encrypted message and a 16 byte authentication tag, 80 bytes in all.
+
+    +----------------+------------------------------------+-------------+
+    | Nonce (24)     | Encrypted message (40)             | Tag (16)    |
+    +----------------+------------------------------------+-------------+
+
+The message itself consists of the following fields, all integers in network byte order:
 
     Message Type (4 bytes): A field that identifies the type of the DCARP message. For DCARP IP distribution messages, this is set to a predefined value (e.g., 0x00000001).
 
@@ -92,9 +98,7 @@ A DCARP message consists of the following fields, all integers in network byte o
 
     Timestamp (8 bytes): The time the message was sent, in seconds since 1970-01-01 00:00:00 UTC.
 
-    HMAC (32 bytes): The HMAC, computed using SHA-256, ensures the message's integrity and authenticity.
-
-The total length of a DCARP message is thus 72 bytes.
+The message is thus 40 bytes before encryption.
 
  0                   1                   2                   3
   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -119,23 +123,17 @@ The total length of a DCARP message is thus 72 bytes.
   +                           Timestamp                           +
   |                                                               |
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  |                                                               |
-  +                                                               +
-  |                                                               |
-  +                              HMAC                             +
-  |                                                               |
-  +                                                               +
-  |                                                               |
-  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  
 
-4.2 Message Integrity and Authentication
 
-The HMAC field is a critical component of the DCARP message format. It is computed using the shared secret key known to all nodes in the DCARP setup. The HMAC covers all fields that precede it. Upon receipt of a DCARP message, nodes must verify the HMAC before accepting the message contents. This verification process protects against unauthorized or tampered messages within the network.
+4.2 Message Confidentiality, Integrity and Authentication
+
+Each message is encrypted and authenticated with XChaCha20-Poly1305, an AEAD cipher, under a 256-bit key shared by all nodes: the SHA-256 hash of a shared key file. The sender picks a new random 24 byte nonce for every message; with XChaCha20's nonce size random nonces do not repeat in practice. The additional authenticated data is the ASCII string "DCARP 1" followed by a NUL byte, which binds the key to this protocol and version. Upon receipt of a DCARP message, nodes must authenticate it before using its contents. This protects against unauthorized or tampered messages, and keeps the distributed configuration and the sender's identity from observers on the network.
+
+Implementations should log a fingerprint of the key, such as the first bytes of a hash of it, so that administrators can check that all nodes use the same key without revealing it.
 
 4.2.1 Replay Protection
 
-A valid HMAC alone does not stop an attacker from sending a recorded message again later, which would make Backup nodes revert to an old configuration. A receiver therefore also requires that:
+Authentication alone does not stop an attacker from sending a recorded message again later, which would make Backup nodes revert to an old configuration. A receiver therefore also requires that:
 
     The Timestamp is no more than 30 seconds before or after its own clock. This bounds replays of messages from senders the receiver does not remember, for example after it restarts. The clocks of the nodes must agree within this limit.
 
@@ -173,7 +171,7 @@ DCARP operates on top of a standard CARP configuration, utilizing the existing C
 
 5.2 Message Handling
 
-    Message Validation: DCARP messages received by Backup nodes must undergo HMAC validation to ensure their authenticity and integrity.
+    Message Validation: DCARP messages received by Backup nodes must be authenticated (see 4.2) to ensure their authenticity and integrity.
 
     Configuration Updates: Upon receiving a validated DCARP message, Backup nodes update their network configurations accordingly.
 
@@ -183,9 +181,9 @@ DCARP does not provide its own mechanism for the election of the Master node. In
 
 5.4 Security and Configuration Management
 
-    Securing DCARP Messages: The security of DCARP messages is maintained through HMAC, using a shared secret key.
+    Securing DCARP Messages: The security of DCARP messages is maintained through authenticated encryption (see 4.2), using a shared secret key.
 
-    Key Management: Secure management and distribution of the HMAC key among the nodes are vital for maintaining the integrity of the DCARP protocol.
+    Key Management: Secure management and distribution of the shared key among the nodes are vital for maintaining the integrity of the DCARP protocol.
     
 6. Security Considerations
 
@@ -193,9 +191,9 @@ The design and implementation of DCARP incorporate several considerations to mai
 
 6.1 Authentication and Integrity
 
-    HMAC Usage: DCARP employs HMAC (Hash-based Message Authentication Code) to ensure the integrity and authenticity of the messages it distributes. This mechanism protects against unauthorized message modification and spoofing, which are critical in maintaining consistent and reliable network configurations.
+    Authenticated Encryption: DCARP employs XChaCha20-Poly1305 to ensure the integrity, authenticity and confidentiality of the messages it distributes. This mechanism protects against unauthorized message modification and spoofing, which are critical in maintaining consistent and reliable network configurations.
 
-    Key Management: The security of DCARP is heavily reliant on the proper management of the HMAC keys. It is imperative that these keys are generated, stored, and transmitted securely. Compromise of the HMAC keys can lead to unauthorized network configuration changes.
+    Key Management: The security of DCARP is heavily reliant on the proper management of the shared key. It is imperative that these keys are generated, stored, and transmitted securely. Compromise of the key can lead to unauthorized network configuration changes.
 
 6.2 Network Security
 
@@ -209,7 +207,7 @@ The design and implementation of DCARP incorporate several considerations to mai
 
 6.4 Implementation and Configuration
 
-    Secure Defaults: Implementations of DCARP should adopt secure default settings, such as strong HMAC keys and restricted multicast scopes. Care should be taken to avoid common pitfalls in default configurations that could lead to security vulnerabilities.
+    Secure Defaults: Implementations of DCARP should adopt secure default settings, such as strong keys and restricted multicast scopes. Care should be taken to avoid common pitfalls in default configurations that could lead to security vulnerabilities.
 
     Monitoring and Logging: Effective logging and monitoring mechanisms are important for identifying potential security breaches or operational anomalies. Administrators should regularly review DCARP logs and monitor network traffic for signs of unusual or unauthorized activity.
 
@@ -237,7 +235,7 @@ The successful deployment of DCARP relies on several key implementation consider
 
 7.3 Configurability and Customization
 
-    Flexible Configuration Options: Implementations of DCARP should offer a range of configuration options to accommodate different network requirements and policies. This includes settings for multicast addresses and ports, HMAC key configuration, and message frequency.
+    Flexible Configuration Options: Implementations of DCARP should offer a range of configuration options to accommodate different network requirements and policies. This includes settings for multicast addresses and ports, key configuration, and message frequency.
 
     Adaptability: DCARP should be adaptable to specific network needs, allowing for customization in areas such as message intervals, timeout periods, and security parameters.
 

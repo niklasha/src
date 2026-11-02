@@ -23,11 +23,10 @@
 #define DEFAULT_KEY_FILE "/etc/dcarp.key"
 #define DCARP_MULTICAST_ADDR "224.0.0.18"
 #define DCARP_MULTICAST_PORT 3522
-#define KEY_LENGTH 32
+#define DCARP_KEYFILE_MAX 4096	/* bytes of the key file that are used */
 
 struct options {
 	char *keyfile_path;
-	char *key;
 	char *interface_name;
 	char *sync_interface;	/* -s, carries the messages; default -i */
 	char *gateway_ip;
@@ -41,9 +40,11 @@ struct options {
 #define CARP_STATE_BACKUP  1
 #define CARP_STATE_MASTER  2
 
-#define HMAC_LENGTH 32  // Length of HMAC SHA-256 output
-
-/* All integers in network byte order; the HMAC covers everything before it */
+/*
+ * A message, all integers in network byte order.  On the wire it is sealed
+ * with XChaCha20-Poly1305: a random nonce, the encrypted message and the
+ * authentication tag.
+ */
 struct dcarp_message {
 	uint32_t message_type;
 	in_addr_t carp_ip;
@@ -53,8 +54,13 @@ struct dcarp_message {
 	uint64_t sequence;	/* per sender, starts at 1 */
 	int64_t timestamp;	/* seconds since the epoch */
 	// Future fields (e.g., DNS servers) can be noted here for later implementation
-	unsigned char hmac[HMAC_LENGTH];  // HMAC signature
 };
+
+#define DCARP_KEY_LEN		32	/* XChaCha20-Poly1305 key */
+#define DCARP_NONCE_LEN		24
+#define DCARP_TAG_LEN		16
+#define DCARP_WIRE_LEN		(DCARP_NONCE_LEN + \
+				    sizeof(struct dcarp_message) + DCARP_TAG_LEN)
 
 #define MSG_TYPE_IP_DISTRIBUTION 1    // Message type for IP distribution
 
@@ -62,7 +68,6 @@ struct dcarp_message {
 #define DCARP_SENDERS		8	/* senders remembered against replay */
 #define DCARP_REJECT_LOG_INTERVAL 10	/* seconds between logged rejects */
 
-int add_hmac_signature(struct dcarp_message *);
 void close_multicast_socket(void);
 int configure_default_gateway(const in_addr_t);
 int configure_interface(const char *, in_addr_t, in_addr_t);
@@ -75,9 +80,11 @@ void log_close(void);
 void log_init(void);
 void log_message(int, const char *, ...);
 void log_perror(const char *);
+int open_message(const unsigned char *, struct dcarp_message *);
 int process_received_message(const struct dcarp_message *,
     const struct sockaddr_in *);
-char *read_keyfile(const char *);
+struct evp_aead_ctx_st *read_keyfile(const char *);
+int seal_message(const struct dcarp_message *, unsigned char *);
 int receive_message(void);
 int send_message(const struct dcarp_message *);
 void setup_multicast_socket(void);
