@@ -55,9 +55,36 @@ interface and the
 gateway when it becomes master,
 when that address changes,
 and every 10 seconds.
-As backup,
-it configures the address and the default route only when they differ
-from the ones it applied last.
+.Pp
+Each configuration has a generation:
+the modification time of the DHCP lease
+.Pa /var/db/dhcpleased/ Ns Ar interface ,
+or 0 without one,
+and the time
+.Nm
+sees the address of the
+.Fl i
+interface change otherwise.
+In any state, master or backup,
+.Nm
+takes a configuration of a newer generation than its own,
+or of the same generation from a sender with a better
+.Xr carp 4
+priority, that is a lower demote count, or else a lower advbase and
+advskew.
+It rejects and logs any other.
+So a backup that has become master because the master's address
+changed, and with it the
+.Xr carp 4
+authentication, takes the new address and returns to backup,
+and the master does not take the old address back from it.
+.Pp
+To take a configuration,
+.Nm
+makes its address the only IPv4 address of the
+.Fl i
+interface and sets the default route,
+but only when they differ from the ones it took last.
 .Pp
 Messages are encrypted and authenticated with XChaCha20-Poly1305,
 keyed with the SHA-256 hash of the key file.
@@ -74,6 +101,13 @@ same sender.
 Rejected messages are logged with their source address,
 at most once every 10 seconds.
 The clocks of the nodes must therefore agree within 30 seconds.
+.Sh FILES
+.Bl -tag -width "/var/db/dhcpleased/interface" -compact
+.It Pa /etc/dcarp.key
+The shared key.
+.It Pa /var/db/dhcpleased/ Ns Ar interface
+The DHCP lease of the carp interface, whose time is the generation.
+.El
 .Sh SEE ALSO
 .Xr carp 4 ,
 .Xr syslogd 8

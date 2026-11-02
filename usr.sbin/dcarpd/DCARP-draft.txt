@@ -76,10 +76,10 @@ DCARP employs a structured message format for communication between the Master a
 
 4.1 Message Structure
 
-On the wire a DCARP message is sealed with XChaCha20-Poly1305 (see 4.2): a 24 byte random nonce, the encrypted message and a 16 byte authentication tag, 80 bytes in all.
+On the wire a DCARP message is sealed with XChaCha20-Poly1305 (see 4.2): a 24 byte random nonce, the encrypted message and a 16 byte authentication tag, 96 bytes in all.
 
     +----------------+------------------------------------+-------------+
-    | Nonce (24)     | Encrypted message (40)             | Tag (16)    |
+    | Nonce (24)     | Encrypted message (56)             | Tag (16)    |
     +----------------+------------------------------------+-------------+
 
 The message itself consists of the following fields, all integers in network byte order:
@@ -98,7 +98,13 @@ The message itself consists of the following fields, all integers in network byt
 
     Timestamp (8 bytes): The time the message was sent, in seconds since 1970-01-01 00:00:00 UTC.
 
-The message is thus 40 bytes before encryption.
+    Generation (8 bytes): When the sender's CARP address was obtained, in the same unit; see 5.2.
+
+    Demote (4 bytes), Advbase (1 byte), Advskew (1 byte): The sender's CARP demote count, advertisement base and skew, its CARP priority; see 5.2.
+
+    Reserved (2 bytes): Zero.
+
+The message is thus 56 bytes before encryption.
 
  0                   1                   2                   3
   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -122,6 +128,14 @@ The message is thus 40 bytes before encryption.
   |                                                               |
   +                           Timestamp                           +
   |                                                               |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                                                               |
+  +                          Generation                           +
+  |                                                               |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |                            Demote                             |
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  |    Advbase    |    Advskew    |           Reserved            |
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
 
@@ -165,7 +179,7 @@ DCARP operates on top of a standard CARP configuration, utilizing the existing C
 
 5.1.2 Backup Nodes
 
-    Applying Configuration: Backup nodes apply the network configuration received from the Master node to their interfaces. This ensures all nodes in the CARP group have synchronized network settings.
+    Applying Configuration: Backup nodes apply the network configuration received from the Master node to their interfaces. This ensures all nodes in the CARP group have synchronized network settings. The received address replaces all other IPv4 addresses of the CARP interface: CARP authenticates its advertisements over the addresses, so an old address kept as an alias would make the node reject the Master's advertisements. The new address is added before the old ones are removed, since a CARP interface without addresses does not take part in the election.
 
     DHCP Query Prevention: Backup nodes must have mechanisms to prevent DHCP queries from being sent on the CARP interface. This is crucial to maintain the integrity of the manually synchronized network configuration and avoid conflicts.
 
@@ -176,6 +190,12 @@ DCARP operates on top of a standard CARP configuration, utilizing the existing C
     Message Validation: DCARP messages received by Backup nodes must be authenticated (see 4.2) to ensure their authenticity and integrity.
 
     Configuration Updates: Upon receiving a validated DCARP message, Backup nodes update their network configurations accordingly, but only when the configuration differs from the one they applied last, so that periodic resends do not reconfigure the node. A node that becomes Backup applies the next configuration it receives in any case.
+
+    Generations: Every configuration has a generation, the time its CARP address was obtained. A node takes the generation from the DHCP lease of the CARP interface, its modification time, when it starts (0 without one); sets it to the current time when it sees the address of the CARP interface change other than by DCARP; and adopts the generation of every configuration it takes. A Master refreshes it from the lease before sending, as a renewal does not change the address.
+
+    Accepting Configurations: In any state, Master, Backup or Init, a node takes a configuration whose generation is newer than its own, or whose generation is the same and whose sender has a better CARP priority: a lower demote count, or with equal demote counts a lower advertisement base and then skew, the order in which CARP itself compares advertisements. It ignores its own messages and rejects, and logs, all others.
+
+    This resolves the split brain that follows a change of the Master's address. CARP authenticates its advertisements over the virtual addresses, so until the Backup has the new address it rejects the Master's advertisements and becomes Master as well. When the new configuration arrives, it is newer, and the Backup takes it although it is Master; changing its address restarts CARP on its interface, and with matching addresses it returns to Backup. Meanwhile the old Master, while CARP restarts after its own address change, rejects the older configuration the other node sends as Master. Comparing priorities alone would not do: after a failover the node with the lower priority may hold the newer lease.
 
 5.3 Reliance on CARP for Master Election
 
