@@ -15,37 +15,48 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-# Run dcarpd(8) as master and backup on one host, in two routing domains
+# Run dcarpd(8) as master and backup on one host, in routing domains
 # joined by veb(4).  No physical interface is involved.
 #
-#   rdomain 78	master	carp78 on vport78
-#   rdomain 77	backup	carp77 on vport77, and vether79 as an internal
-#			net with the default route and a second carp(4),
-#			carp79, whose state changes must be ignored
+#   veb77, the carp net (the master's DHCP-provisioned uplink):
+#	rdomain 78  master	carp78 on vport78
+#	rdomain 77  backup	carp77 on vport77
+#	rdomain 76  attacker	vport76, records and replays messages
+#   veb79, an internal net between the nodes:
+#	rdomain 77  backup	vport79 with the default route, and a second
+#				carp(4), carp79, whose state changes must be
+#				ignored
+#	rdomain 78  master	vport89
 #
 # The Makefile skips the test when any of these interfaces exist.
 #
-# usage: dcarpd-test route-change | route-add | other-carp
+# usage: dcarpd-test route-change | route-add | other-carp | log-live |
+#	 replay | bad-hmac | sync-interface | stale
 
-: ${OBJDIR?} ${DCARPD?}
+: ${OBJDIR?} ${DCARPD?} ${REPLAY?}
 
+RA=76			# attacker rdomain
 RB=77			# backup rdomain
 RM=78			# master rdomain
 VHID=177
-PREFIX=10.77.0		# carp net, the master's DHCP-provisioned uplink
-INTERNAL=10.79.0	# internal net of the backup
-INTERFACES="carp$RB carp$RM carp79 veb$RB vport$RB vport$RM vether79"
+PREFIX=10.77.0		# carp net
+INTERNAL=10.79.0	# internal net
+MAX_AGE=30		# DCARP_MAX_AGE in dcarpd.h
+INTERFACES="carp$RB carp$RM carp79 veb77 veb79 vport76 vport77 vport78
+    vport79 vport89"
 
 KEY=$OBJDIR/dcarp.key
 BLOG=$OBJDIR/dcarpd-$1-backup.log
 MLOG=$OBJDIR/dcarpd-$1-master.log
+MSG=$OBJDIR/dcarpd-$1.msg
 
 cleanup() {
-	if [ -n "$bpid" ]; then
-		kill $bpid 2>/dev/null
-		wait $bpid 2>/dev/null
-		bpid=
-	fi
+	for p in $bpid $cpid; do
+		kill $p 2>/dev/null
+		wait $p 2>/dev/null
+	done
+	bpid=
+	cpid=
 	for i in $INTERFACES; do
 		ifconfig $i destroy 2>/dev/null
 	done
@@ -86,6 +97,18 @@ route_is() {	# $1 = gateway
 	[ "$(defroute)" = $1 ]
 }
 
+listening() {	# $1 = pid
+	fstat -p $1 2>/dev/null | grep -q ':3522'
+}
+
+vport() {	# $1 = interface, $2 = rdomain, $3 = veb, $4 = address or ""
+	run ifconfig $1 create
+	run ifconfig $1 rdomain $2
+	[ -n "$4" ] && run ifconfig $1 inet $4
+	run ifconfig $1 up
+	run ifconfig $3 add $1
+}
+
 mkcarp() {	# $1 = if, $2 = rdomain, $3 = carpdev, $4 = vhid, $5 = advskew,
 		# $6 = address
 	run ifconfig $1 create
@@ -95,16 +118,15 @@ mkcarp() {	# $1 = if, $2 = rdomain, $3 = carpdev, $4 = vhid, $5 = advskew,
 }
 
 setup() {	# $1 = "default" to give the backup an internal default route
-	for r in $RB $RM; do
-		run ifconfig vport$r create
-		run ifconfig vport$r rdomain $r
-		run ifconfig vport$r up
-	done
-	run ifconfig veb$RB create
-	run ifconfig veb$RB add vport$RB add vport$RM up
-	run ifconfig vether79 create
-	run ifconfig vether79 rdomain $RB
-	run ifconfig vether79 inet $INTERNAL.1/24 up
+	run ifconfig veb77 create
+	run ifconfig veb77 up
+	run ifconfig veb79 create
+	run ifconfig veb79 up
+	vport vport$RA $RA veb77 $PREFIX.$RA/24
+	vport vport$RB $RB veb77 ""
+	vport vport$RM $RM veb77 ""
+	vport vport79 $RB veb79 $INTERNAL.1/24
+	vport vport89 $RM veb79 $INTERNAL.2/24
 	if [ "$1" = default ]; then
 		run route -T $RB -qn add default $INTERNAL.254
 	fi
@@ -112,26 +134,21 @@ setup() {	# $1 = "default" to give the backup an internal default route
 	mkcarp carp$RM $RM vport$RM $VHID 0 $PREFIX.77/24
 	retry carp_is carp$RM MASTER || fail "carp$RM did not become MASTER"
 	mkcarp carp$RB $RB vport$RB $VHID 100 $PREFIX.77/24
-	mkcarp carp79 $RB vether79 179 0 $INTERNAL.79/24
+	mkcarp carp79 $RB vport79 179 0 $INTERNAL.79/24
 	retry carp_is carp$RB BACKUP || fail "carp$RB did not become BACKUP"
 	retry carp_is carp79 MASTER || fail "carp79 did not become MASTER"
 
 	(umask 077; echo dcarpd-regress-key > $KEY) || fail "cannot write $KEY"
 	: > $BLOG
 	: > $MLOG
+	rm -f $MSG
 }
 
-listening() {
-	fstat -p $bpid 2>/dev/null | grep -q ':3522'
-}
-
-# With -d dcarpd logs to stdout, which is block buffered in a file: only
-# read the log after the daemon has exited.
-start_backup() {
+start_backup() {	# extra dcarpd arguments
 	route -T $RB exec $DCARPD -d -v -i carp$RB -g $PREFIX.250 -k $KEY \
-	    > $BLOG 2>&1 &
+	    "$@" > $BLOG 2>&1 &
 	bpid=$!
-	retry listening || fail "backup dcarpd did not start"
+	retry listening $bpid || fail "backup dcarpd did not start"
 }
 
 stop_backup() {
@@ -144,16 +161,39 @@ stop_backup() {
 
 # Run a master dcarpd, which distributes its configuration when it starts,
 # and wait until the backup's default route points to the given gateway.
-master() {	# $1 = gateway
-	echo "--- master -g $1" >> $MLOG
-	route -T $RM exec $DCARPD -d -v -i carp$RM -g $1 -k $KEY \
+master() {	# $1 = gateway, then extra dcarpd arguments
+	gw=$1
+	shift
+	echo "--- master -g $gw $*" >> $MLOG
+	route -T $RM exec $DCARPD -d -v -i carp$RM -g $gw -k $KEY "$@" \
 	    >> $MLOG 2>&1 &
 	mpid=$!
-	retry route_is $1
+	retry route_is $gw
 	ok=$?
 	kill $mpid 2>/dev/null
 	wait $mpid 2>/dev/null
 	return $ok
+}
+
+# Record the next message on the carp net from the attacker's rdomain.
+capture() {
+	route -T $RA exec $REPLAY -i vport$RA capture $MSG &
+	cpid=$!
+	retry listening $cpid || fail "dcarp-replay did not start"
+}
+
+wait_capture() {
+	wait $cpid || fail "no message captured"
+	cpid=
+}
+
+# Send the recorded message from the attacker's rdomain.
+replay() {	# extra dcarp-replay arguments
+	run route -T $RA exec $REPLAY -i vport$RA "$@" send $MSG
+}
+
+rejected() {	# $1 = source address, $2 = reason (regular expression)
+	grep -q "rejected message from $1: $2" $BLOG
 }
 
 case $1 in
@@ -193,8 +233,73 @@ other-carp)
 	! grep -q "CARP state changed" $BLOG ||
 	    fail "state change of carp79 taken as our own"
 	;;
+log-live)
+	# With -d the log shows up while dcarpd runs, not when it exits.
+	setup default
+	start_backup
+	retry grep -q "carp$RB is in BACKUP state" $BLOG ||
+	    fail "log not written while dcarpd runs"
+	stop_backup
+	;;
+replay)
+	# A recorded message sent again after a newer one is rejected.
+	setup default
+	start_backup
+	capture
+	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
+	wait_capture
+	master $PREFIX.253 || fail "default route not changed to $PREFIX.253"
+	replay
+	sleep 2
+	route_is $PREFIX.253 ||
+	    fail "replayed message changed the default route to $(defroute)"
+	stop_backup
+	rejected $PREFIX.$RA "replay: " || fail "replay not logged"
+	;;
+bad-hmac)
+	# A message with a changed gateway is rejected.
+	setup default
+	start_backup
+	capture
+	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
+	wait_capture
+	replay -x 12
+	sleep 2
+	route_is $PREFIX.254 ||
+	    fail "tampered message changed the default route to $(defroute)"
+	stop_backup
+	rejected $PREFIX.$RA "invalid HMAC" || fail "invalid HMAC not logged"
+	;;
+sync-interface)
+	# With -s only messages on the sync interface are accepted.
+	setup default
+	start_backup -s vport79
+	! master $PREFIX.254 || fail "message on carp$RB accepted with -s vport79"
+	master $PREFIX.253 -s vport89 || fail "message on vport79 not accepted"
+	stop_backup
+	rejected $PREFIX.77 "received on carp$RB, not on vport79" ||
+	    fail "message on the wrong interface not logged"
+	;;
+stale)
+	# A recorded message is rejected once it is too old, also by a
+	# backup that has never seen its sender.
+	setup default
+	start_backup
+	capture
+	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
+	wait_capture
+	stop_backup
+	sleep $((MAX_AGE + 2))
+	start_backup
+	replay
+	sleep 2
+	stop_backup
+	rejected $PREFIX.$RA "timestamp [0-9]* seconds old" ||
+	    fail "stale message not logged"
+	;;
 *)
-	echo "usage: dcarpd-test route-change | route-add | other-carp" >&2
+	echo "usage: dcarpd-test route-change | route-add | other-carp |" \
+	    "log-live | replay | bad-hmac | sync-interface | stale" >&2
 	exit 2
 	;;
 esac
