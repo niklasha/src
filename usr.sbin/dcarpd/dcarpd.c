@@ -28,6 +28,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <net/if_types.h>
@@ -92,6 +93,24 @@ in_addr_t known_ip;
  * from: ours to use while we are backup.  Kept in the state file.
  */
 in_addr_t learned_backup_gw;
+
+/*
+ * The provider's gateway we last took or sent: a backup that becomes
+ * master still routes via the old master, not through the carp interface,
+ * and announces this one until it has a route of its own there.
+ */
+in_addr_t learned_gw;
+
+/*
+ * How often the -x hook was asked to run, the one running, whether it must
+ * run again when that one exits, and the reaper of its processes
+ */
+unsigned int hook_runs;
+pid_t hook_pid;
+int hook_pending;
+struct event sigchld_event;
+
+void sigchld_callback(int, short, void *);
 
 /* Additional data bound to every message, separating it from other uses */
 static const unsigned char dcarp_ad[] = "DCARP 1";
@@ -206,10 +225,21 @@ void config_record(struct dcarp_config *config,
 	config->generation = message->generation;
 }
 
+const char *carp_state_name(int state) {
+	static const char *names[] = { "INIT", "BACKUP", "MASTER" };
+
+	if (state < CARP_STATE_INIT || state > CARP_STATE_MASTER)
+		return ("INIT");
+	return (names[state]);
+}
+
 void update_carp_state(int new_state) {
+	unsigned int runs;
+
 	if (new_state != current_carp_state) {
 		current_carp_state = new_state;
-		log_message(LOG_INFO, "CARP state changed to: %d", current_carp_state);
+		log_message(LOG_INFO, "CARP state changed to %s",
+		    carp_state_name(current_carp_state));
 
 		/*
 		 * Report the first message sent in the new state, and apply
@@ -219,10 +249,82 @@ void update_carp_state(int new_state) {
 		last_sent.valid = 0;
 		last_applied.valid = 0;
 
+		/*
+		 * Let the hook route for the new state.  As master, sending
+		 * writes the state file, which runs it already.
+		 */
+		runs = hook_runs;
 		if (new_state == CARP_STATE_MASTER) {
 			distribute_ip_addresses();
 		}
-		// Add logic for other states as needed
+		if (hook_runs == runs)
+			run_hook();
+	}
+}
+
+/*
+ * Run the -x program, with the state file and our carp state, without
+ * waiting for it: when the configuration we hold or our state changes, so
+ * that it can set the routes.  This matters with more than two members,
+ * where the master changes while a backup stays backup.  One at a time,
+ * lest an older run set its routes last: while one runs, the next one
+ * waits for it, and gets the state of then.
+ */
+void run_hook(void) {
+	if (global_options.hook == NULL)
+		return;
+	hook_runs++;
+	if (hook_pid != 0)
+		hook_pending = 1;
+	else
+		start_hook();
+}
+
+void start_hook(void) {
+	char *argv[4];
+	pid_t pid;
+
+	argv[0] = global_options.hook;
+	argv[1] = global_options.state_file;
+	argv[2] = (char *)carp_state_name(current_carp_state);
+	argv[3] = NULL;
+
+	switch (pid = fork()) {
+	case -1:
+		log_perror("fork");
+		return;
+	case 0:
+		execv(argv[0], argv);
+		log_perror(argv[0]);
+		_exit(127);
+	default:
+		hook_pid = pid;
+		log_message(LOG_DEBUG, "running %s %s %s (pid %d)", argv[0],
+		    argv[1], argv[2], (int)pid);
+	}
+}
+
+/* Reap the hook, report it if it failed, and start the one waiting */
+void sigchld_callback(int sig, short event, void *arg) {
+	pid_t pid;
+	int status;
+
+	while ((pid = waitpid(WAIT_ANY, &status, WNOHANG)) > 0) {
+		if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+			log_message(LOG_WARNING, "%s (pid %d) exited with %d",
+			    global_options.hook, (int)pid,
+			    WEXITSTATUS(status));
+		else if (WIFSIGNALED(status))
+			log_message(LOG_WARNING, "%s (pid %d) killed by "
+			    "signal %d", global_options.hook, (int)pid,
+			    WTERMSIG(status));
+		if (pid != hook_pid)
+			continue;
+		hook_pid = 0;
+		if (hook_pending) {
+			hook_pending = 0;
+			start_hook();
+		}
 	}
 }
 
@@ -380,9 +482,16 @@ int distribute_ip_addresses() {
 	 * the backups to use when they become master: that of our default
 	 * route through the carp interface, or none.  And our own address on
 	 * the members' other network, -g, for them to use while they are
-	 * backup; main() has checked it.
+	 * backup; main() has checked it.  As a backup become master we may
+	 * still route via the old one: then the gateway learned from it, if
+	 * it is on our carp network.
 	 */
-	if (get_default_gateway(&message.gateway_ip) != 0)
+	if (get_default_gateway(&message.gateway_ip) == 0)
+		learned_gw = message.gateway_ip;
+	else if ((learned_gw & message.netmask) ==
+	    (message.carp_ip & message.netmask))
+		message.gateway_ip = learned_gw;
+	else
 		message.gateway_ip = INADDR_ANY;
 	if (global_options.gateway_ip != NULL)
 		inet_pton(AF_INET, global_options.gateway_ip,
@@ -454,6 +563,7 @@ int process_received_message(const struct dcarp_message *message,
 	uint32_t demote, their_prio, my_prio;
 	uint8_t advbase, advskew;
 	int64_t gen;
+	int better;
 
 	switch (ntohl(message->message_type)) {
         case MSG_TYPE_IP_DISTRIBUTION:
@@ -469,13 +579,21 @@ int process_received_message(const struct dcarp_message *message,
 
 		/*
 		 * Whatever our state: the newest configuration wins, by the
-		 * generation, the time its address was obtained, and within
-		 * one generation the sender with the better carp(4)
-		 * priority.  So a backup that has become master because the
-		 * master's address changed, and with it the carp
-		 * authentication, takes the new address and returns to
-		 * backup; and the master, while carp restarts after the
-		 * change, does not take the old address back from it.
+		 * generation, the time its address was obtained.  So a backup
+		 * that has become master because the master's address
+		 * changed, and with it the carp authentication, takes the new
+		 * address and returns to backup; and the master, while carp
+		 * restarts after the change, does not take the old address
+		 * back from it.
+		 *
+		 * Within one generation a backup takes it from whoever sends
+		 * it: only a master sends, and carp has elected it, even if
+		 * our priority is better, e.g. without preemption.  So does
+		 * a member in INIT, which sends nothing, e.g. one without an
+		 * address yet.  A master takes it only from a sender with a
+		 * better carp(4) priority, the lower sender id breaking ties,
+		 * which decides between masters that see each other's
+		 * messages but not each other's advertisements.
 		 */
 		gen = (int64_t)be64toh(message->generation);
 		their_prio = priority_key(ntohl(message->demote),
@@ -484,6 +602,8 @@ int process_received_message(const struct dcarp_message *message,
 		    &advbase, &advskew) != 0)
 			return (-1);
 		my_prio = priority_key(demote, advbase, advskew);
+		better = their_prio < my_prio || (their_prio == my_prio &&
+		    be64toh(message->sender) < my_sender);
 		if (gen < my_generation) {
 			log_rejected(from, "older configuration %s gateway %s "
 			    "(generation %lld, ours %lld)", carp_ip_str,
@@ -491,7 +611,8 @@ int process_received_message(const struct dcarp_message *message,
 			    (long long)my_generation);
 			return (0);
 		}
-		if (gen == my_generation && their_prio >= my_prio) {
+		if (gen == my_generation && !better &&
+		    current_carp_state == CARP_STATE_MASTER) {
 			if (config_matches(&last_applied, message))
 				return (0);
 			log_rejected(from, "configuration %s gateway %s from a "
@@ -541,6 +662,8 @@ int process_received_message(const struct dcarp_message *message,
 		}
 		/* The sender's -g is our gateway while we are backup */
 		learned_backup_gw = message->backup_gateway;
+		if (message->gateway_ip != INADDR_ANY)
+			learned_gw = message->gateway_ip;
 		if (write_state_file(message, learned_backup_gw) != 0)
 			return (-1);
 		config_record(&last_applied, message);
@@ -853,27 +976,29 @@ int write_state_file(const struct dcarp_message *message,
 	    carp_ip_str, netmask_str,
 	    gateway_ip_str[0] ? gateway_ip_str : "none",
 	    backup_gw_str[0] ? backup_gw_str : "none", gen);
+	run_hook();
 	return (0);
 }
 
 /*
- * The backup gateway our state file holds from before, if any: the -g of
- * the member we last took a configuration from.  Started as master, we
- * have heard from no other member yet, but need it when we become backup.
+ * An address our state file holds from before, if any, e.g. the backup
+ * gateway, the -g of the member we last took a configuration from:
+ * started as master, we have heard from no other member yet, but need it
+ * when we become backup.
  */
-in_addr_t read_state_backup_gateway(void) {
-	const char var[] = "DCARP_BACKUP_GATEWAY=";
+in_addr_t read_state_address(const char *name) {
 	char line[128];
+	size_t len = strlen(name);
 	in_addr_t gw = INADDR_ANY;
 	FILE *f;
 
 	if ((f = fopen(global_options.state_file, "r")) == NULL)
 		return (INADDR_ANY);
 	while (fgets(line, sizeof(line), f) != NULL) {
-		if (strncmp(line, var, sizeof(var) - 1) != 0)
+		if (strncmp(line, name, len) != 0 || line[len] != '=')
 			continue;
 		line[strcspn(line, "\n")] = '\0';
-		if (inet_pton(AF_INET, line + sizeof(var) - 1, &gw) != 1)
+		if (inet_pton(AF_INET, line + len + 1, &gw) != 1)
 			gw = INADDR_ANY;
 		break;
 	}
@@ -1165,7 +1290,7 @@ void setup_routing_socket(void)
 	int sockfd;
     
 	// Open the socket
-	sockfd = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
+	sockfd = socket(PF_ROUTE, SOCK_RAW | SOCK_CLOEXEC, AF_UNSPEC);
 	if (sockfd == -1) {
 		log_perror("socket");
 		log_close();
@@ -1192,7 +1317,7 @@ int main(int argc, char *argv[]) {
 	in_addr_t ip, netmask;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "dnvf:i:g:k:s:")) != -1) {
+	while ((ch = getopt(argc, argv, "dnvf:i:g:k:s:x:")) != -1) {
 		switch (ch) {
 		case 'd':
 			global_options.foreground = 1;
@@ -1218,6 +1343,9 @@ int main(int argc, char *argv[]) {
 		case 'f':
 			global_options.state_file = optarg;
 			break;
+		case 'x':
+			global_options.hook = optarg;
+			break;
 		default:
 			usage();
 		}
@@ -1227,6 +1355,13 @@ int main(int argc, char *argv[]) {
 	argv += optind;
 
 	if (argc != 0 || global_options.interface_name == NULL) {
+		usage();
+	}
+	if (global_options.hook != NULL &&
+	    (global_options.hook[0] != '/' ||
+	    access(global_options.hook, X_OK) == -1)) {
+		fprintf(stderr, "%s: -x %s: not an absolute path to an "
+		    "executable\n", getprogname(), global_options.hook);
 		usage();
 	}
 	if (global_options.gateway_ip != NULL) {
@@ -1274,7 +1409,8 @@ int main(int argc, char *argv[]) {
 			goto err;
 		}
 	}
-	learned_backup_gw = read_state_backup_gateway();
+	learned_gw = read_state_address("DCARP_GATEWAY");
+	learned_backup_gw = read_state_address("DCARP_BACKUP_GATEWAY");
 
 	if (!global_options.foreground) {
 		daemonize();
@@ -1303,6 +1439,12 @@ int main(int argc, char *argv[]) {
 	setup_multicast_socket();
 	setup_routing_socket();
 
+	event_init();
+
+	/* Before the first message sent, which may start the hook */
+	signal_set(&sigchld_event, SIGCHLD, sigchld_callback, NULL);
+	signal_add(&sigchld_event, NULL);
+
 	current_carp_state = get_carp_interface_state(global_options.interface_name);
 
 	if (current_carp_state == CARP_STATE_MASTER) {
@@ -1317,9 +1459,7 @@ int main(int argc, char *argv[]) {
 		log_message(LOG_ERR, "%s is in unexpected state %d.", global_options.interface_name, current_carp_state);
 		goto err;
 	}
-	
-	event_init();
-    
+
 	// Create an event for the multicast socket
 	struct event multicast_event;
 	event_set(&multicast_event, global_multicast_socket, EV_READ | EV_PERSIST, multicast_callback, NULL);
@@ -1457,7 +1597,8 @@ void setup_multicast_socket() {
 	int yes = 1;
 
 	/* Create a UDP socket */
-	int sock = socket(PF_INET, SOCK_DGRAM, 0);
+	/* Close-on-exec: the -x hook must not inherit it */
+	int sock = socket(PF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 	if (sock < 0) {
 		log_perror("socket");
 		log_close();
@@ -1538,8 +1679,9 @@ void close_multicast_socket() {
 void usage(void) {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-dnv] [-f state_file] [-g gateway] "
-	    "-i interface [-k key_file]\n"
-	    "              [-s sync_interface]\n", __progname);
+	fprintf(stderr, "usage: %s [-dnv] [-f state_file] [-g backup_gateway] "
+	    "-i interface\n"
+	    "              [-k key_file] [-s sync_interface] [-x program]\n",
+	    __progname);
 	exit(EXIT_FAILURE);
 }

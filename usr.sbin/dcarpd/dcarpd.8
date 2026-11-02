@@ -1,4 +1,20 @@
-.Dd May 22, 2023
+.\"	$OpenBSD$
+.\"
+.\" Copyright (c) 2023, 2026 Niklas Hallqvist
+.\"
+.\" Permission to use, copy, modify, and distribute this software for any
+.\" purpose with or without fee is hereby granted, provided that the above
+.\" copyright notice and this permission notice appear in all copies.
+.\"
+.\" THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+.\" WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+.\" MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+.\" ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+.\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+.\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+.\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+.\"
+.Dd $Mdocdate: November 2 2026 $
 .Dt DCARPD 8
 .Os
 .Sh NAME
@@ -12,6 +28,7 @@
 .Fl i Ar interface
 .Op Fl k Ar key_file
 .Op Fl s Ar sync_interface
+.Op Fl x Ar program
 .Sh DESCRIPTION
 The
 .Nm
@@ -30,9 +47,10 @@ changes no routes itself.
 The options are as follows:
 .Bl -tag -width Ds
 .It Fl d
-Do not daemonize. If this option is specified,
+Do not daemonize.
+If this option is specified,
 .Nm
-will run in the foreground.
+will run in the foreground and log to standard error.
 .It Fl f Ar state_file
 Write the configuration held to
 .Ar state_file
@@ -59,7 +77,10 @@ instead of
 .Pa /etc/dcarp.key .
 The file must be owned by root and not readable by group or others.
 .It Fl n
-Run in dry-run mode. In this mode, the daemon goes through all the motions but does not actually reconfigure network interfaces. This is useful for testing.
+Run in dry-run mode.
+In this mode, the daemon goes through all the motions but does not
+actually reconfigure network interfaces.
+This is useful for testing.
 .It Fl s Ar sync_interface
 Send and receive the DCARP messages on
 .Ar sync_interface ,
@@ -69,7 +90,32 @@ instead of on the
 interface.
 Messages received on any other interface are rejected.
 .It Fl v
-Increase verbosity. Can be specified multiple times.
+Increase verbosity.
+Can be specified multiple times.
+.It Fl x Ar program
+Run
+.Ar program ,
+an absolute path,
+whenever the state file is written and whenever the
+.Xr carp 4
+state of the
+.Fl i
+interface changes,
+with the state file and the state,
+.Cm MASTER ,
+.Cm BACKUP
+or
+.Cm INIT ,
+as arguments,
+for example to set the routes.
+.Nm
+does not wait for it,
+but runs one at a time:
+a run asked for while one is running is started when that one exits,
+and then gets the state of that time.
+A
+.Ar program
+that exits with a status other than 0 is logged.
 .El
 .Pp
 As master,
@@ -86,6 +132,11 @@ adds from the lease,
 and its
 .Fl g
 backup gateway.
+A backup that has become master may still route via the old master;
+until it has a default route of its own through the
+.Fl i
+interface it sends the gateway it last took or sent,
+if that is on the interface's network.
 It sends them when it becomes master,
 when that address changes,
 and every 10 seconds.
@@ -99,19 +150,44 @@ and the time
 sees the address of the
 .Fl i
 interface change otherwise.
-In any state, master or backup,
+In any state
 .Nm
 takes a configuration of a newer generation than its own,
-or of the same generation from a sender with a better
-.Xr carp 4
-priority, that is a lower demote count, or else a lower advbase and
-advskew.
-It rejects and logs any other.
+and rejects and logs one of an older generation.
 So a backup that has become master because the master's address
 changed, and with it the
 .Xr carp 4
 authentication, takes the new address and returns to backup,
 and the master does not take the old address back from it.
+.Pp
+Of the same generation,
+a backup takes the configuration of any sender:
+only a master sends, and
+.Xr carp 4
+has elected it,
+even one of worse priority than the backup's, as after the backup
+comes back with
+.Va net.inet.carp.preempt
+disabled.
+So does a member in the INIT state, which sends nothing,
+for example one whose
+.Fl i
+interface has no address yet.
+As master,
+.Nm
+takes it only from a sender with a better
+.Xr carp 4
+priority, that is a lower demote count, or else a lower advbase and
+advskew,
+and of the same priority from the sender with the lower sender id,
+a random number each
+.Nm
+chooses when it starts.
+This decides between members that are master at the same time,
+and see each other's messages but not each other's
+.Xr carp 4
+advertisements.
+It rejects and logs any other.
 .Pp
 To take a configuration,
 .Nm
@@ -161,6 +237,8 @@ A message is accepted only if it authenticates,
 it is at most 30 seconds old,
 and its sequence number is higher than the last one accepted from the
 same sender.
+The last 64 senders are remembered,
+more than the members of any group.
 Rejected messages are logged with their source address,
 at most once every 10 seconds.
 The clocks of the nodes must therefore agree within 30 seconds.
@@ -210,6 +288,31 @@ if carp0.link.down {
 A complete example, which also demotes the master if the gateway is
 unreachable, is in
 .Pa /etc/examples/ifstated-dcarpd.conf .
+.Pp
+With more than two members a backup must route via a new master
+although it stays backup, and its carp0 does not change state.
+Leave the routes out of
+.Xr ifstated.conf 5
+then, and set them with a program run by
+.Fl x ,
+here
+.Pa /etc/dcarpd-route :
+.Bd -literal -offset indent
+#!/bin/sh
+\&. "$1" || exit 1
+case $2 in
+MASTER)	gw=$DCARP_GATEWAY ;;
+BACKUP)	gw=$DCARP_BACKUP_GATEWAY ;;
+*)	exit 0 ;;
+esac
+[ -n "$gw" ] || exit 0
+route -q change default $gw 2>/dev/null || route -q add default $gw
+.Ed
+.Pp
+and on each member, with its own internal address:
+.Bd -literal -offset indent
+# rcctl set dcarpd flags -i carp0 -g 192.168.1.2 -x /etc/dcarpd-route
+.Ed
 .Sh SEE ALSO
 .Xr carp 4 ,
 .Xr ifstated.conf 5 ,
@@ -219,7 +322,8 @@ unreachable, is in
 .Sh HISTORY
 The
 .Nm
-command first appeared in OpenBSD 7.4.
+command first appeared in
+.Ox 7.4 .
 .Sh AUTHORS
 .An -nosplit
 The

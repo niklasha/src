@@ -81,17 +81,17 @@ Table of Contents
      8.1.  Validation  . . . . . . . . . . . . . . . . . . . . . . .   9
      8.2.  Acceptance  . . . . . . . . . . . . . . . . . . . . . . .  10
      8.3.  Taking a Configuration  . . . . . . . . . . . . . . . . .  10
-   9.  Interaction with CARP . . . . . . . . . . . . . . . . . . . .  10
-   10. Local Use of the Configuration  . . . . . . . . . . . . . . .  11
-   11. Operational Considerations  . . . . . . . . . . . . . . . . .  11
-   12. Security Considerations . . . . . . . . . . . . . . . . . . .  12
-   13. IANA Considerations . . . . . . . . . . . . . . . . . . . . .  13
-   14. References  . . . . . . . . . . . . . . . . . . . . . . . . .  13
-     14.1.  Normative References . . . . . . . . . . . . . . . . . .  13
+   9.  Interaction with CARP . . . . . . . . . . . . . . . . . . . .  11
+   10. Local Use of the Configuration  . . . . . . . . . . . . . . .  12
+   11. Operational Considerations  . . . . . . . . . . . . . . . . .  12
+   12. Security Considerations . . . . . . . . . . . . . . . . . . .  13
+   13. IANA Considerations . . . . . . . . . . . . . . . . . . . . .  14
+   14. References  . . . . . . . . . . . . . . . . . . . . . . . . .  14
+     14.1.  Normative References . . . . . . . . . . . . . . . . . .  14
      14.2.  Informative References . . . . . . . . . . . . . . . . .  14
-   Appendix A.  Reference Implementation . . . . . . . . . . . . . .  14
-   Acknowledgments . . . . . . . . . . . . . . . . . . . . . . . . .  15
-   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .  15
+   Appendix A.  Reference Implementation . . . . . . . . . . . . . .  15
+   Acknowledgments . . . . . . . . . . . . . . . . . . . . . . . . .  16
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .  16
 
 1.  Introduction
 
@@ -200,21 +200,21 @@ Internet-Draft                    DCARP                    November 2026
    XChaCha20-Poly1305.
 
    A member that receives a valid message takes the Configuration if its
-   Generation is newer than its own, or if it is of the same Generation
-   and the sender has a better Priority.  This holds in every CARP
-   state, so a Backup that has become Master because it rejected the
-   Master's advertisements still takes the new address.  Taking a
-   Configuration makes its address the only IPv4 address of the CARP
-   interface, which restarts CARP on that interface; with the same
-   addresses as the Master, the member then accepts the Master's
-   advertisements and returns to Backup.
+   Generation is newer than its own, in every CARP state, so a Backup
+   that has become Master because it rejected the Master's
+   advertisements still takes the new address.  Of the same Generation,
+   a member that is not Master takes it from any sender, since CARP has
+   elected the sender; a Master takes it only if the sender has a better
+   Priority.  Taking a Configuration makes its address the only IPv4
+   address of the CARP interface, which restarts CARP on that interface;
+   with the same addresses as the Master, the member then accepts the
+   Master's advertisements and returns to Backup.
 
    DCARP does not change routes.  It makes the Configuration available
    to the local system, which uses the gateway when the member becomes
    Master (Section 10).
 
 3.  Message Format
-
 
 
 
@@ -470,12 +470,16 @@ Internet-Draft                    DCARP                    November 2026
    several IPv4 addresses, the sender uses one of them consistently.
    The Gateway is the one the provider of the address gives: the gateway
    of the member's default route if that route goes through the CARP
-   interface, as a DHCP client adds from the lease, or else 0.0.0.0.  It
-   is not configured by the operator.  The Backup Gateway is the
-   sender's own address on another network the members share, which the
-   operator configures, or 0.0.0.0.  Demote, Advbase and Advskew are the
-   sender's current CARP values; the demote count is the sum over the
-   groups the CARP interface belongs to, as CARP computes it.
+   interface, as a DHCP client adds from the lease.  A member that has
+   become Master may still route via the previous Master, through
+   another interface; it then sends the Gateway of the Configuration it
+   last took or sent, if that is on the network of the Address, and
+   otherwise 0.0.0.0.  The Gateway is not configured by the operator.
+   The Backup Gateway is the sender's own address on another network the
+   members share, which the operator configures, or 0.0.0.0.  Demote,
+   Advbase and Advskew are the sender's current CARP values; the demote
+   count is the sum over the groups the CARP interface belongs to, as
+   CARP computes it.
 
 8.  Receiving
 
@@ -492,12 +496,8 @@ Internet-Draft                    DCARP                    November 2026
    3.  its Timestamp differs from the member's clock by more than the
        maximum age, 30 seconds; or
 
-   4.  its Sequence is not higher than the highest Sequence accepted
-       from the same Sender.  A member MUST remember the Sequence of at
-       least the eight Senders it heard from most recently.
 
-   A member ignores its own messages, whose Sender is its own, and
-   discards messages of an unknown Message Type.
+
 
 
 
@@ -506,23 +506,44 @@ Hallqvist                  Expires 6 May 2027                   [Page 9]
 Internet-Draft                    DCARP                    November 2026
 
 
+   4.  its Sequence is not higher than the highest Sequence accepted
+       from the same Sender.  A member MUST remember the Sequence of the
+       Senders it heard from most recently, at least as many as the
+       group has members and at least eight; a restarted member is a new
+       Sender.
+
+   A member ignores its own messages, whose Sender is its own, and
+   discards messages of an unknown Message Type.
+
 8.2.  Acceptance
 
-   A member in any CARP state, Master, Backup or Init, takes the
-   Configuration of a valid message if:
+   A member takes the Configuration of a valid message if:
 
-   *  its Generation is greater than the member's Generation; or
+   *  its Generation is greater than the member's Generation, in any
+      CARP state, Master, Backup or Init;
 
-   *  its Generation equals the member's Generation and the sender's
-      Priority is better than the member's own: a lower Demote, or an
-      equal Demote and a lower Advbase, or equal values of both and a
-      lower Advskew.  This is the order in which CARP compares
-      advertisements.
+   *  its Generation equals the member's Generation and the member is
+      Backup or Init.  Only a Master sends, and CARP has elected it,
+      possibly with a worse Priority than the member's, as when a member
+      returns without preemption.  A member in Init sends nothing, and
+      one whose CARP interface has no address yet gets it this way
+      (Section 9); or
+
+   *  its Generation equals the member's Generation, the member is
+      Master, and the sender's Priority is better than the member's own:
+      a lower Demote, or an equal Demote and a lower Advbase, or equal
+      values of both and a lower Advskew, which is the order in which
+      CARP compares advertisements; or an equal Priority and a lower
+      Sender, compared as unsigned 64-bit integers.
 
    It MUST discard, and SHOULD log, any other.  The Generation comes
    first because after a failover the member with the worse Priority may
    hold the newer lease; the Priority decides only between
-   Configurations of the same Generation.
+   Configurations of the same Generation, and there only for members
+   that are Master at the same time and receive each other's messages
+   but not each other's advertisements, for example over a separate Sync
+   interface while the network of the CARP interface is split: exactly
+   one of them takes the other's Configuration.
 
 8.3.  Taking a Configuration
 
@@ -533,6 +554,13 @@ Internet-Draft                    DCARP                    November 2026
    address, since CARP authenticates over all addresses (Section 9), and
    it SHOULD add the new address before removing the old ones, since a
    CARP interface without an address leaves the election.
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 10]
+
+Internet-Draft                    DCARP                    November 2026
+
 
    Each change of the addresses restarts CARP on the interface, so a
    member MUST NOT change them when the address is already the only one,
@@ -553,14 +581,6 @@ Internet-Draft                    DCARP                    November 2026
        and Backup and becomes Master again after about three
        advertisement intervals.  Meanwhile it neither sends
        advertisements nor, on the CARP interface, DCARP messages.
-
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 10]
-
-Internet-Draft                    DCARP                    November 2026
-
 
    2.  The Backups reject the Master's advertisements, whose
        authentication now covers a different set of addresses.  A Backup
@@ -587,6 +607,17 @@ Internet-Draft                    DCARP                    November 2026
    member takes Configurations in Init as well, such a member obtains
    its address from the Master and then joins the election.
 
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 11]
+
+Internet-Draft                    DCARP                    November 2026
+
+
 10.  Local Use of the Configuration
 
    DCARP does not set routes, so that it does not compete with the tools
@@ -607,16 +638,14 @@ Internet-Draft                    DCARP                    November 2026
    change.  A member that has never taken a Configuration has no Backup
    Gateway, and the tools need another default.
 
+   With more than two members, the Master can change while a member
+   stays Backup: its own CARP state does not change, but its Backup
+   Gateway does.  Tools that act only on the member's CARP state changes
+   miss this.  A member SHOULD therefore notify the tools whenever the
+   Configuration it holds changes, as well as when its CARP state
+   changes.
+
 11.  Operational Considerations
-
-
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 11]
-
-Internet-Draft                    DCARP                    November 2026
-
 
    *  All members MUST use the same key, group and port, and Sync
       interfaces on the same network.  Implementations SHOULD log a
@@ -636,14 +665,24 @@ Internet-Draft                    DCARP                    November 2026
       its address changes, the other members discard the Configuration
       it sends as Master if they hold a newer one.
 
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 12]
+
+Internet-Draft                    DCARP                    November 2026
+
+
 12.  Security Considerations
 
    The shared key protects the confidentiality, integrity and
    authenticity of the Configurations.  Every holder of the key is
    trusted: a holder can make the other members take any address and
-   gateway by sending a Configuration with a later Generation.  The
-   compromise of one member therefore compromises the group, and the key
-   needs the same protection as the members' administrative credentials.
+   gateway by sending a Configuration with a later Generation, and the
+   Backups by sending one with the same Generation.  The compromise of
+   one member therefore compromises the group, and the key needs the
+   same protection as the members' administrative credentials.
 
    The Timestamp and Sequence stop replays.  A member discards a message
    older than 30 seconds, and a message whose Sequence it has already
@@ -665,15 +704,6 @@ Internet-Draft                    DCARP                    November 2026
    is the network of the shared address, often a provider's network.  A
    separate Sync interface on a trusted network hides even that.
 
-
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 12]
-
-Internet-Draft                    DCARP                    November 2026
-
-
    Anyone on that network can send datagrams to the group.  Each costs
    the receiver one authentication attempt; implementations SHOULD limit
    the rate at which they log discarded messages.  The time to live of 1
@@ -685,6 +715,20 @@ Internet-Draft                    DCARP                    November 2026
 
    Tools that set routes from a Configuration act on data that is
    authenticated, but chosen by another member.
+
+
+
+
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 13]
+
+Internet-Draft                    DCARP                    November 2026
+
 
 13.  IANA Considerations
 
@@ -722,14 +766,6 @@ Internet-Draft                    DCARP                    November 2026
               DOI 10.17487/RFC4086, June 2005,
               <https://www.rfc-editor.org/info/rfc4086>.
 
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 13]
-
-Internet-Draft                    DCARP                    November 2026
-
-
    [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC
               2119 Key Words", BCP 14, RFC 8174, DOI 10.17487/RFC8174,
               May 2017, <https://www.rfc-editor.org/info/rfc8174>.
@@ -739,6 +775,16 @@ Internet-Draft                    DCARP                    November 2026
               <https://www.rfc-editor.org/info/rfc8439>.
 
 14.2.  Informative References
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 14]
+
+Internet-Draft                    DCARP                    November 2026
+
 
    [CARP]     The OpenBSD Project, "carp(4): Common Address Redundancy
               Protocol", OpenBSD manual page,
@@ -769,22 +815,11 @@ Appendix A.  Reference Implementation
 
    dcarpd(8) implements DCARP on OpenBSD.  It derives the 256-bit key as
    the SHA-256 hash of a key file, reads the lease time from the lease
-   file of dhcpleased(8), sends every 10 seconds, and remembers eight
+   file of dhcpleased(8), sends every 10 seconds, and remembers 64
    Senders.
 
    It writes the Configuration it holds to a state file of shell
    variable assignments, which it replaces atomically:
-
-
-
-
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 14]
-
-Internet-Draft                    DCARP                    November 2026
-
 
    DCARP_INTERFACE=carp0
    DCARP_ADDRESS=192.0.2.10
@@ -799,10 +834,24 @@ Internet-Draft                    DCARP                    November 2026
    member.  A complete ifstated configuration is distributed with the
    implementation.  The Backup Gateway is the -g option of dcarpd.
 
-   The implementation comes with regression tests that run two members
-   in separate routing domains of one host, including the split of
-   Section 9, replays, tampered and stale messages, and messages with
-   another key.
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 15]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   With more than two members, dcarpd runs the program given with its -x
+   option, with the state file and the CARP state as arguments, whenever
+   it writes the state file and whenever the CARP state changes, one run
+   at a time; the program sets the routes.
+
+   The implementation comes with regression tests that run two or three
+   members in separate routing domains of one host, including the split
+   of Section 9, failovers among three members, a member returning
+   without preemption, Masters of equal Priority, replays, tampered and
+   stale messages, and messages with another key.
 
 Acknowledgments
 
@@ -837,4 +886,11 @@ Author's Address
 
 
 
-Hallqvist                  Expires 6 May 2027                  [Page 15]
+
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 16]
