@@ -222,6 +222,7 @@
 ./etc/rc.d/bootparamd
 ./etc/rc.d/bpflogd
 ./etc/rc.d/cron
+./etc/rc.d/dcarpd
 ./etc/rc.d/dhcp6leased
 ./etc/rc.d/dhcpd
 ./etc/rc.d/dhcpleased
