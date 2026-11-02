@@ -1,0 +1,840 @@
+
+
+
+
+Network Working Group                                       N. Hallqvist
+Internet-Draft                                                     Appli
+Intended status: Experimental                            2 November 2026
+Expires: 6 May 2027
+
+
+    DCARP: Distributing Dynamic Addresses to CARP Redundancy Groups
+                        draft-hallqvist-dcarp-00
+
+Abstract
+
+   The Common Address Redundancy Protocol (CARP) lets a group of hosts
+   share IP addresses, but every member must be configured with the
+   shared addresses in advance.  When the shared address is assigned
+   dynamically, for example by DHCP to the current master, the backups
+   do not know it, and since CARP authenticates its advertisements over
+   the shared addresses, a change of the address splits the group into
+   several masters.  The Distributed Common Address Redundancy Protocol
+   (DCARP) lets the master distribute the shared IPv4 address, its
+   netmask and the gateway of its network to the other members,
+   encrypted and authenticated, and resolves the split that follows an
+   address change.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on 6 May 2027.
+
+Copyright Notice
+
+   Copyright (c) 2026 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                   [Page 1]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents (https://trustee.ietf.org/
+   license-info) in effect on the date of publication of this document.
+   Please review these documents carefully, as they describe your rights
+   and restrictions with respect to this document.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+     1.1.  Requirements Language . . . . . . . . . . . . . . . . . .   3
+     1.2.  Terminology . . . . . . . . . . . . . . . . . . . . . . .   3
+   2.  Protocol Overview . . . . . . . . . . . . . . . . . . . . . .   4
+   3.  Message Format  . . . . . . . . . . . . . . . . . . . . . . .   4
+     3.1.  Wire Format . . . . . . . . . . . . . . . . . . . . . . .   4
+     3.2.  Plaintext . . . . . . . . . . . . . . . . . . . . . . . .   5
+   4.  Encryption and Authentication . . . . . . . . . . . . . . . .   7
+   5.  Transport . . . . . . . . . . . . . . . . . . . . . . . . . .   7
+   6.  Generations . . . . . . . . . . . . . . . . . . . . . . . . .   8
+   7.  Sending . . . . . . . . . . . . . . . . . . . . . . . . . . .   8
+   8.  Receiving . . . . . . . . . . . . . . . . . . . . . . . . . .   9
+     8.1.  Validation  . . . . . . . . . . . . . . . . . . . . . . .   9
+     8.2.  Acceptance  . . . . . . . . . . . . . . . . . . . . . . .   9
+     8.3.  Taking a Configuration  . . . . . . . . . . . . . . . . .  10
+   9.  Interaction with CARP . . . . . . . . . . . . . . . . . . . .  10
+   10. Local Use of the Configuration  . . . . . . . . . . . . . . .  11
+   11. Operational Considerations  . . . . . . . . . . . . . . . . .  11
+   12. Security Considerations . . . . . . . . . . . . . . . . . . .  12
+   13. IANA Considerations . . . . . . . . . . . . . . . . . . . . .  13
+   14. References  . . . . . . . . . . . . . . . . . . . . . . . . .  13
+     14.1.  Normative References . . . . . . . . . . . . . . . . . .  13
+     14.2.  Informative References . . . . . . . . . . . . . . . . .  13
+   Appendix A.  Reference Implementation . . . . . . . . . . . . . .  14
+   Acknowledgments . . . . . . . . . . . . . . . . . . . . . . . . .  15
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .  15
+
+1.  Introduction
+
+   CARP [CARP], like VRRP [RFC9568], makes a group of hosts share one or
+   more virtual addresses on a network.  One member, the Master, owns
+   the addresses and answers for them; the others, the Backups, take
+   over when the Master stops sending advertisements.  CARP requires
+   that all members are configured with the same virtual addresses.
+
+
+
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                   [Page 2]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   That requirement cannot be met when the shared address is assigned
+   dynamically.  A typical case is a pair of firewalls whose external
+   address is assigned by an Internet service provider with DHCP
+   [RFC2131]: the DHCP client runs on the CARP interface of the Master,
+   which shares a virtual MAC address with the Backups, and only the
+   Master learns the address.  Two problems follow:
+
+   1.  A Backup that becomes Master does not know the address, its
+       netmask or the gateway of that network, and cannot use them until
+       it completes a DHCP exchange of its own.
+
+   2.  CARP authenticates its advertisements over the set of virtual
+       addresses.  When the Master's address changes, the Backups reject
+       its advertisements, conclude that the Master is gone, and become
+       Masters themselves.  The group stays split until an operator
+       intervenes.
+
+   DCARP solves both.  The Master sends the address, its netmask and the
+   gateway of its network to the group, encrypted and authenticated with
+   a shared key; every member applies the newest configuration it
+   receives, whatever its CARP state.  DCARP does not replace CARP: CARP
+   still elects the Master, and DCARP only distributes what CARP needs
+   to be configured with.
+
+   This version of DCARP handles IPv4 only.
+
+1.1.  Requirements Language
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+   "OPTIONAL" in this document are to be interpreted as described in
+   BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all
+   capitals, as shown here.
+
+1.2.  Terminology
+
+   CARP interface:  The interface of a member that carries the virtual
+      address managed by DCARP.
+
+   Master, Backup, Init:  The CARP states of a member's CARP interface.
+      A CARP interface without any address does not take part in the
+      election and stays in Init.
+
+   Configuration:  The virtual address, its netmask and the gateway on
+      its network, together with a Generation.
+
+   Generation:  The time at which the address of a Configuration was
+
+
+
+
+Hallqvist                  Expires 6 May 2027                   [Page 3]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+      obtained, used to decide which Configuration is the newest
+      (Section 6).
+
+   Priority:  The CARP demote count, advertisement base and
+      advertisement skew of a member, which CARP uses to elect the
+      Master.  Lower values are better.
+
+   Sync interface:  The interface on which a member sends and receives
+      DCARP messages: the CARP interface unless configured otherwise
+      (Section 5).
+
+2.  Protocol Overview
+
+   All members of a CARP group run DCARP and share a 256-bit key.  The
+   Master sends a DCARP message to an IPv4 multicast group on the Sync
+   interface when it becomes Master, when the address of its CARP
+   interface changes, and periodically.  The message carries the
+   Master's Configuration, its Priority, and fields that let receivers
+   detect replays.  It is encrypted and authenticated with
+   XChaCha20-Poly1305.
+
+   A member that receives a valid message takes the Configuration if its
+   Generation is newer than its own, or if it is of the same Generation
+   and the sender has a better Priority.  This holds in every CARP
+   state, so a Backup that has become Master because it rejected the
+   Master's advertisements still takes the new address.  Taking a
+   Configuration makes its address the only IPv4 address of the CARP
+   interface, which restarts CARP on that interface; with the same
+   addresses as the Master, the member then accepts the Master's
+   advertisements and returns to Backup.
+
+   DCARP does not change routes.  It makes the Configuration available
+   to the local system, which uses the gateway when the member becomes
+   Master (Section 10).
+
+3.  Message Format
+
+3.1.  Wire Format
+
+   A DCARP message is the payload of a UDP datagram [RFC768] and is
+   exactly 96 octets long:
+
+
+
+
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                   [Page 4]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+    0                   1                   2                   3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                                                               |
+   +                         Nonce (24 octets)                     +
+   |                                                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                                                               |
+   +                       Ciphertext (56 octets)                  +
+   |                                                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                                                               |
+   +                  Authentication Tag (16 octets)               +
+   |                                                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+                           Figure 1: Wire Format
+
+   The Ciphertext and Authentication Tag are the output of
+   AEAD_XChaCha20_Poly1305 over the 56-octet plaintext of Section 3.2,
+   as described in Section 4.
+
+3.2.  Plaintext
+
+   All integers are unsigned and in network byte order unless stated
+   otherwise.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                   [Page 5]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+    0                   1                   2                   3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                         Message Type                          |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                            Address                            |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                            Netmask                            |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                            Gateway                            |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                                                               |
+   +                            Sender                             +
+   |                                                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                                                               |
+   +                           Sequence                            +
+   |                                                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                                                               |
+   +                           Timestamp                           +
+   |                                                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                                                               |
+   +                          Generation                           +
+   |                                                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                            Demote                             |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |    Advbase    |    Advskew    |           Reserved            |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+                            Figure 2: Plaintext
+
+   Message Type (4 octets):  1, Configuration.  No other type is
+      defined.
+
+   Address (4 octets):  The IPv4 address of the sender's CARP interface.
+
+   Netmask (4 octets):  Its netmask.
+
+   Gateway (4 octets):  The IPv4 address of the gateway on the network
+      of the Address that a member is to use as Master, or 0.0.0.0 if
+      the sender knows none (Section 7).
+
+   Sender (8 octets):  A random value the sender chooses when it starts,
+      which identifies it for replay detection.
+
+
+
+
+Hallqvist                  Expires 6 May 2027                   [Page 6]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   Sequence (8 octets):  A counter of the sender, 1 in its first message
+      and incremented by one in each message it sends.
+
+   Timestamp (8 octets):  The time the message was sent, as a signed
+      number of seconds since 1970-01-01T00:00:00Z.
+
+   Generation (8 octets):  The Generation of the Configuration, a signed
+      number of seconds since 1970-01-01T00:00:00Z, or 0 (Section 6).
+
+   Demote (4 octets), Advbase (1 octet), Advskew (1 octet):  The
+      sender's CARP demote count, advertisement base and advertisement
+      skew: its Priority.
+
+   Reserved (2 octets):  Senders MUST set it to zero; receivers MUST
+      ignore it.
+
+4.  Encryption and Authentication
+
+   All members of a group share a 256-bit key.  How the key is generated
+   and distributed is outside the scope of this document; it MUST have
+   at least 256 bits of entropy [RFC4086].
+
+   A sender encrypts and authenticates each plaintext with
+   AEAD_XChaCha20_Poly1305 [I-D.irtf-cfrg-xchacha], which extends the
+   AEAD construction of [RFC8439] to a 192-bit nonce.  The inputs are:
+
+   Key:  The shared key.
+
+   Nonce:  24 octets the sender MUST choose at random for each message.
+      With 192 bits, random nonces do not repeat in practice, and no
+      state is needed to keep them unique.
+
+   Additional data:  The 8 octets of the ASCII string "DCARP 1" followed
+      by a zero octet, which binds the key to this protocol and version.
+
+   Plaintext:  The 56 octets of Section 3.2.
+
+   The message is the nonce, followed by the ciphertext and the 16-octet
+   authentication tag.  A receiver MUST authenticate a message before it
+   uses any of its contents, and MUST discard messages that fail.
+
+5.  Transport
+
+   Messages are sent as UDP datagrams to the IPv4 multicast group
+   224.0.0.18, destination port 3522, with a time to live of 1
+   (Section 13 discusses these values).  An implementation SHOULD allow
+   both to be configured.
+
+
+
+
+Hallqvist                  Expires 6 May 2027                   [Page 7]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   By default the Sync interface is the CARP interface.  An
+   implementation MAY allow another interface to be configured, for
+   example a dedicated link between the members.  A member MUST join the
+   group on its Sync interface, and MUST select the interface explicitly
+   rather than by address: the address of the CARP interface changes,
+   and may be missing.  It MUST discard messages received on any other
+   interface, and messages whose payload is not exactly 96 octets.
+
+   A Master whose CARP interface is the Sync interface cannot send while
+   CARP restarts after an address change (Section 9); it sends once it
+   is Master again.
+
+6.  Generations
+
+   Every Configuration has a Generation: the time its address was
+   obtained.  Comparing Generations tells which of two Configurations is
+   newer.  A member keeps the Generation of the Configuration it holds:
+
+   *  When it starts, the Generation is the time at which its DHCP
+      client last obtained or renewed the lease of the CARP interface,
+      or 0 if there is none.
+
+   *  When the address of its CARP interface changes other than by
+      DCARP, for example when the DHCP client obtains a new address, the
+      Generation becomes the current time.
+
+   *  When it takes a Configuration (Section 8), it adopts the
+      Configuration's Generation.
+
+   *  As Master, before sending, it updates the Generation to the time
+      of the latest renewal of the lease if that is later, since a
+      renewal does not change the address.
+
+   Generations use wall-clock time, so the members' clocks MUST be
+   synchronized, for example with NTP; see also Section 12.
+
+7.  Sending
+
+   A member whose CARP interface is Master and has an IPv4 address sends
+   a message with its Configuration:
+
+   *  when it becomes Master;
+
+   *  when the address of its CARP interface changes, as soon as the
+      interface is Master again (Section 5); and
+
+   *  every Interval seconds otherwise.
+
+
+
+
+Hallqvist                  Expires 6 May 2027                   [Page 8]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   The periodic messages let members that start later, or that missed a
+   message, learn the Configuration.  The Interval MUST be shorter than
+   the maximum age of Section 8.1; the RECOMMENDED value is 10 seconds.
+
+   The Address and Netmask are those of the CARP interface; if it has
+   several IPv4 addresses, the sender uses one of them consistently.
+   The Gateway is the gateway on the network of the Address: one
+   configured by the operator, or else the gateway of the member's
+   default route if that route goes through the CARP interface, or else
+   0.0.0.0.  Demote, Advbase and Advskew are the sender's current CARP
+   values; the demote count is the sum over the groups the CARP
+   interface belongs to, as CARP computes it.
+
+8.  Receiving
+
+8.1.  Validation
+
+   A member discards a message, and SHOULD log its source address and
+   the reason at a limited rate, if:
+
+   1.  it was received on another interface than the Sync interface, or
+       is not 96 octets long (Section 5);
+
+   2.  it does not authenticate (Section 4);
+
+   3.  its Timestamp differs from the member's clock by more than the
+       maximum age, 30 seconds; or
+
+   4.  its Sequence is not higher than the highest Sequence accepted
+       from the same Sender.  A member MUST remember the Sequence of at
+       least the eight Senders it heard from most recently.
+
+   A member ignores its own messages, whose Sender is its own, and
+   discards messages of an unknown Message Type.
+
+8.2.  Acceptance
+
+   A member in any CARP state, Master, Backup or Init, takes the
+   Configuration of a valid message if:
+
+   *  its Generation is greater than the member's Generation; or
+
+   *  its Generation equals the member's Generation and the sender's
+      Priority is better than the member's own: a lower Demote, or an
+      equal Demote and a lower Advbase, or equal values of both and a
+      lower Advskew.  This is the order in which CARP compares
+      advertisements.
+
+
+
+
+Hallqvist                  Expires 6 May 2027                   [Page 9]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   It MUST discard, and SHOULD log, any other.  The Generation comes
+   first because after a failover the member with the worse Priority may
+   hold the newer lease; the Priority decides only between
+   Configurations of the same Generation.
+
+8.3.  Taking a Configuration
+
+   To take a Configuration, a member adopts its Generation and makes its
+   Address, with its Netmask, the only IPv4 address of the CARP
+   interface: it adds the address if it is missing and then removes all
+   other IPv4 addresses of the interface.  It MUST NOT keep an old
+   address, since CARP authenticates over all addresses (Section 9), and
+   it SHOULD add the new address before removing the old ones, since a
+   CARP interface without an address leaves the election.
+
+   Each change of the addresses restarts CARP on the interface, so a
+   member MUST NOT change them when the address is already the only one,
+   and SHOULD do nothing when the Configuration equals the one it took
+   last.  Periodic messages thus cause no changes.
+
+   A member MUST NOT change its routes because of a Configuration.  It
+   makes the Configuration available locally (Section 10).
+
+9.  Interaction with CARP
+
+   CARP computes the authentication of its advertisements over, among
+   other things, the sorted set of IPv4 addresses of the CARP interface
+   [CARP].  When the Master's address changes:
+
+   1.  CARP on the Master restarts: the interface passes through Init
+       and Backup and becomes Master again after about three
+       advertisement intervals.  Meanwhile it neither sends
+       advertisements nor, on the CARP interface, DCARP messages.
+
+   2.  The Backups reject the Master's advertisements, whose
+       authentication now covers a different set of addresses.  A Backup
+       whose master-down timer expires before it has the new address
+       becomes Master as well.
+
+   3.  When the Master is Master again, it sends its Configuration,
+       whose Generation is newer.  Every other member takes it, in its
+       current state, and changes its address, which restarts CARP on
+       its interface.  With the same addresses as the Master it accepts
+       the Master's advertisements and becomes Backup again.
+
+   4.  A member that became Master in step 2 sends its own, older
+       Configuration.  The Master, and any member that already holds the
+       new Configuration, discards it as older.
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 10]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   If the new Configuration reaches a Backup before its master-down
+   timer expires, the Backup takes it as Backup and step 2 does not
+   occur.  If the message is lost, the periodic messages repeat it.  The
+   interruption of the Master's own service while CARP restarts is not
+   avoided by DCARP.
+
+   A member whose CARP interface has no address stays in Init.  Since a
+   member takes Configurations in Init as well, such a member obtains
+   its address from the Master and then joins the election.
+
+10.  Local Use of the Configuration
+
+   DCARP does not set routes, so that it does not compete with the tools
+   that already follow CARP state changes on a member, such as a daemon
+   that changes the default route when the CARP interface becomes Master
+   or Backup.  A member SHOULD make the Configuration it holds, as
+   Master or Backup, available to such tools, for example in a file.
+   When the member becomes Master, they can then route via the Gateway
+   at once, before any DHCP exchange of the new Master completes.
+   Appendix A describes how the reference implementation does this.
+
+11.  Operational Considerations
+
+   *  All members MUST use the same key, group and port, and Sync
+      interfaces on the same network.  Implementations SHOULD log a
+      fingerprint of the key, such as the first octets of a hash of it,
+      so that operators can compare the keys without revealing them.
+
+   *  The members' clocks MUST agree within the maximum age of 30
+      seconds, and closely enough that Generations compare correctly.
+
+   *  The DHCP client of the shared address runs on the CARP interface
+      and gets no lease on Backups, whose CARP interface does not pass
+      traffic.  On some systems the DHCP client also changes the local
+      resolver configuration; operators may want to prevent that on the
+      CARP interface.
+
+   *  A member restarted without a DHCP lease has Generation 0.  Until
+      its address changes, the other members discard the Configuration
+      it sends as Master if they hold a newer one.
+
+
+
+
+
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 11]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+12.  Security Considerations
+
+   The shared key protects the confidentiality, integrity and
+   authenticity of the Configurations.  Every holder of the key is
+   trusted: a holder can make the other members take any address and
+   gateway by sending a Configuration with a later Generation.  The
+   compromise of one member therefore compromises the group, and the key
+   needs the same protection as the members' administrative credentials.
+
+   The Timestamp and Sequence stop replays.  A member discards a message
+   older than 30 seconds, and a message whose Sequence it has already
+   seen from the same Sender.  Within 30 seconds, a recorded message can
+   be replayed to a member that does not remember its Sender, for
+   example after a restart; such a message carries a Configuration that
+   was current 30 seconds earlier, and is discarded anyway if the member
+   holds a newer Generation.
+
+   DCARP depends on synchronized clocks.  An attacker who can move a
+   member's clock, for example by attacking its time synchronization,
+   can make it discard valid messages, accept older ones, or give its
+   own Configurations Generations that win over newer ones.
+
+   The encryption hides the Configuration, the Sender, Sequence and
+   Priority, but not the existence, size and timing of the messages or
+   the source address of the sender, which is visible to anyone on the
+   network of the Sync interface.  With the default Sync interface that
+   is the network of the shared address, often a provider's network.  A
+   separate Sync interface on a trusted network hides even that.
+
+   Anyone on that network can send datagrams to the group.  Each costs
+   the receiver one authentication attempt; implementations SHOULD limit
+   the rate at which they log discarded messages.  The time to live of 1
+   and the link-local multicast group keep the messages on the local
+   network.
+
+   Nonces are random and 192 bits long, so their reuse under one key is
+   negligibly likely.
+
+   Tools that set routes from a Configuration act on data that is
+   authenticated, but chosen by another member.
+
+
+
+
+
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 12]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+13.  IANA Considerations
+
+   This document makes no requests of IANA.  The reference
+   implementation uses the multicast group 224.0.0.18, which is assigned
+   to VRRP [RFC9568] and also used by CARP, and UDP port 3522, which is
+   not registered for DCARP.  A version of this document intended for
+   wider deployment would need a port assignment from the Service Name
+   and Transport Protocol Port Number Registry [RFC6335], and either a
+   multicast group assignment [RFC5771] or a justification for sharing
+   the VRRP group.
+
+14.  References
+
+14.1.  Normative References
+
+   [I-D.irtf-cfrg-xchacha]
+              Arciszewski, S., "XChaCha: eXtended-nonce ChaCha and
+              AEAD_XChaCha20_Poly1305", Work in Progress, Internet-
+              Draft, draft-irtf-cfrg-xchacha-03, January 2020,
+              <https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-
+              xchacha-03>.
+
+   [RFC768]   Postel, J., "User Datagram Protocol", STD 6, RFC 768,
+              DOI 10.17487/RFC0768, August 1980,
+              <https://www.rfc-editor.org/info/rfc768>.
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119,
+              DOI 10.17487/RFC2119, March 1997,
+              <https://www.rfc-editor.org/info/rfc2119>.
+
+   [RFC4086]  Eastlake 3rd, D., Schiller, J., and S. Crocker,
+              "Randomness Requirements for Security", BCP 106, RFC 4086,
+              DOI 10.17487/RFC4086, June 2005,
+              <https://www.rfc-editor.org/info/rfc4086>.
+
+   [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC
+              2119 Key Words", BCP 14, RFC 8174, DOI 10.17487/RFC8174,
+              May 2017, <https://www.rfc-editor.org/info/rfc8174>.
+
+   [RFC8439]  Nir, Y. and A. Langley, "ChaCha20 and Poly1305 for IETF
+              Protocols", RFC 8439, DOI 10.17487/RFC8439, June 2018,
+              <https://www.rfc-editor.org/info/rfc8439>.
+
+14.2.  Informative References
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 13]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   [CARP]     The OpenBSD Project, "carp(4): Common Address Redundancy
+              Protocol", OpenBSD manual page,
+              <https://man.openbsd.org/carp.4>.
+
+   [RFC2131]  Droms, R., "Dynamic Host Configuration Protocol",
+              RFC 2131, DOI 10.17487/RFC2131, March 1997,
+              <https://www.rfc-editor.org/info/rfc2131>.
+
+   [RFC5771]  Cotton, M., Vegoda, L., and D. Meyer, "IANA Guidelines for
+              IPv4 Multicast Address Assignments", BCP 51, RFC 5771,
+              DOI 10.17487/RFC5771, March 2010,
+              <https://www.rfc-editor.org/info/rfc5771>.
+
+   [RFC6335]  Cotton, M., Eggert, L., Touch, J., Westerlund, M., and S.
+              Cheshire, "Internet Assigned Numbers Authority (IANA)
+              Procedures for the Management of the Service Name and
+              Transport Protocol Port Number Registry", BCP 165,
+              RFC 6335, DOI 10.17487/RFC6335, August 2011,
+              <https://www.rfc-editor.org/info/rfc6335>.
+
+   [RFC9568]  Lindem, A. and A. Dogra, "Virtual Router Redundancy
+              Protocol (VRRP) Version 3 for IPv4 and IPv6", RFC 9568,
+              DOI 10.17487/RFC9568, April 2024,
+              <https://www.rfc-editor.org/info/rfc9568>.
+
+Appendix A.  Reference Implementation
+
+   dcarpd(8) implements DCARP on OpenBSD.  It derives the 256-bit key as
+   the SHA-256 hash of a key file, reads the lease time from the lease
+   file of dhcpleased(8), sends every 10 seconds, and remembers eight
+   Senders.
+
+   It writes the Configuration it holds to a state file of shell
+   variable assignments, which it replaces atomically:
+
+   DCARP_INTERFACE=carp0
+   DCARP_ADDRESS=192.0.2.10
+   DCARP_NETMASK=255.255.255.0
+   DCARP_GATEWAY=192.0.2.1
+   DCARP_GENERATION=1793625676
+
+   ifstated(8) sources the file and routes via DCARP_GATEWAY when the
+   CARP interface becomes Master, and via the peer member on an internal
+   network when it becomes Backup.  A complete ifstated configuration is
+   distributed with the implementation.
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 14]
+
+Internet-Draft                    DCARP                    November 2026
+
+
+   The implementation comes with regression tests that run two members
+   in separate routing domains of one host, including the split of
+   Section 9, replays, tampered and stale messages, and messages with
+   another key.
+
+Acknowledgments
+
+   DCARP builds on CARP, written for OpenBSD.
+
+Author's Address
+
+   Niklas Hallqvist
+   Appli
+   Email: niklas+dcarp@appli.se
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Hallqvist                  Expires 6 May 2027                  [Page 15]
