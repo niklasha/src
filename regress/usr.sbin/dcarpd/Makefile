@@ -40,14 +40,11 @@ regress:
 
 TESTS =		route-change route-add other-carp log-live \
 		replay tampered wrong-key encrypted sync-interface \
-		periodic address-change split-brain stale
+		periodic address-change split-brain address-follow \
+		older-generation lower-priority stale
 
 # Waits for a recorded message to age out.
 REGRESS_SLOW_TARGETS +=	stale
-
-# carp(4) authenticates the virtual addresses: when the master's address
-# changes, the backup becomes master too.  Not solved yet.
-REGRESS_EXPECTED_FAILURES +=	split-brain
 
 .for t in ${TESTS}
 REGRESS_TARGETS +=	$t

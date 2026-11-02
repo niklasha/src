@@ -32,7 +32,9 @@
 #
 # usage: dcarpd-test route-change | route-add | other-carp | log-live |
 #	 replay | tampered | wrong-key | encrypted | sync-interface |
-#	 periodic | address-change | split-brain | stale
+#	 periodic | address-change | split-brain | address-follow |
+#	 older-generation |
+#	 lower-priority | stale
 
 : ${OBJDIR?} ${DCARPD?} ${REPLAY?}
 
@@ -106,6 +108,14 @@ route_is() {	# $1 = gateway
 	[ "$(defroute)" = $1 ]
 }
 
+addresses() {	# $1 = interface
+	echo $(ifconfig $1 | awk '$1 == "inet" { print $2 }')
+}
+
+only_address() {	# $1 = interface, $2 = address
+	[ "$(addresses $1)" = $2 ]
+}
+
 listening() {	# $1 = pid
 	fstat -p $1 2>/dev/null | grep -q ':3522'
 }
@@ -127,6 +137,11 @@ mkcarp() {	# $1 = if, $2 = rdomain, $3 = carpdev, $4 = vhid, $5 = advskew,
 }
 
 setup() {	# $1 = "default" to give the backup an internal default route
+	# A DHCP lease of the carp interfaces would set their generation
+	for i in carp$RB carp$RM; do
+		[ ! -e /var/db/dhcpleased/$i ] ||
+		    fail "/var/db/dhcpleased/$i exists, generations would differ"
+	done
 	run ifconfig veb77 create
 	run ifconfig veb77 up
 	run ifconfig veb79 create
@@ -219,8 +234,9 @@ replay() {	# extra dcarp-replay arguments
 	run route -T $RA exec $REPLAY -i vport$RA "$@" send $MSG
 }
 
-rejected() {	# $1 = source address, $2 = reason (regular expression)
-	grep -q "rejected message from $1: $2" $BLOG
+rejected() {	# $1 = source address, $2 = reason (regular expression),
+		# $3 = log, the backup's by default
+	grep -q "rejected message from $1: $2" ${3:-$BLOG}
 }
 
 case $1 in
@@ -324,7 +340,7 @@ encrypted)
 	*0a4d004d*)	fail "carp address 10.77.0.77 in clear text: $hex";;
 	*0a4d00fe*)	fail "gateway 10.77.0.254 in clear text: $hex";;
 	esac
-	[ ${#hex} -eq 160 ] || fail "captured ${#hex} hex digits, expected 160"
+	[ ${#hex} -eq 192 ] || fail "captured ${#hex} hex digits, expected 192"
 	;;
 sync-interface)
 	# With -s only messages on the sync interface are accepted.
@@ -373,22 +389,97 @@ address-change)
 	stop_master
 	;;
 split-brain)
-	# Known problem, expected to fail: carp(4) authenticates the virtual
-	# addresses, so when the master's address changes the backup
-	# discards its advertisements and becomes master as well.  As
-	# master, dcarpd then ignores the new configuration.
+	# Both nodes master, with different addresses: carp(4)
+	# authenticates the virtual addresses, so each discards the other's
+	# advertisements.  Cut the backup off, change the master's address,
+	# wait until the backup has become master, and reconnect it.  The
+	# backup must take the newer configuration from the master's next
+	# resend although it is master, keep no old address, and return to
+	# backup; the master must reject the backup's older configuration.
+	setup default
+	start_backup
+	start_master $PREFIX.254
+	retry route_is $PREFIX.254 ||
+	    fail "default route not changed to $PREFIX.254"
+	run ifconfig veb77 del vport$RB
+	run ifconfig carp$RM inet $PREFIX.78/24
+	retry carp_is carp$RB MASTER || fail "cut off carp$RB did not become MASTER"
+	retry carp_is carp$RM MASTER || fail "carp$RM did not become MASTER again"
+	run ifconfig veb77 add vport$RB
+	retry_for 15 only_address carp$RB $PREFIX.78 ||
+	    fail "carp$RB has $(addresses carp$RB), not only $PREFIX.78"
+	retry carp_is carp$RB BACKUP || fail "carp$RB did not return to BACKUP"
+	stop_backup
+	stop_master
+	grep -q "Gateway IP: $PREFIX.254, taking it although not backup" $BLOG ||
+	    fail "backup did not take the configuration as master"
+	rejected $PREFIX.77 "older configuration" $MLOG ||
+	    fail "master did not reject the backup's older configuration"
+	;;
+address-follow)
+	# carp(4) authenticates the virtual addresses, so when the master's
+	# address changes the backup discards its advertisements and may
+	# become master before the new address reaches it.  Whichever wins
+	# that race, the backup must take the new address, keep no old one,
+	# and return to backup.
 	setup default
 	start_backup
 	start_master $PREFIX.254
 	retry route_is $PREFIX.254 ||
 	    fail "default route not changed to $PREFIX.254"
 	run ifconfig carp$RM inet $PREFIX.78/24
-	sleep 10
+	retry_for 15 only_address carp$RB $PREFIX.78 ||
+	    fail "carp$RB has $(addresses carp$RB), not only $PREFIX.78"
+	sleep 5
 	state=$(ifconfig carp$RB | sed -n 's/.*carp: \([A-Z]*\) .*/\1/p')
 	[ "$state" = BACKUP ] ||
 	    fail "carp$RB is $state after the master's address changed"
 	stop_backup
 	stop_master
+	;;
+older-generation)
+	# A configuration older than the one held is rejected.  Here a
+	# master restarted without a DHCP lease, generation 0, sends another
+	# gateway after the backup took a new address of a later generation.
+	# The same rule keeps a backup that has briefly become master from
+	# giving the old address back to the master.
+	setup default
+	start_backup
+	start_master $PREFIX.254
+	retry route_is $PREFIX.254 ||
+	    fail "default route not changed to $PREFIX.254"
+	run ifconfig carp$RM inet $PREFIX.78/24
+	retry_for 15 only_address carp$RB $PREFIX.78 ||
+	    fail "carp$RB has $(addresses carp$RB), not only $PREFIX.78"
+	stop_master
+	start_master $PREFIX.253
+	sleep 3
+	route_is $PREFIX.254 ||
+	    fail "older configuration changed the default route to $(defroute)"
+	stop_backup
+	stop_master
+	rejected $PREFIX.78 "older configuration" ||
+	    fail "older configuration not logged"
+	;;
+lower-priority)
+	# Within one generation, a sender of lower carp(4) priority is
+	# rejected: a backup forced to master does not impose its
+	# configuration on the master.
+	setup default
+	start_backup
+	start_master $PREFIX.254
+	retry route_is $PREFIX.254 ||
+	    fail "default route not changed to $PREFIX.254"
+	before=$(route -T $RM -n show -inet | awk '$1 == "default" { print $2 }')
+	run ifconfig carp$RB state master
+	sleep 3
+	gw=$(route -T $RM -n show -inet | awk '$1 == "default" { print $2 }')
+	[ "$gw" = "$before" ] ||
+	    fail "master's default route changed from '$before' to '$gw'"
+	stop_backup
+	stop_master
+	grep -q "rejected message from $PREFIX.77: configuration .* no better priority" $MLOG ||
+	    fail "lower priority not logged by the master"
 	;;
 stale)
 	# A recorded message is rejected once it is too old, also by a
@@ -411,7 +502,8 @@ stale)
 	echo "usage: dcarpd-test route-change | route-add | other-carp |" \
 	    "log-live | replay | tampered | wrong-key | encrypted |" \
 	    "sync-interface | periodic | address-change | split-brain |" \
-	    "stale" >&2
+	    "address-follow |" \
+	    "older-generation | lower-priority | stale" >&2
 	exit 2
 	;;
 esac
