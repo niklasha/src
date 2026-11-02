@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,6 +78,14 @@ struct event send_timer;
 
 /* What we last sent as master and applied as backup */
 struct dcarp_config last_sent, last_applied;
+
+/*
+ * The generation of the configuration we hold, and the carp address that
+ * goes with it, to tell address changes from outside, e.g. by dhcpleased,
+ * from our own.
+ */
+int64_t my_generation;
+in_addr_t known_ip;
 
 /* Additional data bound to every message, separating it from other uses */
 static const unsigned char dcarp_ad[] = "DCARP 1";
@@ -339,6 +348,7 @@ int distribute_ip_addresses() {
 	struct dcarp_message message;
 	char carp_ip_str[INET_ADDRSTRLEN];
 	char netmask_str[INET_ADDRSTRLEN];
+	uint32_t demote;
 	int rv;
 
 	memset(&message, 0, sizeof(message));
@@ -359,6 +369,14 @@ int distribute_ip_addresses() {
 	message.sender = htobe64(my_sender);
 	message.sequence = htobe64(++my_sequence);
 	message.timestamp = htobe64(time(NULL));
+	/* dhcpleased renews the lease without changing the address */
+	if (lease_generation() > my_generation)
+		my_generation = lease_generation();
+	message.generation = htobe64(my_generation);
+	if (get_carp_priority(global_options.interface_name, &demote,
+	    &message.advbase, &message.advskew) != 0)
+		return (-1);
+	message.demote = htonl(demote);
 
 	rv = send_message(&message);
 	if (rv != 0)
@@ -374,9 +392,12 @@ int distribute_ip_addresses() {
 	inet_ntop(AF_INET, &message.carp_ip, carp_ip_str, sizeof(carp_ip_str));
 	inet_ntop(AF_INET, &message.netmask, netmask_str, sizeof(netmask_str));
 	log_message(LOG_INFO, "sent %s netmask %s gateway %s on %s "
-	    "(sender %016llx sequence %llu)", carp_ip_str, netmask_str,
+	    "(sender %016llx sequence %llu generation %lld priority "
+	    "%u/%u/%u)", carp_ip_str, netmask_str,
 	    global_options.gateway_ip, global_options.sync_interface,
-	    (unsigned long long)my_sender, (unsigned long long)my_sequence);
+	    (unsigned long long)my_sender, (unsigned long long)my_sequence,
+	    (long long)my_generation, demote, message.advbase,
+	    message.advskew);
 	config_record(&last_sent, &message);
 	return (0);
 }
@@ -396,6 +417,9 @@ int process_received_message(const struct dcarp_message *message,
 	char netmask_str[INET_ADDRSTRLEN];
 	char gateway_ip_str[INET_ADDRSTRLEN];
 	char from_str[INET_ADDRSTRLEN];
+	uint32_t demote, their_prio, my_prio;
+	uint8_t advbase, advskew;
+	int64_t gen;
 
 	switch (ntohl(message->message_type)) {
         case MSG_TYPE_IP_DISTRIBUTION:
@@ -404,31 +428,72 @@ int process_received_message(const struct dcarp_message *message,
 		inet_ntop(AF_INET, &message->gateway_ip, gateway_ip_str, INET_ADDRSTRLEN);
 		inet_ntop(AF_INET, &from->sin_addr, from_str, INET_ADDRSTRLEN);
 
+		/* Our own message, looped back */
+		if (be64toh(message->sender) == my_sender)
+			return (0);
+
+		/*
+		 * Whatever our state: the newest configuration wins, by the
+		 * generation, the time its address was obtained, and within
+		 * one generation the sender with the better carp(4)
+		 * priority.  So a backup that has become master because the
+		 * master's address changed, and with it the carp
+		 * authentication, takes the new address and returns to
+		 * backup; and the master, while carp restarts after the
+		 * change, does not take the old address back from it.
+		 */
+		gen = (int64_t)be64toh(message->generation);
+		their_prio = priority_key(ntohl(message->demote),
+		    message->advbase, message->advskew);
+		if (get_carp_priority(global_options.interface_name, &demote,
+		    &advbase, &advskew) != 0)
+			return (-1);
+		my_prio = priority_key(demote, advbase, advskew);
+		if (gen < my_generation) {
+			log_rejected(from, "older configuration %s gateway %s "
+			    "(generation %lld, ours %lld)", carp_ip_str,
+			    gateway_ip_str, (long long)gen,
+			    (long long)my_generation);
+			return (0);
+		}
+		if (gen == my_generation && their_prio >= my_prio) {
+			if (config_matches(&last_applied, message))
+				return (0);
+			log_rejected(from, "configuration %s gateway %s from a "
+			    "sender of no better priority (%u/%u/%u, ours "
+			    "%u/%u/%u)", carp_ip_str, gateway_ip_str,
+			    ntohl(message->demote), message->advbase,
+			    message->advskew, demote, advbase, advskew);
+			return (0);
+		}
+		my_generation = gen;
+
 		/*
 		 * A master resends every DCARP_INTERVAL seconds; only a
 		 * changed configuration is logged without -v and applied.
 		 */
-		if (current_carp_state != CARP_STATE_BACKUP ||
-		    config_matches(&last_applied, message)) {
+		if (config_matches(&last_applied, message)) {
 			log_message(LOG_DEBUG, "Received IP distribution message "
 			    "from %s (sender %016llx sequence %llu): CARP IP: %s, "
-			    "Netmask: %s, Gateway IP: %s%s", from_str,
+			    "Netmask: %s, Gateway IP: %s, unchanged", from_str,
 			    (unsigned long long)be64toh(message->sender),
 			    (unsigned long long)be64toh(message->sequence),
-			    carp_ip_str, netmask_str, gateway_ip_str,
-			    current_carp_state == CARP_STATE_BACKUP ?
-			    ", unchanged" : ", not backup");
+			    carp_ip_str, netmask_str, gateway_ip_str);
 			return (0);
 		}
 		log_message(LOG_INFO, "Received IP distribution message from %s "
-		    "(sender %016llx sequence %llu): CARP IP: %s, Netmask: %s, "
-		    "Gateway IP: %s", from_str,
+		    "(sender %016llx sequence %llu generation %lld): CARP IP: "
+		    "%s, Netmask: %s, Gateway IP: %s%s", from_str,
 		    (unsigned long long)be64toh(message->sender),
 		    (unsigned long long)be64toh(message->sequence),
-		    carp_ip_str, netmask_str, gateway_ip_str);
+		    (long long)gen, carp_ip_str, netmask_str, gateway_ip_str,
+		    current_carp_state == CARP_STATE_BACKUP ? "" :
+		    ", taking it although not backup");
 		if (global_options.dry_run) {
 			log_message(LOG_WARNING, "Dry-run mode: Skipping network reconfiguration.");
 		} else {
+			/* Our own address change, not one from outside */
+			known_ip = message->carp_ip;
 			/* On failure, the next resend tries again */
 			if (configure_interface(global_options.interface_name, message->carp_ip, message->netmask) != 0)
 				return (-1);
@@ -503,40 +568,99 @@ void handle_master_transition() {
 	}
 }
 
+/*
+ * Make the given address the only IPv4 address of the interface.  carp(4)
+ * authenticates its advertisements over all of them, so an old address
+ * left as an alias keeps the backup from accepting the master's.  Every
+ * change restarts carp on the interface, so change nothing if the address
+ * is there already, and add the new address before removing the others:
+ * without any address carp stays in INIT.
+ */
 int configure_interface(const char *interface, const in_addr_t ip, const in_addr_t netmask) {
-	int sockfd;
-	struct in_aliasreq ifra;
+	struct ifaddrs *ifaddr, *ifa;
 	struct sockaddr_in *sin;
+	struct in_aliasreq ifra;
 	char carp_ip_str[INET_ADDRSTRLEN];
 	char netmask_str[INET_ADDRSTRLEN];
+	char old_str[INET_ADDRSTRLEN];
+	int sockfd, have = 0, others = 0, rv = 0;
 
+	if (getifaddrs(&ifaddr) == -1) {
+		log_perror("getifaddrs");
+		return (-1);
+	}
+	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET ||
+		    strcmp(ifa->ifa_name, interface) != 0)
+			continue;
+		if (((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr == ip &&
+		    ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr ==
+		    netmask)
+			have = 1;
+		else
+			others++;
+	}
+	if (have && others == 0) {
+		freeifaddrs(ifaddr);
+		return (0);
+	}
+
+	inet_ntop(AF_INET, &ip, carp_ip_str, INET_ADDRSTRLEN);
+	inet_ntop(AF_INET, &netmask, netmask_str, INET_ADDRSTRLEN);
 	sockfd = socket(PF_INET, SOCK_DGRAM, 0);
 	if (sockfd < 0) {
 		log_perror("socket");
+		freeifaddrs(ifaddr);
 		return (-1);
 	}
 
-	memset(&ifra, 0, sizeof(ifra));
-	strncpy(ifra.ifra_name, interface, sizeof(ifra.ifra_name));
-	sin = (struct sockaddr_in *)&ifra.ifra_addr;
-	sin->sin_len = sizeof(*sin);	/* the kernel rejects sin_len 0 */
-	sin->sin_family = AF_INET;
-	sin->sin_addr.s_addr = ip;
-	sin = (struct sockaddr_in *)&ifra.ifra_mask;
-	sin->sin_len = sizeof(*sin);
-	sin->sin_family = AF_INET;
-	sin->sin_addr.s_addr = netmask;
-	if (ioctl(sockfd, SIOCAIFADDR, &ifra) < 0) {
-		log_perror("ioctl SIOCAIFADDR");
-		inet_ntop(AF_INET, &ip, carp_ip_str, INET_ADDRSTRLEN);
-		inet_ntop(AF_INET, &netmask, netmask_str, INET_ADDRSTRLEN);
-		log_message(LOG_ERR, "IP: %s, Netmask: %s", carp_ip_str, netmask_str);
-		close(sockfd);
-		return (-1);
+	if (!have) {
+		memset(&ifra, 0, sizeof(ifra));
+		strlcpy(ifra.ifra_name, interface, sizeof(ifra.ifra_name));
+		sin = (struct sockaddr_in *)&ifra.ifra_addr;
+		sin->sin_len = sizeof(*sin);	/* the kernel rejects sin_len 0 */
+		sin->sin_family = AF_INET;
+		sin->sin_addr.s_addr = ip;
+		sin = (struct sockaddr_in *)&ifra.ifra_mask;
+		sin->sin_len = sizeof(*sin);
+		sin->sin_family = AF_INET;
+		sin->sin_addr.s_addr = netmask;
+		if (ioctl(sockfd, SIOCAIFADDR, &ifra) < 0) {
+			log_perror("ioctl SIOCAIFADDR");
+			log_message(LOG_ERR, "IP: %s, Netmask: %s", carp_ip_str, netmask_str);
+			rv = -1;
+			goto out;
+		}
+		log_message(LOG_NOTICE, "%s: added %s netmask %s", interface,
+		    carp_ip_str, netmask_str);
 	}
 
+	/* Remove the other addresses; one with our address got the netmask */
+	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET ||
+		    strcmp(ifa->ifa_name, interface) != 0 ||
+		    ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr == ip)
+			continue;
+		memset(&ifra, 0, sizeof(ifra));
+		strlcpy(ifra.ifra_name, interface, sizeof(ifra.ifra_name));
+		memcpy(&ifra.ifra_addr, ifa->ifa_addr, sizeof(struct sockaddr_in));
+		inet_ntop(AF_INET,
+		    &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, old_str,
+		    INET_ADDRSTRLEN);
+		if (ioctl(sockfd, SIOCDIFADDR, &ifra) < 0) {
+			log_perror("ioctl SIOCDIFADDR");
+			log_message(LOG_ERR, "%s: could not remove %s", interface,
+			    old_str);
+			rv = -1;
+			continue;
+		}
+		log_message(LOG_NOTICE, "%s: removed %s", interface, old_str);
+	}
+
+out:
 	close(sockfd);
-	return (0);
+	freeifaddrs(ifaddr);
+	return (rv);
 }
 
 int configure_default_gateway(const in_addr_t gateway_ip) {
@@ -636,6 +760,112 @@ int get_carp_interface_state(const char *if_name) {
 	return (carpr.carpr_states[0]);
 }
 
+/* Lower is better, ordered as carp(4) orders advertisements */
+uint32_t priority_key(uint32_t demote, uint8_t advbase, uint8_t advskew) {
+	return ((demote << 16) | (advbase << 8) | advskew);
+}
+
+/*
+ * Our carp(4) priority: the demote count, summed over the interface's
+ * groups like carp_group_demote_count() does, and advbase and advskew.
+ */
+int get_carp_priority(const char *if_name, uint32_t *demote, uint8_t *advbase,
+    uint8_t *advskew) {
+	struct ifgroupreq ifgr, ifga;
+	struct ifg_req *ifg;
+	struct carpreq carpr;
+	struct ifreq ifr;
+	unsigned int len;
+	int sockfd, rv = -1;
+
+	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sockfd < 0) {
+		log_perror("socket");
+		return (-1);
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	memset(&carpr, 0, sizeof(carpr));
+	strlcpy(ifr.ifr_name, if_name, sizeof(ifr.ifr_name));
+	ifr.ifr_data = (caddr_t)&carpr;
+	if (ioctl(sockfd, SIOCGVH, &ifr) < 0) {
+		log_perror("ioctl SIOCGVH");
+		goto out;
+	}
+	*advbase = carpr.carpr_advbase;
+	*advskew = carpr.carpr_advskews[0];
+
+	memset(&ifgr, 0, sizeof(ifgr));
+	strlcpy(ifgr.ifgr_name, if_name, sizeof(ifgr.ifgr_name));
+	if (ioctl(sockfd, SIOCGIFGROUP, &ifgr) < 0) {
+		log_perror("ioctl SIOCGIFGROUP");
+		goto out;
+	}
+	len = ifgr.ifgr_len;
+	if ((ifgr.ifgr_groups = calloc(1, len)) == NULL) {
+		log_perror("calloc");
+		goto out;
+	}
+	if (ioctl(sockfd, SIOCGIFGROUP, &ifgr) < 0) {
+		log_perror("ioctl SIOCGIFGROUP");
+		free(ifgr.ifgr_groups);
+		goto out;
+	}
+	*demote = 0;
+	for (ifg = ifgr.ifgr_groups; len >= sizeof(*ifg); ifg++,
+	    len -= sizeof(*ifg)) {
+		memset(&ifga, 0, sizeof(ifga));
+		strlcpy(ifga.ifgr_name, ifg->ifgrq_group,
+		    sizeof(ifga.ifgr_name));
+		if (ioctl(sockfd, SIOCGIFGATTR, &ifga) == 0)
+			*demote += ifga.ifgr_attrib.ifg_carp_demoted;
+	}
+	free(ifgr.ifgr_groups);
+	if (*demote > 255)
+		*demote = 255;
+	rv = 0;
+out:
+	close(sockfd);
+	return (rv);
+}
+
+/* Whether the interface has the given IPv4 address */
+int interface_has_address(const char *if_name, in_addr_t ip) {
+	struct ifaddrs *ifaddr, *ifa;
+	int found = 0;
+
+	if (getifaddrs(&ifaddr) == -1) {
+		log_perror("getifaddrs");
+		return (0);
+	}
+	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr != NULL &&
+		    ifa->ifa_addr->sa_family == AF_INET &&
+		    strcmp(ifa->ifa_name, if_name) == 0 &&
+		    ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr == ip) {
+			found = 1;
+			break;
+		}
+	}
+	freeifaddrs(ifaddr);
+	return (found);
+}
+
+/*
+ * The generation of a DHCP-provisioned carp address: when dhcpleased last
+ * wrote the lease of the interface, or 0 if there is none.
+ */
+int64_t lease_generation(void) {
+	char path[PATH_MAX];
+	struct stat st;
+
+	snprintf(path, sizeof(path), "%s/%s", DCARP_LEASE_DIR,
+	    global_options.interface_name);
+	if (stat(path, &st) < 0)
+		return (0);
+	return (st.st_mtime);
+}
+
 int get_interface_ip_and_netmask(const char *if_name, in_addr_t *ip, in_addr_t *netmask) {
 	struct ifaddrs *ifaddr, *ifa;
 	struct sockaddr_in *sa;
@@ -682,6 +912,7 @@ void routing_callback(int fd, short event, void *arg) {
 	case RTM_NEWADDR:
 	case RTM_DELADDR: {
 		struct ifa_msghdr *ifam = (struct ifa_msghdr *)msg;
+		char ip_str[INET_ADDRSTRLEN];
 		in_addr_t ip, netmask;
 
 		if (n < sizeof(*ifam) || ifam->ifam_index != carp_ifindex)
@@ -691,16 +922,13 @@ void routing_callback(int fd, short event, void *arg) {
 		    global_options.interface_name);
 
 		/*
-		 * The master's address changed, e.g. a new DHCP lease:
-		 * tell the backups now rather than at the next resend.  A
-		 * renewal may remove the old address before adding the new.
-		 * Changing the addresses of a carp(4) interface usually
-		 * sends it through INIT, and it cannot send until it is
-		 * master again; RTM_IFINFO for that follows, and we send
-		 * then.  So ask the kernel rather than trusting our state,
-		 * which the queued RTM_IFINFO has not updated yet.
+		 * While the address we know is there, this is our own change
+		 * or one in progress: a renewal may add the new address
+		 * before removing the old, or the other way around.
 		 */
-		if (current_carp_state != CARP_STATE_MASTER)
+		if (known_ip != INADDR_ANY &&
+		    interface_has_address(global_options.interface_name,
+		    known_ip))
 			break;
 		if (get_interface_ip_and_netmask(global_options.interface_name,
 		    &ip, &netmask) != 0) {
@@ -708,15 +936,35 @@ void routing_callback(int fd, short event, void *arg) {
 			    global_options.interface_name);
 			break;
 		}
+
+		/*
+		 * A new address from outside, e.g. a new DHCP lease: a new
+		 * generation, which wins over the old configuration
+		 * wherever it is.
+		 */
+		known_ip = ip;
+		my_generation = time(NULL);
+		inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
+		log_message(LOG_INFO, "address of %s changed to %s, generation "
+		    "%lld", global_options.interface_name, ip_str,
+		    (long long)my_generation);
+
+		/*
+		 * As master, tell the backups now rather than at the next
+		 * resend.  Changing the addresses of a carp(4) interface
+		 * usually sends it through INIT, and it cannot send until
+		 * it is master again; RTM_IFINFO for that follows, and we
+		 * send then.  So ask the kernel rather than trusting our
+		 * state, which the queued RTM_IFINFO has not updated yet.
+		 */
+		if (current_carp_state != CARP_STATE_MASTER)
+			break;
 		if (get_carp_interface_state(global_options.interface_name) !=
 		    CARP_STATE_MASTER) {
-			log_message(LOG_INFO, "address of %s changed, sending "
-			    "when it is master again",
+			log_message(LOG_INFO, "sending when %s is master again",
 			    global_options.interface_name);
 			break;
 		}
-		log_message(LOG_INFO, "address of %s changed, sending",
-		    global_options.interface_name);
 		distribute_ip_addresses();
 		break;
 	}
@@ -789,6 +1037,7 @@ void multicast_callback(int fd, short event, void *arg) {
 }
 
 int main(int argc, char *argv[]) {
+	in_addr_t ip, netmask;
 	int ch;
 
 	while ((ch = getopt(argc, argv, "dnvi:g:k:s:")) != -1) {
@@ -856,6 +1105,18 @@ int main(int argc, char *argv[]) {
 	aead_ctx = read_keyfile(global_options.keyfile_path);
 	if (aead_ctx == NULL)
 		goto err;
+
+	/*
+	 * Start with the address the carp interface has, if any, and the
+	 * time of its DHCP lease as its generation: without a lease, any
+	 * configuration received from a master wins.
+	 */
+	if (get_interface_ip_and_netmask(global_options.interface_name, &ip,
+	    &netmask) == 0)
+		known_ip = ip;
+	my_generation = lease_generation();
+	log_message(LOG_INFO, "generation %lld%s", (long long)my_generation,
+	    my_generation ? " from the DHCP lease" : ", no DHCP lease");
     
 	signal(SIGINT, handle_signal);
 	signal(SIGHUP, handle_signal);

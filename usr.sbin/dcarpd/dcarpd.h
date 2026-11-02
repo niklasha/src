@@ -53,8 +53,17 @@ struct dcarp_message {
 	uint64_t sender;	/* random, chosen when the sender starts */
 	uint64_t sequence;	/* per sender, starts at 1 */
 	int64_t timestamp;	/* seconds since the epoch */
+	int64_t generation;	/* when the carp address was obtained; newer
+				   configurations win */
+	uint32_t demote;	/* the sender's carp(4) demote count, advbase */
+	uint8_t advbase;	/* and advskew: the priority that decides */
+	uint8_t advskew;	/* between configurations of one generation */
+	uint16_t reserved;
 	// Future fields (e.g., DNS servers) can be noted here for later implementation
 };
+
+/* The DHCP lease of the carp interface, whose time is the generation */
+#define DCARP_LEASE_DIR		"/var/db/dhcpleased"
 
 /* A configuration last sent or applied, to notice changes */
 struct dcarp_config {
@@ -83,6 +92,10 @@ int configure_default_gateway(const in_addr_t);
 int configure_interface(const char *, in_addr_t, in_addr_t);
 void daemonize(void);
 int determine_carp_state(struct if_msghdr *);
+int get_carp_priority(const char *, uint32_t *, uint8_t *, uint8_t *);
+int interface_has_address(const char *, in_addr_t);
+int64_t lease_generation(void);
+uint32_t priority_key(uint32_t, uint8_t, uint8_t);
 int distribute_ip_addresses(void);
 int get_interface_ip_and_netmask(const char *, in_addr_t *, in_addr_t *);
 void handle_signal(int sig);
