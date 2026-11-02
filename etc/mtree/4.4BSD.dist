@@ -559,6 +559,8 @@ var
     db
         acpi
 	..
+        dcarpd
+	..
         dhcp6leased
 	..
         dhcpleased
