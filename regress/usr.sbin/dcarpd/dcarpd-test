@@ -31,7 +31,7 @@
 # The Makefile skips the test when any of these interfaces exist.
 #
 # usage: dcarpd-test route-change | route-add | other-carp | log-live |
-#	 replay | bad-hmac | sync-interface | stale
+#	 replay | tampered | wrong-key | encrypted | sync-interface | stale
 
 : ${OBJDIR?} ${DCARPD?} ${REPLAY?}
 
@@ -256,19 +256,48 @@ replay)
 	stop_backup
 	rejected $PREFIX.$RA "replay: " || fail "replay not logged"
 	;;
-bad-hmac)
-	# A message with a changed gateway is rejected.
+tampered)
+	# A message with a changed byte in the encrypted gateway field is
+	# rejected.  The wire format is a 24 byte nonce and the encrypted
+	# message, in which the gateway is at offset 12.
 	setup default
 	start_backup
 	capture
 	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
 	wait_capture
-	replay -x 12
+	replay -x 36
 	sleep 2
 	route_is $PREFIX.254 ||
 	    fail "tampered message changed the default route to $(defroute)"
 	stop_backup
-	rejected $PREFIX.$RA "invalid HMAC" || fail "invalid HMAC not logged"
+	rejected $PREFIX.$RA "authentication failed" ||
+	    fail "tampered message not logged"
+	;;
+wrong-key)
+	# A master with another key is rejected.
+	setup default
+	(umask 077; echo another-key > $KEY.other) || fail "cannot write key"
+	start_backup
+	! master $PREFIX.254 -k $KEY.other ||
+	    fail "message with another key changed the default route"
+	stop_backup
+	rejected $PREFIX.77 "authentication failed" ||
+	    fail "message with another key not logged"
+	;;
+encrypted)
+	# Neither the carp address nor the gateway is visible on the wire.
+	setup default
+	start_backup
+	capture
+	master $PREFIX.254 || fail "default route not changed to $PREFIX.254"
+	wait_capture
+	stop_backup
+	hex=$(od -An -tx1 -v $MSG | tr -d ' \n')
+	case $hex in
+	*0a4d004d*)	fail "carp address 10.77.0.77 in clear text: $hex";;
+	*0a4d00fe*)	fail "gateway 10.77.0.254 in clear text: $hex";;
+	esac
+	[ ${#hex} -eq 160 ] || fail "captured ${#hex} hex digits, expected 160"
 	;;
 sync-interface)
 	# With -s only messages on the sync interface are accepted.
@@ -299,7 +328,8 @@ stale)
 	;;
 *)
 	echo "usage: dcarpd-test route-change | route-add | other-carp |" \
-	    "log-live | replay | bad-hmac | sync-interface | stale" >&2
+	    "log-live | replay | tampered | wrong-key | encrypted |" \
+	    "sync-interface | stale" >&2
 	exit 2
 	;;
 esac
