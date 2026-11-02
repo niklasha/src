@@ -38,7 +38,7 @@ regress:
 
 .endif
 
-TESTS =		route-change route-add other-carp log-live \
+TESTS =		state-file gateway-from-route other-carp log-live \
 		replay tampered wrong-key encrypted sync-interface \
 		periodic address-change split-brain address-follow \
 		older-generation lower-priority stale
@@ -57,6 +57,7 @@ $t: dcarp-replay
 dcarp-replay: dcarp-replay.c
 	${CC} ${CFLAGS} -Wall -Werror -o $@ ${.CURDIR}/dcarp-replay.c
 
-CLEANFILES +=	dcarp-replay dcarp.key dcarp.key.other dcarpd-*.log dcarpd-*.msg
+CLEANFILES +=	dcarp-replay dcarp.key dcarp.key.other dcarpd-*.log dcarpd-*.msg \
+		dcarpd-*.state
 
 .include <bsd.regress.mk>
