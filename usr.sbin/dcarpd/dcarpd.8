@@ -46,6 +46,19 @@ interface.
 Messages received on any other interface are rejected.
 .El
 .Pp
+As master,
+.Nm
+sends the address and netmask of the
+.Fl i
+interface and the
+.Fl g
+gateway when it becomes master,
+when that address changes,
+and every 10 seconds.
+As backup,
+it configures the address and the default route only when they differ
+from the ones it applied last.
+.Pp
 Messages are encrypted and authenticated with XChaCha20-Poly1305,
 keyed with the SHA-256 hash of the key file.
 At startup and when the key file is reread on

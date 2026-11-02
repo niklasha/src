@@ -159,7 +159,9 @@ DCARP operates on top of a standard CARP configuration, utilizing the existing C
 
     Configuration Distribution: Upon assuming the Master role, as determined by CARP, the Master node in a DCARP setup is responsible for broadcasting the current network configuration, including the shared IP address, netmask, and default gateway, to the Backup nodes.
 
-    Handling Network Changes: The Master node monitors for changes in network configuration and updates the Backup nodes by sending new DCARP messages reflecting these changes.
+    Handling Network Changes: The Master node monitors for changes in network configuration and updates the Backup nodes by sending new DCARP messages reflecting these changes, as soon as it can when the address of the CARP interface changes. On systems where changing the address restarts CARP on the interface, such as OpenBSD, that is when the node is Master again.
+
+    Periodic Resends: The Master node also repeats the current configuration at a fixed interval, so that Backup nodes that start later or miss a message still receive it. The interval must be shorter than the age limit of 4.2.1; the reference implementation uses 10 seconds.
 
 5.1.2 Backup Nodes
 
@@ -173,7 +175,7 @@ DCARP operates on top of a standard CARP configuration, utilizing the existing C
 
     Message Validation: DCARP messages received by Backup nodes must be authenticated (see 4.2) to ensure their authenticity and integrity.
 
-    Configuration Updates: Upon receiving a validated DCARP message, Backup nodes update their network configurations accordingly.
+    Configuration Updates: Upon receiving a validated DCARP message, Backup nodes update their network configurations accordingly, but only when the configuration differs from the one they applied last, so that periodic resends do not reconfigure the node. A node that becomes Backup applies the next configuration it receives in any case.
 
 5.3 Reliance on CARP for Master Election
 
