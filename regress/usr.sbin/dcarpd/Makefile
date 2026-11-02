@@ -41,7 +41,7 @@ regress:
 TESTS =		state-file gateway-from-route other-carp log-live \
 		replay tampered wrong-key encrypted sync-interface \
 		periodic address-change split-brain address-follow \
-		older-generation lower-priority stale
+		older-generation lower-priority backup-gateway-kept stale
 
 # Waits for a recorded message to age out.
 REGRESS_SLOW_TARGETS +=	stale
