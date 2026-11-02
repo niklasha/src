@@ -87,6 +87,12 @@ struct dcarp_config last_sent, last_applied;
 int64_t my_generation;
 in_addr_t known_ip;
 
+/*
+ * The backup gateway, -g, of the member we last took a configuration
+ * from: ours to use while we are backup.  Kept in the state file.
+ */
+in_addr_t learned_backup_gw;
+
 /* Additional data bound to every message, separating it from other uses */
 static const unsigned char dcarp_ad[] = "DCARP 1";
 
@@ -186,6 +192,7 @@ int config_matches(const struct dcarp_config *config,
 	return (config->valid && config->carp_ip == message->carp_ip &&
 	    config->netmask == message->netmask &&
 	    config->gateway_ip == message->gateway_ip &&
+	    config->backup_gateway == message->backup_gateway &&
 	    config->generation == message->generation);
 }
 
@@ -195,6 +202,7 @@ void config_record(struct dcarp_config *config,
 	config->carp_ip = message->carp_ip;
 	config->netmask = message->netmask;
 	config->gateway_ip = message->gateway_ip;
+	config->backup_gateway = message->backup_gateway;
 	config->generation = message->generation;
 }
 
@@ -351,6 +359,7 @@ int distribute_ip_addresses() {
 	char carp_ip_str[INET_ADDRSTRLEN];
 	char netmask_str[INET_ADDRSTRLEN];
 	char gateway_ip_str[INET_ADDRSTRLEN];
+	char backup_gw_str[INET_ADDRSTRLEN];
 	uint32_t demote;
 	int rv;
 
@@ -367,14 +376,17 @@ int distribute_ip_addresses() {
 	no_address = 0;
 
 	/*
-	 * The gateway of the carp network, for the backups to use when they
-	 * become master: -g, or else our default route through the carp
-	 * interface, or none.  main() has checked -g.
+	 * The gateway of the carp network, which the provider gives us, for
+	 * the backups to use when they become master: that of our default
+	 * route through the carp interface, or none.  And our own address on
+	 * the members' other network, -g, for them to use while they are
+	 * backup; main() has checked it.
 	 */
-	if (global_options.gateway_ip != NULL)
-		inet_pton(AF_INET, global_options.gateway_ip, &message.gateway_ip);
-	else if (get_default_gateway(&message.gateway_ip) != 0)
+	if (get_default_gateway(&message.gateway_ip) != 0)
 		message.gateway_ip = INADDR_ANY;
+	if (global_options.gateway_ip != NULL)
+		inet_pton(AF_INET, global_options.gateway_ip,
+		    &message.backup_gateway);
 
 	message.sender = htobe64(my_sender);
 	message.sequence = htobe64(++my_sequence);
@@ -403,16 +415,23 @@ int distribute_ip_addresses() {
 	inet_ntop(AF_INET, &message.netmask, netmask_str, sizeof(netmask_str));
 	inet_ntop(AF_INET, &message.gateway_ip, gateway_ip_str,
 	    sizeof(gateway_ip_str));
-	log_message(LOG_INFO, "sent %s netmask %s gateway %s on %s "
-	    "(sender %016llx sequence %llu generation %lld priority "
-	    "%u/%u/%u)", carp_ip_str, netmask_str,
+	inet_ntop(AF_INET, &message.backup_gateway, backup_gw_str,
+	    sizeof(backup_gw_str));
+	log_message(LOG_INFO, "sent %s netmask %s gateway %s backup gateway "
+	    "%s on %s (sender %016llx sequence %llu generation %lld "
+	    "priority %u/%u/%u)", carp_ip_str, netmask_str,
 	    message.gateway_ip != INADDR_ANY ? gateway_ip_str : "none",
+	    message.backup_gateway != INADDR_ANY ? backup_gw_str : "none",
 	    global_options.sync_interface,
 	    (unsigned long long)my_sender, (unsigned long long)my_sequence,
 	    (long long)my_generation, demote, message.advbase,
 	    message.advskew);
 	config_record(&last_sent, &message);
-	write_state_file(&message);
+	/*
+	 * Our own -g is no use to us: keep the backup gateway learned from
+	 * the members that were master before, for when we are backup again.
+	 */
+	write_state_file(&message, learned_backup_gw);
 	return (0);
 }
 
@@ -430,6 +449,7 @@ int process_received_message(const struct dcarp_message *message,
 	char carp_ip_str[INET_ADDRSTRLEN];
 	char netmask_str[INET_ADDRSTRLEN];
 	char gateway_ip_str[INET_ADDRSTRLEN];
+	char backup_gw_str[INET_ADDRSTRLEN];
 	char from_str[INET_ADDRSTRLEN];
 	uint32_t demote, their_prio, my_prio;
 	uint8_t advbase, advskew;
@@ -440,6 +460,7 @@ int process_received_message(const struct dcarp_message *message,
 		inet_ntop(AF_INET, &message->carp_ip, carp_ip_str, INET_ADDRSTRLEN);
 		inet_ntop(AF_INET, &message->netmask, netmask_str, INET_ADDRSTRLEN);
 		inet_ntop(AF_INET, &message->gateway_ip, gateway_ip_str, INET_ADDRSTRLEN);
+		inet_ntop(AF_INET, &message->backup_gateway, backup_gw_str, INET_ADDRSTRLEN);
 		inet_ntop(AF_INET, &from->sin_addr, from_str, INET_ADDRSTRLEN);
 
 		/* Our own message, looped back */
@@ -489,19 +510,21 @@ int process_received_message(const struct dcarp_message *message,
 		if (config_matches(&last_applied, message)) {
 			log_message(LOG_DEBUG, "Received IP distribution message "
 			    "from %s (sender %016llx sequence %llu): CARP IP: %s, "
-			    "Netmask: %s, Gateway IP: %s, unchanged", from_str,
+			    "Netmask: %s, Gateway IP: %s, Backup Gateway: %s, "
+			    "unchanged", from_str,
 			    (unsigned long long)be64toh(message->sender),
 			    (unsigned long long)be64toh(message->sequence),
-			    carp_ip_str, netmask_str, gateway_ip_str);
+			    carp_ip_str, netmask_str, gateway_ip_str,
+			    backup_gw_str);
 			return (0);
 		}
 		log_message(LOG_INFO, "Received IP distribution message from %s "
 		    "(sender %016llx sequence %llu generation %lld): CARP IP: "
-		    "%s, Netmask: %s, Gateway IP: %s%s", from_str,
-		    (unsigned long long)be64toh(message->sender),
+		    "%s, Netmask: %s, Gateway IP: %s, Backup Gateway: %s%s",
+		    from_str, (unsigned long long)be64toh(message->sender),
 		    (unsigned long long)be64toh(message->sequence),
 		    (long long)gen, carp_ip_str, netmask_str, gateway_ip_str,
-		    current_carp_state == CARP_STATE_BACKUP ? "" :
+		    backup_gw_str, current_carp_state == CARP_STATE_BACKUP ? "" :
 		    ", taking it although not backup");
 		/*
 		 * Set the address; the routes are left to ifstated(8) and
@@ -516,7 +539,9 @@ int process_received_message(const struct dcarp_message *message,
 			if (configure_interface(global_options.interface_name, message->carp_ip, message->netmask) != 0)
 				return (-1);
 		}
-		if (write_state_file(message) != 0)
+		/* The sender's -g is our gateway while we are backup */
+		learned_backup_gw = message->backup_gateway;
+		if (write_state_file(message, learned_backup_gw) != 0)
 			return (-1);
 		config_record(&last_applied, message);
 		break;
@@ -764,13 +789,16 @@ out:
 /*
  * Write the configuration we hold, as master or backup, for ifstated(8)
  * and other scripts to source: shell variable assignments, replaced
- * atomically.  The routes are theirs to set; this is what they need.
+ * atomically.  The routes are theirs to set; this is what they need: the
+ * gateway to use as master, and the one to use as backup.
  */
-int write_state_file(const struct dcarp_message *message) {
+int write_state_file(const struct dcarp_message *message,
+    in_addr_t backup_gateway) {
 	char tmp[PATH_MAX];
 	char carp_ip_str[INET_ADDRSTRLEN];
 	char netmask_str[INET_ADDRSTRLEN];
 	char gateway_ip_str[INET_ADDRSTRLEN] = "";
+	char backup_gw_str[INET_ADDRSTRLEN] = "";
 	long long gen = (long long)be64toh(message->generation);
 	FILE *f;
 	int fd;
@@ -780,6 +808,9 @@ int write_state_file(const struct dcarp_message *message) {
 	if (message->gateway_ip != INADDR_ANY)
 		inet_ntop(AF_INET, &message->gateway_ip, gateway_ip_str,
 		    sizeof(gateway_ip_str));
+	if (backup_gateway != INADDR_ANY)
+		inet_ntop(AF_INET, &backup_gateway, backup_gw_str,
+		    sizeof(backup_gw_str));
 
 	if (snprintf(tmp, sizeof(tmp), "%s.XXXXXXXXXX",
 	    global_options.state_file) >= (int)sizeof(tmp)) {
@@ -801,9 +832,10 @@ int write_state_file(const struct dcarp_message *message) {
 	    "DCARP_ADDRESS=%s\n"
 	    "DCARP_NETMASK=%s\n"
 	    "DCARP_GATEWAY=%s\n"
+	    "DCARP_BACKUP_GATEWAY=%s\n"
 	    "DCARP_GENERATION=%lld\n", global_options.interface_name,
 	    global_options.interface_name, carp_ip_str, netmask_str,
-	    gateway_ip_str, gen);
+	    gateway_ip_str, backup_gw_str, gen);
 	if (fflush(f) == EOF || fsync(fd) == -1) {
 		log_perror(tmp);
 		fclose(f);
@@ -817,9 +849,36 @@ int write_state_file(const struct dcarp_message *message) {
 		return (-1);
 	}
 	log_message(LOG_INFO, "wrote %s: address %s netmask %s gateway %s "
-	    "generation %lld", global_options.state_file, carp_ip_str,
-	    netmask_str, gateway_ip_str[0] ? gateway_ip_str : "none", gen);
+	    "backup gateway %s generation %lld", global_options.state_file,
+	    carp_ip_str, netmask_str,
+	    gateway_ip_str[0] ? gateway_ip_str : "none",
+	    backup_gw_str[0] ? backup_gw_str : "none", gen);
 	return (0);
+}
+
+/*
+ * The backup gateway our state file holds from before, if any: the -g of
+ * the member we last took a configuration from.  Started as master, we
+ * have heard from no other member yet, but need it when we become backup.
+ */
+in_addr_t read_state_backup_gateway(void) {
+	const char var[] = "DCARP_BACKUP_GATEWAY=";
+	char line[128];
+	in_addr_t gw = INADDR_ANY;
+	FILE *f;
+
+	if ((f = fopen(global_options.state_file, "r")) == NULL)
+		return (INADDR_ANY);
+	while (fgets(line, sizeof(line), f) != NULL) {
+		if (strncmp(line, var, sizeof(var) - 1) != 0)
+			continue;
+		line[strcspn(line, "\n")] = '\0';
+		if (inet_pton(AF_INET, line + sizeof(var) - 1, &gw) != 1)
+			gw = INADDR_ANY;
+		break;
+	}
+	fclose(f);
+	return (gw);
 }
 
 int get_carp_interface_state(const char *if_name) {
@@ -1215,6 +1274,7 @@ int main(int argc, char *argv[]) {
 			goto err;
 		}
 	}
+	learned_backup_gw = read_state_backup_gateway();
 
 	if (!global_options.foreground) {
 		daemonize();

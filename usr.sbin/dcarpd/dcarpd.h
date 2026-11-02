@@ -29,8 +29,9 @@ struct options {
 	char *keyfile_path;
 	char *interface_name;
 	char *sync_interface;	/* -s, carries the messages; default -i */
-	char *gateway_ip;	/* -g, the carp network's gateway as master;
-				   default the default route through -i */
+	char *gateway_ip;	/* -g, our address on another network of the
+				   members, their gateway while they are backup
+				   and we are master */
 	char *state_file;	/* -f, the configuration for ifstated(8) */
 	int foreground;
 	int verbose;
@@ -51,7 +52,10 @@ struct dcarp_message {
 	uint32_t message_type;
 	in_addr_t carp_ip;
 	in_addr_t netmask;
-	in_addr_t gateway_ip;
+	in_addr_t gateway_ip;	/* the carp network's gateway, from the ISP */
+	in_addr_t backup_gateway; /* the sender's -g: the others' gateway
+				   while they are backup */
+	uint32_t reserved32;
 	uint64_t sender;	/* random, chosen when the sender starts */
 	uint64_t sequence;	/* per sender, starts at 1 */
 	int64_t timestamp;	/* seconds since the epoch */
@@ -76,6 +80,7 @@ struct dcarp_config {
 	in_addr_t carp_ip;
 	in_addr_t netmask;
 	in_addr_t gateway_ip;
+	in_addr_t backup_gateway;
 	int64_t generation;
 };
 
@@ -95,7 +100,8 @@ struct dcarp_config {
 
 void close_multicast_socket(void);
 int get_default_gateway(in_addr_t *);
-int write_state_file(const struct dcarp_message *);
+int write_state_file(const struct dcarp_message *, in_addr_t);
+in_addr_t read_state_backup_gateway(void);
 int configure_interface(const char *, in_addr_t, in_addr_t);
 void daemonize(void);
 int determine_carp_state(struct if_msghdr *);
