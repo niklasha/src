@@ -8,7 +8,7 @@
 .Nm
 .Op Fl dnv
 .Op Fl f Ar state_file
-.Op Fl g Ar gateway
+.Op Fl g Ar backup_gateway
 .Fl i Ar interface
 .Op Fl k Ar key_file
 .Op Fl s Ar sync_interface
@@ -38,18 +38,14 @@ Write the configuration held to
 .Ar state_file
 instead of
 .Pa /var/db/dcarpd/ Ns Ar interface .
-.It Fl g Ar gateway
-The gateway on the network of the
+.It Fl g Ar backup_gateway
+This host's address on another network that it shares with the other
+members, typically an internal network.
+As master it announces it,
+and the other members use it as their gateway while they are backup and
+cannot reach the gateway of the
 .Fl i
-interface that this host announces as master,
-for example the ISP's router.
-Without
-.Fl g ,
-it announces the gateway of its default route if that goes through the
-.Fl i
-interface, as one added by
-.Xr dhcpleased 8 ,
-and else none.
+interface's network themselves.
 .It Fl i Ar interface
 The
 .Xr carp 4
@@ -80,7 +76,17 @@ As master,
 .Nm
 sends the address and netmask of the
 .Fl i
-interface and the gateway when it becomes master,
+interface,
+the gateway of that network,
+which it takes from its default route if that goes through the
+.Fl i
+interface, such as one
+.Xr dhcpleased 8
+adds from the lease,
+and its
+.Fl g
+backup gateway.
+It sends them when it becomes master,
 when that address changes,
 and every 10 seconds.
 .Pp
@@ -113,7 +119,10 @@ makes its address the only IPv4 address of the
 .Fl i
 interface and writes it to the state file,
 but only when it differs from the one it took last.
-As master it writes the configuration it sends.
+As master it writes the configuration it sends,
+but keeps the backup gateway it learned from the member that was master
+before, which it needs when it becomes backup again;
+its own is no use to it.
 The state file consists of
 .Xr sh 1
 variable assignments, replaced atomically:
@@ -127,12 +136,18 @@ Its address.
 .It Ev DCARP_NETMASK
 Its netmask.
 .It Ev DCARP_GATEWAY
-The gateway on its network, or empty if there is none.
+The gateway on its network, to use as master, or empty if there is none.
+.It Ev DCARP_BACKUP_GATEWAY
+The gateway to use as backup: the
+.Fl g
+address of the member that was master last,
+or empty if there is none.
 .It Ev DCARP_GENERATION
 The generation, in seconds since the Epoch.
 .El
 .Pp
-A backup thus knows the gateway the moment it becomes master.
+A backup thus knows the gateway the moment it becomes master,
+and a master the gateway to use the moment it becomes backup.
 .Pp
 Messages are encrypted and authenticated with XChaCha20-Poly1305,
 keyed with the SHA-256 hash of the key file.
@@ -166,14 +181,16 @@ The DHCP lease of the carp interface, whose time is the generation.
 Run
 .Nm
 on both firewalls of a pair, for carp0, whose address the master gets
-by DHCP:
+by DHCP, with the firewall's own address on the internal network:
 .Bd -literal -offset indent
-# dcarpd -i carp0
+# rcctl enable dcarpd
+# rcctl set dcarpd flags -i carp0 -g 192.168.1.2
+# rcctl start dcarpd
 .Ed
 .Pp
 In
 .Xr ifstated.conf 5 ,
-route via the gateway from the state file when carp0 becomes master,
+route via the gateways from the state file when carp0 changes state,
 and keep the current route if there is none:
 .Bd -literal -offset indent
 if carp0.link.up {
@@ -182,10 +199,16 @@ if carp0.link.up {
 	    { route -q delete default; \e
 	    route -q add default $DCARP_GATEWAY; }"
 }
+if carp0.link.down {
+	run "[ -r /var/db/dcarpd/carp0 ] && . /var/db/dcarpd/carp0 && \e
+	    [ -n \e"$DCARP_BACKUP_GATEWAY\e" ] && \e
+	    { route -q delete default; \e
+	    route -q add default $DCARP_BACKUP_GATEWAY; }"
+}
 .Ed
 .Pp
 A complete example, which also demotes the master if the gateway is
-unreachable and routes via the peer as backup, is in
+unreachable, is in
 .Pa /etc/examples/ifstated-dcarpd.conf .
 .Sh SEE ALSO
 .Xr carp 4 ,
