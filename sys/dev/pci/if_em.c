@@ -1968,6 +1968,19 @@ em_hardware_init(struct em_softc *sc)
 
 	em_disable_aspm(sc);
 
+	/*
+	 * em_init_hw() programs RAR[0] from hw.mac_addr, but at attach time
+	 * em_read_mac_addr() has not run yet, so an all-zero address with
+	 * the AV bit set would be written.  That makes management firmware
+	 * sharing the port (Intel ME/AMT) drop the link it is using.  Read
+	 * the address first.  The multi-function parts need bus_func for
+	 * this, which is not known yet, so limit it to the ICH/PCH family.
+	 */
+	if (sc->hw.mac_type >= em_ich8lan &&
+	    (sc->hw.mac_addr[0] | sc->hw.mac_addr[1] | sc->hw.mac_addr[2] |
+	    sc->hw.mac_addr[3] | sc->hw.mac_addr[4] | sc->hw.mac_addr[5]) == 0)
+		em_read_mac_addr(&sc->hw);
+
 	if ((ret_val = em_init_hw(sc)) != 0) {
 		if (ret_val == E1000_DEFER_INIT) {
 			INIT_DEBUGOUT("\nHardware Initialization Deferred ");
