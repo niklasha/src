@@ -1,4 +1,4 @@
-/* $OpenBSD: exchange.h,v 1.38 2026/10/03 01:31:30 deraadt Exp $	 */
+/* $OpenBSD: exchange.h,v 1.38.4.1 2026/11/04 15:06:59 bluhm Exp $	 */
 /* $EOM: exchange.h,v 1.28 2000/09/28 12:54:28 niklas Exp $	 */
 
 /*
@@ -224,6 +224,7 @@ struct exchange {
 #define EXCHANGE_FLAG_NAT_T_RFC		0x0080	/* Peer does RFC NAT-T. */
 #define EXCHANGE_FLAG_NAT_T_DRAFT	0x0100	/* Peer does draft NAT-T.*/
 #define EXCHANGE_FLAG_OPENBSD		0x0200	/* Peer is OpenBSD */
+#define EXCHANGE_FLAG_FINALIZED		0x0400	/* Finalize function called. */
 
 extern int      exchange_add_certs(struct message *);
 extern int      exchange_add_certreqs(struct message *);
