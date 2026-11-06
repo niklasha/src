@@ -473,11 +473,18 @@ gettdbbydst(u_int rdomain, union sockaddr_union *dst, u_int8_t sproto,
     struct sockaddr_encap *filter, struct sockaddr_encap *filtermask)
 {
 	u_int32_t hashval;
-	struct tdb *tdbp;
+	struct tdb *tdbp, *best = NULL;
 
 	mtx_enter(&tdb_sadb_mtx);
 	hashval = tdb_hash(0, dst, sproto);
 
+	/*
+	 * Several SAs may match, e.g. after rekeying, when the old SA lives
+	 * on until its lifetime ends although the peer has dropped it.  Use
+	 * the newest one, as the peer does.  The order of the hash chain is
+	 * no guide: a rehash reverses it, and SAs copied from a sasyncd(8)
+	 * peer come in snapshot order.
+	 */
 	for (tdbp = tdbdst[hashval]; tdbp != NULL; tdbp = tdbp->tdb_dnext)
 		if ((tdbp->tdb_sproto == sproto) &&
 		    (tdbp->tdb_rdomain == rdomain) &&
@@ -486,12 +493,14 @@ gettdbbydst(u_int rdomain, union sockaddr_union *dst, u_int8_t sproto,
 			/* Check whether IDs match */
 			if (!ipsp_aux_match(tdbp, ids, filter, filtermask))
 				continue;
-			break;
+			if (best == NULL ||
+			    tdbp->tdb_established > best->tdb_established)
+				best = tdbp;
 		}
 
-	tdb_ref(tdbp);
+	tdb_ref(best);
 	mtx_leave(&tdb_sadb_mtx);
-	return tdbp;
+	return best;
 }
 
 /*
