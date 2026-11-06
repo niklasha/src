@@ -90,6 +90,7 @@
 
 #if NPF > 0
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/pfvar.h>
 #endif
 
@@ -1092,6 +1093,36 @@ pfkeyv2_get_proto_alg(u_int8_t satype, u_int8_t *sproto, int *alg)
 /*
  * Handle all messages from userland to kernel.
  */
+/*
+ * Is the address one of ours (in this routing domain)?  Only the address
+ * counts: the sockaddr in a PF_KEY message may carry a port.
+ */
+static int
+pfkeyv2_local_address(union sockaddr_union *su, u_int rdomain)
+{
+	union sockaddr_union sa;
+
+	memset(&sa, 0, sizeof(sa));
+	switch (su->sa.sa_family) {
+	case AF_INET:
+		sa.sin.sin_family = AF_INET;
+		sa.sin.sin_len = sizeof(sa.sin);
+		sa.sin.sin_addr = su->sin.sin_addr;
+		break;
+#ifdef INET6
+	case AF_INET6:
+		sa.sin6.sin6_family = AF_INET6;
+		sa.sin6.sin6_len = sizeof(sa.sin6);
+		sa.sin6.sin6_addr = su->sin6.sin6_addr;
+		sa.sin6.sin6_scope_id = su->sin6.sin6_scope_id;
+		break;
+#endif /* INET6 */
+	default:
+		return 0;
+	}
+	return ifa_ifwithaddr(&sa.sa, rdomain) != NULL;
+}
+
 int
 pfkeyv2_dosend(struct socket *so, void *message, int len)
 {
@@ -1499,6 +1530,16 @@ pfkeyv2_dosend(struct socket *so, void *message, int len)
 			import_key(&ii, headers[SADB_EXT_KEY_ENCRYPT],
 			    PFKEYV2_ENCRYPTION_KEY);
 
+			/*
+			 * The identities follow the addresses: the source
+			 * identity belongs to the source address.  For an SA
+			 * whose destination is ours, an inbound SA, the source
+			 * identity is thus the remote one.  isakmpd(8) adds
+			 * inbound SAs with SADB_UPDATE, where that is assumed,
+			 * but sasyncd(8) copies them to its peers as SADB_ADD.
+			 */
+			if (pfkeyv2_local_address(&newsa->tdb_dst, rdomain))
+				newsa->tdb_ids_swapped = 1;
 			import_identities(&newsa->tdb_ids,
 			    newsa->tdb_ids_swapped,
 			    headers[SADB_EXT_IDENTITY_SRC],
