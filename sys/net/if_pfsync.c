@@ -2506,6 +2506,15 @@ pfsync_update_tdb(struct tdb *tdb, int output)
 		if (!ISSET(tdb->tdb_flags, TDBF_PFSYNC)) {
 			mtx_enter(&tdb->tdb_mtx);
 			SET(tdb->tdb_flags, TDBF_PFSYNC);
+			/*
+			 * pfsync_out_tdb() bumps the replay counter it sends
+			 * for an outbound tdb, so that a peer taking over the
+			 * SA does not reuse sequence numbers we have sent.
+			 */
+			if (output)
+				SET(tdb->tdb_flags, TDBF_PFSYNC_RPL);
+			else
+				CLR(tdb->tdb_flags, TDBF_PFSYNC_RPL);
 			mtx_leave(&tdb->tdb_mtx);
 
 			pfsync_tdb_ins(s, tdb);
