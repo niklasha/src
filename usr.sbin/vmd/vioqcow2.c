@@ -32,6 +32,8 @@
 
 #define QCOW2_COMPRESSED	0x4000000000000000ull
 #define QCOW2_INPLACE		0x8000000000000000ull
+#define QCOW2_ZERO		0x0000000000000001ull	/* v3: reads as zeros */
+#define QCOW2_OFFMASK		0x00fffffffffffe00ull	/* host offset bits 9-55 */
 
 #define QCOW2_DIRTY		(1 << 0)
 #define QCOW2_CORRUPT		(1 << 1)
@@ -92,11 +94,46 @@ struct qcdisk {
 	uint64_t autoclearfeatures;
 	uint32_t refssz;
 	uint32_t headersz;
+
+	int	 reffull;	/* refcount table full, warned */
+	time_t	 logsec;		/* last I/O error message, seconds */
+	unsigned int logdropped;	/* messages suppressed since */
 };
 
-static off_t xlate(struct qcdisk *, off_t, int *);
-static void copy_cluster(struct qcdisk *, struct qcdisk *, off_t, off_t);
-static void inc_refs(struct qcdisk *, off_t, int);
+/*
+ * A guest that keeps retrying against a failing disk (a full host file
+ * system, say) makes every request log a line.  Log at most one line
+ * per second per disk from the I/O error paths, and count the rest.
+ */
+static int
+qc2_logok(struct qcdisk *disk)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (disk->logsec != 0 && now.tv_sec == disk->logsec) {
+		disk->logdropped++;
+		return 0;
+	}
+	disk->logsec = now.tv_sec;
+	if (disk->logdropped != 0) {
+		log_warnx("qcow2: %u similar messages suppressed",
+		    disk->logdropped);
+		disk->logdropped = 0;
+	}
+	return 1;
+}
+
+#define QC2_WARN(d, ...) do { if (qc2_logok(d)) log_warn(__VA_ARGS__); } \
+	while (0)
+#define QC2_WARNX(d, ...) do { if (qc2_logok(d)) log_warnx(__VA_ARGS__); } \
+	while (0)
+
+static off_t xlate(struct qcdisk *, off_t, int *, int *);
+static int copy_cluster(struct qcdisk *, struct qcdisk *, off_t, off_t);
+static int inc_refs(struct qcdisk *, off_t, int);
+static off_t grow_disk(struct qcdisk *);
+static int refs_covered(struct qcdisk *, off_t);
 static off_t mkcluster(struct qcdisk *, struct qcdisk *, off_t, off_t);
 static int qc2_open(struct qcdisk *, int *, size_t);
 static ssize_t qc2_pread(void *, char *, size_t, off_t);
@@ -239,6 +276,9 @@ qc2_open(struct qcdisk *disk, int *fds, size_t nfd)
 	disk->l1off		= be64toh(header.l1off);
 	disk->refsz		= be32toh(header.refsz);
 	disk->refoff		= be64toh(header.refoff);
+	disk->reffull		= 0;
+	disk->logsec		= 0;
+	disk->logdropped	= 0;
 	disk->nsnap		= be32toh(header.snapcount);
 	disk->snapoff		= be64toh(header.snapsz);
 
@@ -338,6 +378,7 @@ qc2_pread(void *p, char *buf, size_t len, off_t off)
 	struct qcdisk *disk, *d;
 	off_t phys_off, end, cluster_off;
 	ssize_t sz, rem;
+	int zero;
 
 	disk = p;
 	end = off + len;
@@ -347,9 +388,17 @@ qc2_pread(void *p, char *buf, size_t len, off_t off)
 	/* handle head chunk separately */
 	rem = len;
 	while (off != end) {
-		for (d = disk; d; d = d->base)
-			if ((phys_off = xlate(d, off, NULL)) > 0)
+		for (d = disk; d; d = d->base) {
+			if ((phys_off = xlate(d, off, NULL, &zero)) > 0)
 				break;
+			if (phys_off == -1)
+				return -1;
+			/* A zero cluster hides any data in the base images. */
+			if (zero) {
+				d = NULL;
+				break;
+			}
+		}
 		/* Break out into chunks. This handles
 		 * three cases:
 		 *
@@ -411,9 +460,8 @@ qc2_pwrite(void *p, char *buf, size_t len, off_t off)
 	struct qcdisk *disk, *d;
 	off_t phys_off, cluster_off, end;
 	ssize_t sz, rem;
-	int inplace;
+	int inplace, zero;
 
-	d = p;
 	disk = p;
 	inplace = 1;
 	end = off + len;
@@ -427,7 +475,14 @@ qc2_pwrite(void *p, char *buf, size_t len, off_t off)
 		if (sz > rem)
 			sz = rem;
 
-		phys_off = xlate(disk, off, &inplace);
+		/*
+		 * The copy-on-write source is this disk unless the
+		 * search below finds the cluster in a backing image.
+		 * Do not carry over a previous chunk's choice.
+		 */
+		d = disk;
+
+		phys_off = xlate(disk, off, &inplace, &zero);
 		if (phys_off == -1)
 			return -1;
 		/*
@@ -435,11 +490,18 @@ qc2_pwrite(void *p, char *buf, size_t len, off_t off)
 		 * see if it exists in the base image. If it does, we
 		 * need to copy it before the write. The copy happens
 		 * in the '!inplace' if clause below the search.
+		 * A zero cluster has nothing to copy: the fresh cluster
+		 * allocated below already reads as zeros.
 		 */
-		if (phys_off == 0)
-			for (d = disk->base; d; d = d->base)
-				if ((phys_off = xlate(d, off, NULL)) > 0)
+		if (phys_off == 0 && !zero) {
+			for (d = disk->base; d; d = d->base) {
+				phys_off = xlate(d, off, NULL, &zero);
+				if (phys_off != 0 || zero)
 					break;
+			}
+			if (phys_off == -1)
+				return -1;
+		}
 		if (!inplace || phys_off == 0)
 			phys_off = mkcluster(disk, d, off, phys_off);
 		if (phys_off == -1)
@@ -473,15 +535,17 @@ qc2_close(void *p, int stayopen)
  * Translates a virtual offset into an on-disk offset.
  * Returns:
  * 	-1 on error
- * 	 0 on 'not found'
+ * 	 0 on 'not found'; *zero, if given, is set when the cluster
+ * 	   is a qcow2 v3 zero cluster, which reads as zeros and hides
+ * 	   the backing images
  * 	>0 on found
  */
 static off_t
-xlate(struct qcdisk *disk, off_t off, int *inplace)
+xlate(struct qcdisk *disk, off_t off, int *inplace, int *zero)
 {
 	off_t l2sz, l1off, l2tab, l2off, cluster, clusteroff;
 	uint64_t buf;
-
+	ssize_t n;
 
 	/*
 	 * Clear out inplace flag -- xlate misses should not
@@ -491,22 +555,30 @@ xlate(struct qcdisk *disk, off_t off, int *inplace)
 	 */
 	if (inplace)
 		*inplace = 0;
+	if (zero)
+		*zero = 0;
 	if (off < 0)
 		goto err;
 
 	l2sz = disk->clustersz / 8;
 	l1off = (off / disk->clustersz) / l2sz;
+	/* Nothing beyond the L1 table, e.g. in a smaller base image. */
 	if (l1off >= disk->l1sz)
-		goto err;
+		return 0;
 
 	l2tab = disk->l1[l1off];
 	l2tab &= ~QCOW2_INPLACE;
 	if (l2tab == 0)
 		return 0;
 	l2off = (off / disk->clustersz) % l2sz;
-	if (pread(disk->fd, &buf, sizeof(buf), l2tab + l2off * 8) !=
-	    (ssize_t)sizeof(buf))
-		fatalx("%s: unable to read qcow2 L2 entry", __func__);
+	n = pread(disk->fd, &buf, sizeof(buf), l2tab + l2off * 8);
+	if (n == -1) {
+		QC2_WARN(disk, "%s: unable to read qcow2 L2 entry", __func__);
+		goto err;
+	} else if (n != (ssize_t)sizeof(buf)) {
+		QC2_WARNX(disk, "%s: short read of qcow2 L2 entry", __func__);
+		goto err;
+	}
 	cluster = be64toh(buf);
 	/*
 	 * cluster may be 0, but all future operations don't affect
@@ -516,8 +588,20 @@ xlate(struct qcdisk *disk, off_t off, int *inplace)
 		*inplace = !!(cluster & QCOW2_INPLACE);
 	if (cluster & QCOW2_COMPRESSED)
 		fatalx("%s: compressed clusters unsupported", __func__);
+	/*
+	 * A v3 zero cluster reads as all zeros. A host offset only
+	 * describes a preallocation and must not be read, nor may the
+	 * base images be consulted. Report a miss with *zero set.
+	 */
+	if (cluster & QCOW2_ZERO) {
+		if (inplace)
+			*inplace = 0;
+		if (zero)
+			*zero = 1;
+		return 0;
+	}
 	clusteroff = 0;
-	cluster &= ~QCOW2_INPLACE;
+	cluster &= QCOW2_OFFMASK;
 	if (cluster)
 		clusteroff = off % disk->clustersz;
 	return cluster + clusteroff;
@@ -530,6 +614,11 @@ err:
  * if needed. The cluster starts off with a refs of one,
  * and the writable bit set.
  *
+ * A new cluster is filled in and refcounted before a table
+ * points to it, and the cached L1 table only changes after
+ * the image has, so an I/O error such as a full file system
+ * fails the write and at worst leaks a cluster.
+ *
  * Returns -1 on error, and the physical address within the
  * cluster of the write offset if it exists.
  */
@@ -539,12 +628,13 @@ mkcluster(struct qcdisk *disk, struct qcdisk *base, off_t off, off_t src_phys)
 	off_t l2sz, l1off, l2tab, l2off, cluster, clusteroff, orig;
 	uint64_t buf;
 
-	cluster = -1;
 	/* L1 entries always exist */
 	l2sz = disk->clustersz / 8;
 	l1off = off / (disk->clustersz * l2sz);
-	if (l1off >= disk->l1sz)
-		fatalx("l1 offset outside disk");
+	if (l1off >= disk->l1sz) {
+		QC2_WARNX(disk, "%s: l1 offset outside disk", __func__);
+		return -1;
+	}
 
 	disk->end = (disk->end + disk->clustersz - 1) & ~(disk->clustersz - 1);
 
@@ -553,39 +643,40 @@ mkcluster(struct qcdisk *disk, struct qcdisk *base, off_t off, off_t src_phys)
 	/* We may need to create or clone an L2 entry to map the block */
 	if (l2tab == 0 || (l2tab & QCOW2_INPLACE) == 0) {
 		orig = l2tab & ~QCOW2_INPLACE;
-		l2tab = disk->end;
-		disk->end += disk->clustersz;
-		if (ftruncate(disk->fd, disk->end) == -1)
-			fatal("%s: ftruncate failed", __func__);
+		if ((l2tab = grow_disk(disk)) == -1)
+			return -1;
 
 		/*
 		 * If we translated, found a L2 entry, but it needed to
 		 * be copied, copy it.
 		 */
-		if (orig != 0)
-			copy_cluster(disk, disk, l2tab, orig);
-		/* Update l1 -- we flush it later */
+		if (orig != 0 && copy_cluster(disk, disk, l2tab, orig) == -1)
+			return -1;
+		if (inc_refs(disk, l2tab, 1) == -1)
+			return -1;
+
+		/* Point the l1 entry at the new table, then cache it. */
+		buf = htobe64(l2tab | QCOW2_INPLACE);
+		if (pwrite(disk->fd, &buf, sizeof(buf),
+		    disk->l1off + 8 * l1off) != 8) {
+			QC2_WARN(disk, "%s: could not write l1", __func__);
+			return -1;
+		}
 		disk->l1[l1off] = l2tab | QCOW2_INPLACE;
-		inc_refs(disk, l2tab, 1);
 	}
 	l2tab &= ~QCOW2_INPLACE;
 
-	/* Grow the disk */
-	if (ftruncate(disk->fd, disk->end + disk->clustersz) < 0)
-		fatal("%s: could not grow disk", __func__);
-	if (src_phys > 0)
-		copy_cluster(disk, base, disk->end, src_phys);
-	cluster = disk->end;
-	disk->end += disk->clustersz;
+	if ((cluster = grow_disk(disk)) == -1)
+		return -1;
+	if (src_phys > 0 && copy_cluster(disk, base, cluster, src_phys) == -1)
+		return -1;
+	if (inc_refs(disk, cluster, 1) == -1)
+		return -1;
 	buf = htobe64(cluster | QCOW2_INPLACE);
-	if (pwrite(disk->fd, &buf, sizeof(buf), l2tab + l2off * 8) != 8)
-		fatalx("%s: could not write cluster", __func__);
-
-	/* TODO: lazily sync: currently VMD doesn't close things */
-	buf = htobe64(disk->l1[l1off]);
-	if (pwrite(disk->fd, &buf, sizeof(buf), disk->l1off + 8 * l1off) != 8)
-		fatalx("%s: could not write l1", __func__);
-	inc_refs(disk, cluster, 1);
+	if (pwrite(disk->fd, &buf, sizeof(buf), l2tab + l2off * 8) != 8) {
+		QC2_WARN(disk, "%s: could not write l2", __func__);
+		return -1;
+	}
 
 	clusteroff = off % disk->clustersz;
 	if (cluster + clusteroff < disk->clustersz)
@@ -593,35 +684,104 @@ mkcluster(struct qcdisk *disk, struct qcdisk *base, off_t off, off_t src_phys)
 	return cluster + clusteroff;
 }
 
-/* Copies a cluster containing src to dst. Src and dst need not be aligned. */
-static void
+/*
+ * Grows the disk by one cluster, which reads as zeros. Nothing
+ * refers to the cluster or counts it yet. The refcount table must
+ * cover the new cluster, else the disk is not grown: inc_refs()
+ * could not count it, and every failed write would leak a cluster.
+ *
+ * Returns the offset of the cluster, or -1 on error.
+ */
+static off_t
+grow_disk(struct qcdisk *disk)
+{
+	off_t cluster;
+
+	cluster = disk->end;
+	if (!refs_covered(disk, cluster))
+		return -1;
+	if (ftruncate(disk->fd, cluster + disk->clustersz) == -1) {
+		QC2_WARN(disk, "%s: could not grow disk", __func__);
+		return -1;
+	}
+	disk->end = cluster + disk->clustersz;
+	return cluster;
+}
+
+/*
+ * Checks that the refcount table covers the cluster at off. We cannot
+ * grow the refcount table, so once it is full no cluster beyond it can
+ * be allocated. That is logged only once per disk, as a guest may
+ * keep writing.
+ *
+ * Returns 1 if the cluster is covered, 0 if not.
+ */
+static int
+refs_covered(struct qcdisk *disk, off_t off)
+{
+	off_t idx;
+
+	idx = (off / disk->clustersz) / (disk->clustersz / 2);
+	if (idx < disk->refsz * disk->clustersz / 8)
+		return 1;
+	if (!disk->reffull) {
+		log_warnx("%s: refcount table full", __func__);
+		disk->reffull = 1;
+	}
+	return 0;
+}
+
+/*
+ * Copies a cluster containing src to dst. Src and dst need not be aligned.
+ * Returns 0 on success, -1 on error.
+ */
+static int
 copy_cluster(struct qcdisk *disk, struct qcdisk *base, off_t dst, off_t src)
 {
 	char *scratch;
 	ssize_t n;
+	int ret = -1;
 
 	scratch = malloc(disk->clustersz);
-	if (!scratch)
-		fatal("out of memory");
+	if (!scratch) {
+		QC2_WARN(disk, "%s: malloc", __func__);
+		return -1;
+	}
 	src &= ~(disk->clustersz - 1);
 	dst &= ~(disk->clustersz - 1);
 	n = pread(base->fd, scratch, disk->clustersz, src);
-	if (n == -1)
-		fatal("%s: could not read cluster", __func__);
-	else if (n != (ssize_t)disk->clustersz)
-		fatalx("%s: short read of cluster", __func__);
+	if (n == -1) {
+		QC2_WARN(disk, "%s: could not read cluster", __func__);
+		goto done;
+	} else if (n != (ssize_t)disk->clustersz) {
+		QC2_WARNX(disk, "%s: short read of cluster", __func__);
+		goto done;
+	}
 	n = pwrite(disk->fd, scratch, disk->clustersz, dst);
-	if (n == -1)
-		fatal("%s: could not write cluster", __func__);
-	else if (n != (ssize_t)disk->clustersz)
-		fatalx("%s: short write of cluster", __func__);
+	if (n == -1) {
+		QC2_WARN(disk, "%s: could not write cluster", __func__);
+		goto done;
+	} else if (n != (ssize_t)disk->clustersz) {
+		QC2_WARNX(disk, "%s: short write of cluster", __func__);
+		goto done;
+	}
+	ret = 0;
+done:
 	free(scratch);
+	return ret;
 }
 
-static void
+/*
+ * Gives a new cluster a refcount of one, or adds one to the refcount
+ * of an existing cluster. A missing refcount block is allocated, and
+ * counted, before the refcount table points to it.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int
 inc_refs(struct qcdisk *disk, off_t off, int newcluster)
 {
-	off_t l1off, l1idx, l2idx, l2cluster;
+	off_t l1off, l1idx, l2idx, l2cluster, self;
 	size_t nper;
 	uint16_t refs;
 	uint64_t buf;
@@ -630,32 +790,58 @@ inc_refs(struct qcdisk *disk, off_t off, int newcluster)
 	nper = disk->clustersz / 2;
 	l1idx = (off / disk->clustersz) / nper;
 	l2idx = (off / disk->clustersz) % nper;
+	/* We cannot grow the refcount table. */
+	if (!refs_covered(disk, off))
+		return -1;
 	l1off = disk->refoff + 8 * l1idx;
-	if (pread(disk->fd, &buf, sizeof(buf), l1off) != 8)
-		fatal("could not read refs");
+	if (pread(disk->fd, &buf, sizeof(buf), l1off) != 8) {
+		QC2_WARN(disk, "%s: could not read refs", __func__);
+		return -1;
+	}
 
 	l2cluster = be64toh(buf);
 	if (l2cluster == 0) {
-		l2cluster = disk->end;
-		disk->end += disk->clustersz;
-		if (ftruncate(disk->fd, disk->end) < 0)
-			fatal("%s: failed to allocate ref block", __func__);
+		if ((l2cluster = grow_disk(disk)) == -1)
+			return -1;
+
+		/*
+		 * Count the new block in itself if it covers its own
+		 * cluster, else in the block that does.
+		 */
+		self = l2cluster / disk->clustersz;
+		if (self / nper == (size_t)l1idx) {
+			refs = htobe16(1);
+			if (pwrite(disk->fd, &refs, sizeof(refs),
+			    l2cluster + 2 * (self % nper)) != 2) {
+				QC2_WARN(disk, "%s: could not write ref block",
+				    __func__);
+				return -1;
+			}
+		} else if (inc_refs(disk, l2cluster, 1) == -1)
+			return -1;
+
 		buf = htobe64(l2cluster);
-		if (pwrite(disk->fd, &buf, sizeof(buf), l1off) != 8)
-			fatal("%s: failed to write ref block", __func__);
-		inc_refs(disk, l2cluster, 1);
+		if (pwrite(disk->fd, &buf, sizeof(buf), l1off) != 8) {
+			QC2_WARN(disk, "%s: could not write ref table", __func__);
+			return -1;
+		}
 	}
 
 	refs = 1;
 	if (!newcluster) {
 		if (pread(disk->fd, &refs, sizeof(refs),
-		    l2cluster + 2 * l2idx) != 2)
-			fatal("could not read ref cluster");
+		    l2cluster + 2 * l2idx) != 2) {
+			QC2_WARN(disk, "%s: could not read ref cluster", __func__);
+			return -1;
+		}
 		refs = be16toh(refs) + 1;
 	}
 	refs = htobe16(refs);
-	if (pwrite(disk->fd, &refs, sizeof(refs), l2cluster + 2 * l2idx) != 2)
-		fatal("%s: could not write ref block", __func__);
+	if (pwrite(disk->fd, &refs, sizeof(refs), l2cluster + 2 * l2idx) != 2) {
+		QC2_WARN(disk, "%s: could not write ref block", __func__);
+		return -1;
+	}
+	return 0;
 }
 
 /*

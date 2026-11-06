@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <pthread_np.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -123,7 +124,7 @@ vionet_main(int fd, int vm_fd)
 	struct viodev_msg 	 msg;
 	struct vmd_vm	 	 vm;
 	ssize_t			 sz;
-	int			 ret;
+	int			 ret, sync_init = 0;
 
 	/*
 	 * stdio - needed for read/write to disk fds and channels to the vm.
@@ -137,6 +138,7 @@ vionet_main(int fd, int vm_fd)
 	memset(iov_tx, 0, sizeof(iov_tx));
 
 	/* Receive our vionet_dev, mostly preconfigured. */
+	memset(&dev, 0, sizeof(dev));
 	sz = atomicio(read, fd, &dev, sizeof(dev));
 	if (sz != sizeof(dev)) {
 		ret = errno;
@@ -170,7 +172,7 @@ vionet_main(int fd, int vm_fd)
 	/* Now that we have our vm information, we can remap memory. */
 	ret = remap_guest_mem(&vm, vm_fd);
 	if (ret) {
-		fatal("%s: failed to remap", __func__);
+		log_warnx("failed to remap guest memory");
 		goto fail;
 	}
 
@@ -239,6 +241,7 @@ vionet_main(int fd, int vm_fd)
 		log_warnx("imsgbuf_init");
 		goto fail;
 	}
+	sync_init = 1;
 	imsgbuf_allow_fdpass(&dev.sync_iev.ibuf);
 	dev.sync_iev.handler = handle_sync_io;
 	dev.sync_iev.data = &dev;
@@ -290,13 +293,21 @@ vionet_main(int fd, int vm_fd)
 		/* NOTREACHED */
 	}
 fail:
-	/* Try firing off a message to the vm saying we're dying. */
-	memset(&msg, 0, sizeof(msg));
-	msg.type = VIODEV_MSG_ERROR;
-	msg.data = ret;
-	imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
-	    sizeof(msg));
-	imsgbuf_flush(&dev.sync_iev.ibuf);
+	/*
+	 * Try firing off a message to the vm saying we're dying. An early
+	 * failure comes before the sync channel's imsgbuf is set up, so set
+	 * it up here, on fd: dev.sync_fd may not be set yet either. If the
+	 * vm is already gone, let the write fail instead of dying of SIGPIPE.
+	 */
+	signal(SIGPIPE, SIG_IGN);
+	if (sync_init || imsgbuf_init(&dev.sync_iev.ibuf, fd) != -1) {
+		memset(&msg, 0, sizeof(msg));
+		msg.type = VIODEV_MSG_ERROR;
+		msg.data = ret;
+		imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1,
+		    &msg, sizeof(msg));
+		imsgbuf_flush(&dev.sync_iev.ibuf);
+	}
 
 	close_fd(dev.sync_fd);
 	close_fd(dev.async_fd);
@@ -368,6 +379,17 @@ vionet_rx(struct virtio_dev *dev, int fd)
 	}
 
 	vq_info = &dev->vq[RXQ];
+	if (!vq_info->vq_enabled) {
+		/*
+		 * Don't just return 0: we run whenever the tap or the inject
+		 * pipe is readable, so the packet would stay there and we
+		 * would spin. Request a reset, which stops watching both
+		 * until the driver kicks the rx queue again.
+		 */
+		log_warnx("%s: virtqueue not enabled", __func__);
+		return (-1);
+	}
+
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
 	if (vr == NULL || vq_info->q_avail_hva == NULL ||
@@ -501,6 +523,8 @@ vionet_rx(struct virtio_dev *dev, int fd)
 	vq_info->last_avail = idx;
 	return (notify);
 reset:
+	/* Don't replay chains already placed in the used ring. */
+	vq_info->last_avail = idx;
 	return (-1);
 }
 
@@ -640,8 +664,13 @@ vionet_rx_zerocopy(struct vionet_dev *dev, int fd, const struct iovec *iov,
 	}
 
 	sz = readv(fd, iov, iov_cnt);
-	if (sz == -1 && errno == EAGAIN)
+	if (sz == -1) {
+		if (errno != EAGAIN) {
+			log_warn("%s: error reading packet", __func__);
+			return (-1);
+		}
 		return (0);
+	}
 
 	if ((size_t)sz < sizeof(struct tun_hdr))
 		return (0);
@@ -688,6 +717,15 @@ vionet_rx_event(int fd, short event, void *arg)
 			log_warnx("%s: requesting device reset", __func__);
 			dev->status |= DEVICE_NEEDS_RESET;
 			dev->isr |= VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
+			/*
+			 * The bad chain stays at last_avail, so nothing can
+			 * be received until the driver resets the device.
+			 * Stop watching the tap and the inject pipe, which
+			 * would fire again at once; the driver's next rx
+			 * kick re-arms them.
+			 */
+			event_del(&ev_tap);
+			event_del(&ev_inject);
 		}
 		raise_irq = 1;
 	}
@@ -747,6 +785,11 @@ vionet_tx(struct virtio_dev *dev)
 	}
 
 	vq_info = &dev->vq[TXQ];
+	if (!vq_info->vq_enabled) {
+		log_warnx("%s: virtqueue not enabled", __func__);
+		return (0);
+	}
+
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
 	if (vr == NULL || vq_info->q_avail_hva == NULL ||
@@ -928,6 +971,8 @@ drop:
 	vq_info->last_avail = idx;
 	return (notify);
 reset:
+	/* Don't replay chains already placed in the used ring. */
+	vq_info->last_avail = idx;
 	return (-1);
 }
 
@@ -1054,12 +1099,19 @@ handle_sync_io(int fd, short event, void *arg)
 		switch (msg.type) {
 		case VIODEV_MSG_IO_READ:
 			/* Read IO: make sure to send a reply */
+			deassert = 0;
 			msg.data = vionet_read(dev, &msg, &deassert);
 			msg.data_valid = 1;
-			if (deassert)
-				msg.state = INTR_STATE_DEASSERT;
 			imsg_compose_event2(iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 			    sizeof(msg), ev_base_main);
+			/*
+			 * Lower the line for the ISR read on the async
+			 * channel, in order with the asserts this thread
+			 * sends for the rx and tx threads, not in the reply.
+			 * See handle_dev_msg() in virtio.c.
+			 */
+			if (deassert)
+				vionet_deassert_pic_irq(dev);
 			break;
 		case VIODEV_MSG_IO_WRITE:
 			/* Write IO: no reply needed */
@@ -1658,7 +1710,24 @@ static void
 vionet_assert_irq(struct virtio_dev *dev, uint16_t vq_idx)
 {
 	struct viodev_msg	msg;
-	int			ret;
+	int			ret, pending;
+
+	/*
+	 * The rx and tx threads set isr before they ask us to raise the
+	 * interrupt, and a guest ISR read or a device reset, both handled
+	 * on this thread, can clear it in between.  Then the read has
+	 * reported the interrupt or the reset has discarded it, and an
+	 * assert would leave the line up with nothing pending.  Only this
+	 * thread clears isr, so the check holds until the assert is
+	 * queued.  With MSI-X the driver does not read the ISR (virtio
+	 * 1.x: it should not for queue interrupts), so isr stays set and
+	 * only a raise made stale by a reset is dropped.
+	 */
+	pthread_rwlock_rdlock(&lock);
+	pending = (dev->isr != 0);
+	pthread_rwlock_unlock(&lock);
+	if (!pending)
+		return;
 
 	memset(&msg, 0, sizeof(msg));
 	msg.irq = dev->irq;

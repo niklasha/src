@@ -24,6 +24,7 @@
 
 #include <errno.h>
 #include <event.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -71,7 +72,7 @@ vioblk_main(int fd, int vm_fd)
 	ssize_t			 sz;
 	off_t			 szp = 0;
 	enum vm_disk_fmt	 type;
-	int			 i, ret;
+	int			 i, ret, sync_init = 0;
 
 	/*
 	 * stdio - needed for read/write to disk fds and channels to the vm.
@@ -173,6 +174,7 @@ vioblk_main(int fd, int vm_fd)
 		log_warn("imsgbuf_init");
 		goto fail;
 	}
+	sync_init = 1;
 	imsgbuf_allow_fdpass(&dev.sync_iev.ibuf);
 	dev.sync_iev.handler = handle_sync_io;
 	dev.sync_iev.data = &dev;
@@ -210,13 +212,21 @@ vioblk_main(int fd, int vm_fd)
 	}
 
 fail:
-	/* Try letting the vm know we've failed something. */
-	memset(&msg, 0, sizeof(msg));
-	msg.type = VIODEV_MSG_ERROR;
-	msg.data = ret;
-	imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
-	    sizeof(msg));
-	imsgbuf_flush(&dev.sync_iev.ibuf);
+	/*
+	 * Try letting the vm know we've failed something. An early failure
+	 * comes before the sync channel's imsgbuf is set up, so set it up
+	 * here, on fd: dev.sync_fd may not be set yet either. If the vm is
+	 * already gone, let the write fail instead of dying of SIGPIPE.
+	 */
+	signal(SIGPIPE, SIG_IGN);
+	if (sync_init || imsgbuf_init(&dev.sync_iev.ibuf, fd) != -1) {
+		memset(&msg, 0, sizeof(msg));
+		msg.type = VIODEV_MSG_ERROR;
+		msg.data = ret;
+		imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1,
+		    &msg, sizeof(msg));
+		imsgbuf_flush(&dev.sync_iev.ibuf);
+	}
 
 	close_fd(dev.sync_fd);
 	close_fd(dev.async_fd);
@@ -244,24 +254,25 @@ vioblk_cmd_name(uint32_t type)
 }
 
 /*
- * Flush the backing store(s) to stable storage for a guest
+ * Flush the writable backing store to stable storage for a guest
  * VIRTIO_BLK_T_FLUSH command (negotiated via VIRTIO_BLK_F_FLUSH).
+ *
+ * Only disk_fd[0] is ever written. For a qcow2 overlay chain,
+ * disk_fd[1..] are the base images, opened O_RDONLY and never
+ * modified, so syncing them makes nothing more durable. It would
+ * still take an exclusive vnode lock and synchronously rewrite the
+ * base's inode block on every guest flush, and a failure there would
+ * fail the guest's flush.
  *
  * Returns 0 on success, -1 on error.
  */
 static int
 vioblk_flush(struct vioblk_dev *dev)
 {
-	int i;
-
-	for (i = 0; i < dev->ndisk_fd; i++) {
-		if (dev->disk_fd[i] == -1)
-			continue;
-		if (fdatasync(dev->disk_fd[i]) == -1) {
-			log_warn("%s: fdatasync of disk fd %d failed",
-			    __func__, dev->disk_fd[i]);
-			return (-1);
-		}
+	if (fdatasync(dev->disk_fd[0]) == -1) {
+		log_warn("%s: fdatasync of disk fd %d failed",
+		    __func__, dev->disk_fd[0]);
+		return (-1);
 	}
 	return (0);
 }
@@ -295,6 +306,11 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 		return (0);
 
 	vq_info = &dev->vq[vq_idx];
+	if (!vq_info->vq_enabled) {
+		log_warnx("%s: virtqueue not enabled", __func__);
+		return (0);
+	}
+
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
 	if (vr == NULL || vq_info->q_avail_hva == NULL ||
@@ -363,7 +379,8 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 			/*
 			 * Flush (negotiated via VIRTIO_BLK_F_FLUSH). The guest
 			 * issues this on fsync(2)/sync; honor it as a real
-			 * fdatasync of the backing store(s). Without it a guest
+			 * fdatasync of the writable backing store (read-only
+			 * qcow2 bases are never written). Without it a guest
 			 * fsync would silently leave data only in the host
 			 * buffer cache.
 			 */
@@ -428,6 +445,9 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	return (notify);
 
 reset:
+	/* Don't replay chains already placed in the used ring. */
+	vq_info->last_avail = idx;
+
 	/*
 	 * When setting the "needs reset" flag, the driver is notified
 	 * via a configuration change interrupt.
@@ -551,14 +571,18 @@ handle_sync_io(int fd, short event, void *arg)
 		switch (msg.type) {
 		case VIODEV_MSG_IO_READ:
 			/* Read IO: make sure to send a reply */
+			deassert = 0;
 			msg.data = vioblk_read(dev, &msg, &deassert);
 			msg.data_valid = 1;
-			if (deassert) {
-				/* Inline any interrupt deassertions. */
-				msg.state = INTR_STATE_DEASSERT;
-			}
 			imsg_compose_event(iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 			    sizeof(msg));
+			/*
+			 * Lower the line for the ISR read on the async
+			 * channel, in order with our asserts, not in the
+			 * reply.  See handle_dev_msg() in virtio.c.
+			 */
+			if (deassert)
+				virtio_deassert_irq(dev, 0);
 			break;
 		case VIODEV_MSG_IO_WRITE:
 			/* Write IO: no reply needed, but maybe an irq assert */
@@ -684,6 +708,32 @@ vioblk_dev_read(struct virtio_dev *dev, struct viodev_msg *msg)
 }
 
 /*
+ * A guest retrying against a failing disk (a full host file system,
+ * say) makes every request log a line.  Log at most one line per
+ * second and count the rest.
+ */
+static int
+vioblk_logok(void)
+{
+	static time_t last;
+	static unsigned int dropped;
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (last != 0 && now.tv_sec == last) {
+		dropped++;
+		return 0;
+	}
+	last = now.tv_sec;
+	if (dropped != 0) {
+		log_warnx("%s: %u similar messages suppressed", __func__,
+		    dropped);
+		dropped = 0;
+	}
+	return 1;
+}
+
+/*
  * Emulate read/write io. Walks the descriptor chain, collecting io work and
  * then emulates the read or write.
  *
@@ -755,9 +805,11 @@ vioblk_io(struct vioblk_dev *dev, struct virtio_vq_info *vq_info, int is_write,
 	else
 		sz = dev->file.preadv(dev->file.p, io_v, io_idx, offset);
 	if (sz != (ssize_t)xfer_sz) {
-		log_warnx("%s: %s failure at offset 0x%llx, xfer_sz=%zu, "
-		    "sz=%ld", __func__, (is_write ? "write" : "read"), offset,
-		    xfer_sz, sz);
+		if (vioblk_logok()) {
+			log_warnx("%s: %s failure at offset 0x%llx, "
+			    "xfer_sz=%zu, sz=%ld", __func__,
+			    (is_write ? "write" : "read"), offset, xfer_sz, sz);
+		}
 		return (-1);
 	}
 

@@ -367,9 +367,12 @@ vmm_quiesce_vmx(void)
 			if (err)
 				break;
 
-			/* We can skip unlaunched VMCS. Nothing to flush. */
-			if (atomic_load_int(&vcpu->vc_vmx_vmcs_state)
-			    != VMCS_LAUNCHED) {
+			/*
+			 * Skip a VMCS that is not loaded on any cpu.  The
+			 * launch state cannot tell: a VMCS can be active
+			 * but marked clear, see vcpu_deinit_vmx().
+			 */
+			if (vcpu->vc_last_pcpu == NULL) {
 				DPRINTF("%s: skipping vcpu %d for vm %d\n",
 				    __func__, vcpu->vc_id, vm->vm_id);
 				rw_exit_write(&vcpu->vc_lock);
@@ -396,6 +399,8 @@ vmm_quiesce_vmx(void)
 				atomic_swap_uint(&vcpu->vc_vmx_vmcs_state,
 				    VMCS_CLEARED);
 			}
+			if (err == 0)
+				vcpu->vc_last_pcpu = NULL;
 
 			rw_exit_write(&vcpu->vc_lock);
 			if (err)
@@ -594,7 +599,7 @@ int
 vmm_start(void)
 {
 	int rv = 0;
-	struct cpu_info *self = curcpu();
+	struct cpu_info *self;
 #ifdef MULTIPROCESSOR
 	struct cpu_info *ci;
 	CPU_INFO_ITERATOR cii;
@@ -604,6 +609,8 @@ vmm_start(void)
 #endif /* MULTIPROCESSOR */
 
 	rw_enter_write(&vmm_softc->sc_slock);
+	/* Only now: rw_enter_write() may have slept and moved us. */
+	self = curcpu();
 
 	/* VMM is already running */
 	if (self->ci_flags & CPUF_VMM)
@@ -654,7 +661,7 @@ int
 vmm_stop(void)
 {
 	int rv = 0;
-	struct cpu_info *self = curcpu();
+	struct cpu_info *self;
 #ifdef MULTIPROCESSOR
 	struct cpu_info *ci;
 	CPU_INFO_ITERATOR cii;
@@ -664,6 +671,8 @@ vmm_stop(void)
 #endif /* MULTIPROCESSOR */
 
 	rw_enter_write(&vmm_softc->sc_slock);
+	/* Only now: rw_enter_write() may have slept and moved us. */
+	self = curcpu();
 
 	/* VMM is not running */
 	if (!(self->ci_flags & CPUF_VMM))
@@ -937,6 +946,14 @@ vcpu_reload_vmcs_vmx(struct vcpu *vcpu)
 		printf("%s: vmptrld\n", __func__);
 		return (EINVAL);
 	}
+
+	/*
+	 * Record where the VMCS is now active, so that the next reload,
+	 * vmm_quiesce_vmx() and vcpu_deinit_vmx() clear it there even if
+	 * the caller returns before it runs the vcpu.  This is curcpu(),
+	 * not ci: vmx_remote_vmclear() may have slept and moved us.
+	 */
+	vcpu->vc_last_pcpu = curcpu();
 
 	return (0);
 }
@@ -1367,6 +1384,8 @@ out:
 	if (loadvmcs) {
 		if (vmclear(&vcpu->vc_control_pa))
 			ret = EINVAL;
+		else
+			vcpu->vc_last_pcpu = NULL;	/* active nowhere now */
 		atomic_swap_uint(&vcpu->vc_vmx_vmcs_state, VMCS_CLEARED);
 	}
 	return (ret);
@@ -2534,7 +2553,8 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	if (vmclear(&vcpu->vc_control_pa)) {
 		DPRINTF("%s: vmclear failed\n", __func__);
 		ret = EINVAL;
-	}
+	} else
+		vcpu->vc_last_pcpu = NULL;	/* active nowhere now */
 	atomic_swap_uint(&vcpu->vc_vmx_vmcs_state, VMCS_CLEARED);
 
 exit:
@@ -2663,6 +2683,12 @@ vcpu_init_vmx(struct vcpu *vcpu)
 		goto exit;
 	}
 
+	/*
+	 * The VMCS is now active on this cpu.  Record that, so that
+	 * vcpu_deinit_vmx() clears it here if we fail below.
+	 */
+	vcpu->vc_last_pcpu = curcpu();
+
 	/* Configure EPT Pointer */
 	eptp = vcpu->vc_parent->vm_pmap->pm_pdirpa;
 	msr = rdmsr(IA32_VMX_EPT_VPID_CAP);
@@ -2767,7 +2793,8 @@ vcpu_init_vmx(struct vcpu *vcpu)
 	if (vmclear(&vcpu->vc_control_pa)) {
 		DPRINTF("%s: vmclear failed\n", __func__);
 		ret = EINVAL;
-	}
+	} else
+		vcpu->vc_last_pcpu = NULL;	/* active nowhere now */
 
 exit:
 	if (ret)
@@ -3008,14 +3035,18 @@ void
 vcpu_deinit_vmx(struct vcpu *vcpu)
 {
 	/*
-	 * If this VMCS is still launched and current on a (possibly
-	 * remote) cpu, that cpu can write cached VMCS host state back
-	 * into the page after km_free() below returns it to the
-	 * allocator, corrupting whatever the page is recycled for.
-	 * Retire it first, exactly as vmm_quiesce_vmx() does before
-	 * suspend and vcpu_reload_vmcs_vmx() does before migration.
+	 * Unless it is NULL, vc_last_pcpu is the cpu that last loaded
+	 * this VMCS, and the VMCS may still be active there whatever
+	 * vc_vmx_vmcs_state says: init, register reset and run can fail
+	 * after VMPTRLD, and a reload onto another cpu marks the VMCS
+	 * clear until the next guest entry, which may never come.  That
+	 * cpu can write cached VMCS data back into the page after
+	 * km_free() below returns it to the allocator, corrupting
+	 * whatever the page is recycled for.  Retire it first, as
+	 * vcpu_reload_vmcs_vmx() does before migration and
+	 * vmm_quiesce_vmx() before suspend.
 	 */
-	if (atomic_load_int(&vcpu->vc_vmx_vmcs_state) == VMCS_LAUNCHED) {
+	if (vcpu->vc_last_pcpu != NULL) {
 #ifdef MULTIPROCESSOR
 		if (vcpu->vc_last_pcpu != curcpu()) {
 			/* Remote cpu vmclear via ipi. */
@@ -3034,9 +3065,9 @@ vcpu_deinit_vmx(struct vcpu *vcpu)
 			atomic_swap_uint(&vcpu->vc_vmx_vmcs_state,
 			    VMCS_CLEARED);
 		}
+		vcpu->vc_last_pcpu = NULL;
 	}
 	if (vcpu->vc_control_va) {
-
 		km_free((void *)vcpu->vc_control_va, PAGE_SIZE,
 		    &kv_page, &kp_zero);
 		vcpu->vc_control_va = 0;
@@ -5260,15 +5291,20 @@ vmx_fault_page(struct vcpu *vcpu, paddr_t gpa)
 		vcpu->vc_last_pcpu = curcpu(); /* uvm_fault may sleep. */
 		error = uvm_fault_wire(&p->p_vmspace->vm_map, hva,
 		    hva + PAGE_SIZE, PROT_READ | PROT_WRITE);
-		if (error) {
+		if (error)
 			printf("%s: uvm_fault failed %d hva=0x%llx\n", __func__,
 			    error, (uint64_t)hva);
-			return (VMM_ACTION_TERMINATE);
-		}
+		/*
+		 * Reload even if the fault failed: we may have slept and
+		 * moved cpus, and vcpu_run_vmx() reads the VMCS and records
+		 * curcpu() in vc_last_pcpu on its way out.
+		 */
 		if (vcpu_reload_vmcs_vmx(vcpu)) {
 			printf("%s: failed to reload vmcs\n", __func__);
 			return (VMM_ACTION_TERMINATE);
 		}
+		if (error)
+			return (VMM_ACTION_TERMINATE);
 
 		/* ...and then get the mapping. */
 		if (!pmap_extract(p->p_vmspace->vm_map.pmap, hva, &hpa)) {
@@ -6256,6 +6292,28 @@ vmm_handle_xsetbv(struct vcpu *vcpu, uint64_t *rax)
 	val = *rax + (*rdx << 32);
 	if (val & ~mask) {
 		DPRINTF("%s: guest specified xcr0 outside xsave_mask %lld\n",
+		    __func__, val);
+		vmm_inject_gp(vcpu);
+		return (VMM_ACTION_INJECT);
+	}
+
+	/*
+	 * Refuse what XSETBV itself refuses with #GP: x87 state must be
+	 * enabled, AVX state needs SSE state, the AVX-512 components are
+	 * enabled all together and only with SSE and AVX state, and the
+	 * MPX and AMX components only in pairs.  Storing such a value
+	 * would make vmm_fpurestore() fail to load it, which stops the
+	 * vcpu instead of raising #GP in the guest.
+	 */
+	if ((val & XFEATURE_X87) == 0 ||
+	    ((val & XFEATURE_AVX) && (val & XFEATURE_SSE) == 0) ||
+	    ((val & XFEATURE_AVX512) &&
+	    ((val & XFEATURE_AVX512) != XFEATURE_AVX512 ||
+	    (val & (XFEATURE_SSE | XFEATURE_AVX)) !=
+	    (XFEATURE_SSE | XFEATURE_AVX))) ||
+	    ((val & XFEATURE_MPX) && (val & XFEATURE_MPX) != XFEATURE_MPX) ||
+	    ((val & XFEATURE_AMX) && (val & XFEATURE_AMX) != XFEATURE_AMX)) {
+		DPRINTF("%s: guest specified invalid xcr0 0x%llx\n",
 		    __func__, val);
 		vmm_inject_gp(vcpu);
 		return (VMM_ACTION_INJECT);
