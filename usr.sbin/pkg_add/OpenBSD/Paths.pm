@@ -114,6 +114,14 @@ sub compute_osversion($self)
 	}
 }
 
+# The Appli baseline directory on the mirror, bl43 for 8.0: the baseline
+# number is the release number minus 37, as in sysupgrade -A and syspatch.
+sub baseline_directory($self)
+{
+	my ($major, $minor) = split /\./, $self->os_version;
+	return "bl" . ($major * 10 + $minor - 37);
+}
+
 sub os_version($self)
 {
 	if (!defined $osversion) {

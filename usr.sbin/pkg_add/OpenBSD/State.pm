@@ -143,7 +143,10 @@ OpenBSD::Auto::cache(installpath,
 			next if m/^\s*\#/;
 			next if m/^\s*$/;
 			next if m/[\x00-\x20"\$&';<>\\`|]/;
-			$url = "$_/%c/packages/%a/";
+			# The Appli baseline packages first, then the
+			# release ones (%c: packages-stable and packages)
+			$url = "$_/" . OpenBSD::Paths->baseline_directory .
+			    "/packages/%a/:$_/%c/packages/%a/";
 		}
 		return $url;
 	});
