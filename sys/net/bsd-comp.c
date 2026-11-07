@@ -909,7 +909,7 @@ bsd_decompress(void *state, struct mbuf *cmp, struct mbuf **dmpp)
 	    break;
 	}
 
-	if (incode > max_ent + 2 || incode > db->maxmaxcode
+	if (incode > max_ent + 1 || incode > db->maxmaxcode
 	    || (incode > max_ent && oldcode == CLEAR)) {
 	    m_freem(mret);
 	    if (db->debug) {
