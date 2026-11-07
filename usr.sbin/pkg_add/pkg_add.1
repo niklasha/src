@@ -153,7 +153,13 @@ environment variable.
 The special url
 .Sq installpath
 refers to the contents of
-.Xr installurl 5 .
+.Xr installurl 5 :
+the Appli baseline packages directory,
+.Pa bl43/packages/ ,
+followed by the release ones,
+.Pa 8.0/packages-stable/
+and
+.Pa 8.0/packages/ .
 If neither
 .Ev TRUSTED_PKG_PATH
 nor
