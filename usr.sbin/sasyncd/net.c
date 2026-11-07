@@ -73,6 +73,17 @@ AES_KEY	aes_key[2];
 static u_int8_t *net_read(struct syncpeer *, u_int32_t *, u_int32_t *);
 static int	 net_set_sa(struct sockaddr *, char *, in_port_t);
 static void	 net_check_peers(void *);
+static void	 net_retry_peers(void *);
+static void	 net_schedule_retry(void);
+
+/*
+ * An unconnected peer is tried again after NET_RETRY_MIN seconds, doubling
+ * up to NET_RETRY_MAX while it stays away (see net_schedule_retry()).
+ */
+#define NET_RETRY_MIN	10
+#define NET_RETRY_MAX	300
+static u_int32_t	 net_retry_interval;
+static int		 net_retry_pending, net_shutting_down;
 
 /* Pretty-print a buffer. */
 void
@@ -620,6 +631,8 @@ net_disconnect_peer(struct syncpeer *p)
 		close(p->socket);
 	}
 	p->socket = -1;
+	if (!net_shutting_down)
+		net_schedule_retry();
 }
 
 void
@@ -630,6 +643,7 @@ net_shutdown(void)
 	struct msg	*m;
 	int		 i;
 
+	net_shutting_down = 1;
 	while ((p = LIST_FIRST(&cfgstate.peerlist))) {
 		while ((qm = SIMPLEQ_FIRST(&p->msgs))) {
 			SIMPLEQ_REMOVE_HEAD(&p->msgs, next);
@@ -840,6 +854,8 @@ net_connect(void)
 	setitimer(ITIMER_REAL, &iv, NULL);
 	signal(SIGALRM, SIG_IGN);
 
+	net_schedule_retry();
+
 	return;
 }
 
@@ -848,4 +864,45 @@ net_check_peers(void *arg)
 {
 	net_connect();
 	(void)timer_add("peer recheck", 600, net_check_peers, 0);
+}
+
+/*
+ * Make sure an unconnected peer is tried again soon.  Without this only a
+ * carp state change or the ten-minute recheck retried, and the first attempt
+ * after a reboot is often made before the network is up: the new BACKUP then
+ * held no SAs for up to ten minutes, and a failover in that window meant an
+ * IPsec outage.  Back off from NET_RETRY_MIN to NET_RETRY_MAX seconds while
+ * the peer stays away; start over once every peer is connected.
+ */
+static void
+net_schedule_retry(void)
+{
+	struct syncpeer	*p;
+
+	for (p = LIST_FIRST(&cfgstate.peerlist); p; p = LIST_NEXT(p, link))
+		if (p->socket == -1)
+			break;
+	if (p == NULL) {
+		net_retry_interval = 0;
+		return;
+	}
+	if (net_retry_pending)
+		return;
+	if (net_retry_interval == 0)
+		net_retry_interval = NET_RETRY_MIN;
+	if (timer_add("peer retry", net_retry_interval, net_retry_peers, 0))
+		return;
+	net_retry_pending = 1;
+	log_msg(2, "net: retrying unconnected peers in %us",
+	    net_retry_interval);
+	net_retry_interval *= 2;
+	if (net_retry_interval > NET_RETRY_MAX)
+		net_retry_interval = NET_RETRY_MAX;
+}
+
+static void
+net_retry_peers(void *arg)
+{
+	net_retry_pending = 0;
+	net_connect();
 }
