@@ -2610,6 +2610,7 @@
 ./usr/share/man/man8/crunchgen.8
 ./usr/share/man/man8/cvsbug.8
 ./usr/share/man/man8/daily.8
+./usr/share/man/man8/dbupdate.8
 ./usr/share/man/man8/dev_mkdb.8
 ./usr/share/man/man8/dhcp6leasectl.8
 ./usr/share/man/man8/dhcp6leased.8

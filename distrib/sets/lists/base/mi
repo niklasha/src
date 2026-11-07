@@ -2931,6 +2931,7 @@
 ./usr/sbin/crunchgen
 ./usr/sbin/cryptoadm
 ./usr/sbin/cryptoinit
+./usr/sbin/dbupdate
 ./usr/sbin/dev_mkdb
 ./usr/sbin/dhcp6leasectl
 ./usr/sbin/dhcpd

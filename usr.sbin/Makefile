@@ -4,8 +4,8 @@
 
 SUBDIR=	ac accton acme-client acpidump adduser amd apm apmd arp authpf \
 	bgpctl bgpd bgplgd bpflogd btrace chroot config cron crunchgen \
-	dev_mkdb dhcp6leasectl dhcpd dhcpleasectl dhcrelay dhcrelay6 \
-	dvmrpctl dvmrpd \
+	dbupdate dev_mkdb dhcp6leasectl dhcpd dhcpleasectl dhcrelay \
+	dhcrelay6 dvmrpctl dvmrpd \
 	edquota eeprom eigrpd eigrpctl fdformat ftp-proxy fw_update gpioctl \
 	hostapd hostctl hotplugd httpd identd ifstated ikectl inetd \
 	installboot iostat iscsictl iscsid kgmon kvm_mkdb ldapd ldapctl \
