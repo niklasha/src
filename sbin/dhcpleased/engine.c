@@ -121,6 +121,8 @@ struct dhcpleased_iface {
 	uint32_t			 renewal_time;
 	uint32_t			 rebinding_time;
 	uint32_t			 ipv6_only_time;
+	int				 configured;	/* address added by us */
+	int				 lease_kept;	/* past a failed reboot */
 };
 
 LIST_HEAD(, dhcpleased_iface) dhcpleased_interfaces;
@@ -1278,6 +1280,12 @@ parse_dhcp(struct dhcpleased_iface *iface, struct imsg_dhcp *dhcp)
 			return;
 		}
 
+		/* A lease kept past a failed reboot goes for a different offer */
+		if (iface->lease_kept &&
+		    iface->requested_ip.s_addr != dhcp_hdr->yiaddr.s_addr) {
+			send_rdns_withdraw(iface);
+			send_deconfigure_interface(iface);
+		}
 		iface->server_identifier = server_identifier;
 		iface->dhcp_server = server_identifier;
 		iface->requested_ip = dhcp_hdr->yiaddr;
@@ -1404,6 +1412,9 @@ parse_dhcp(struct dhcpleased_iface *iface, struct imsg_dhcp *dhcp)
 			return;
 		}
 
+		/* Unlike a silence, final: delete the address, kept or not */
+		send_rdns_withdraw(iface);
+		send_deconfigure_interface(iface);
 		state_transition(iface, IF_INIT);
 		break;
 	default:
@@ -1422,6 +1433,17 @@ parse_dhcp(struct dhcpleased_iface *iface, struct imsg_dhcp *dhcp)
 }
 
 /* XXX check valid transitions */
+/* Whether the lease we configured has run out */
+static int
+lease_expired(struct dhcpleased_iface *iface)
+{
+	struct timespec	 now, res;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	timespecsub(&now, &iface->request_time, &res);
+	return (res.tv_sec >= iface->lease_time);
+}
+
 void
 state_transition(struct dhcpleased_iface *iface, enum if_state new_state)
 {
@@ -1434,6 +1456,11 @@ state_transition(struct dhcpleased_iface *iface, enum if_state new_state)
 	case IF_DOWN:
 		if (iface->requested_ip.s_addr == INADDR_ANY) {
 			/* nothing to do until iface comes up */
+			iface->timo.tv_sec = -1;
+			break;
+		}
+		if (iface->lease_kept && !iface->configured) {
+			/* An address we never configured: not ours to delete */
 			iface->timo.tv_sec = -1;
 			break;
 		}
@@ -1456,14 +1483,41 @@ state_transition(struct dhcpleased_iface *iface, enum if_state new_state)
 		case IF_INIT:
 			if (iface->timo.tv_sec < MAX_EXP_BACKOFF_SLOW)
 				iface->timo.tv_sec *= 2;
+			/* A lease kept past a failed reboot, until it runs out */
+			if (iface->lease_kept && iface->configured &&
+			    lease_expired(iface)) {
+				send_rdns_withdraw(iface);
+				send_deconfigure_interface(iface);
+			}
 			break;
+		case IF_REBOOTING:
+			/*
+			 * No answer to the request for our address.  RFC 2131
+			 * 4.4.2 lets us keep using it until the lease runs out,
+			 * which carp(4) and the like need, as their
+			 * authentication covers the addresses; and an address
+			 * we never configured, from the lease file, is not ours
+			 * to delete.  A DHCPNAK deletes it before we get here.
+			 */
+			if (iface->requested_ip.s_addr != INADDR_ANY &&
+			    !(iface->configured && lease_expired(iface))) {
+				iface->lease_kept = 1;
+				iface->timo.tv_sec = START_EXP_BACKOFF;
+				iface->xid = arc4random();
+				break;
+			}
+			/* FALLTHROUGH */
 		case IF_REQUESTING:
 		case IF_RENEWING:
 		case IF_REBINDING:
-		case IF_REBOOTING:
-			/* lease expired, got DHCPNAK or timeout: delete IP */
-			send_rdns_withdraw(iface);
-			send_deconfigure_interface(iface);
+			/*
+			 * lease expired, got DHCPNAK or timeout: delete IP,
+			 * unless the one kept, which the offer was for
+			 */
+			if (!iface->lease_kept) {
+				send_rdns_withdraw(iface);
+				send_deconfigure_interface(iface);
+			}
 			/* fall through */
 		case IF_DOWN:
 		case IF_IPV6_ONLY:
@@ -1494,6 +1548,7 @@ state_transition(struct dhcpleased_iface *iface, enum if_state new_state)
 		break;
 	case IF_BOUND:
 		iface->timo.tv_sec = iface->renewal_time;
+		iface->lease_kept = 0;
 		if (old_state == IF_REQUESTING || old_state == IF_REBOOTING) {
 			send_configure_interface(iface);
 			send_rdns_proposal(iface);
@@ -1753,6 +1808,7 @@ send_configure_interface(struct dhcpleased_iface *iface)
 	memcpy(imsg.routes, iface->routes, sizeof(imsg.routes));
 	engine_imsg_compose_main(IMSG_CONFIGURE_INTERFACE, 0, &imsg,
 	    sizeof(imsg));
+	iface->configured = 1;
 }
 
 void
@@ -1783,6 +1839,8 @@ send_deconfigure_interface(struct dhcpleased_iface *iface)
 	iface->dhcp_server.s_addr = INADDR_ANY;
 	iface->requested_ip.s_addr = INADDR_ANY;
 	iface->mask.s_addr = INADDR_ANY;
+	iface->configured = 0;
+	iface->lease_kept = 0;
 	iface->routes_len = 0;
 	memset(iface->routes, 0, sizeof(iface->routes));
 }
