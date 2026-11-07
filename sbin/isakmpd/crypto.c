@@ -188,8 +188,9 @@ cast1_decrypt(struct keystate *ks, u_int8_t *data, u_int16_t len)
 enum cryptoerr
 aes_init(struct keystate *ks, u_int8_t *key, u_int16_t len)
 {
-	AES_set_encrypt_key(key, len << 3, &ks->ks_aes[0]);
-	AES_set_decrypt_key(key, len << 3, &ks->ks_aes[1]);
+	if (AES_set_encrypt_key(key, len << 3, &ks->ks_aes[0]) != 0 ||
+	    AES_set_decrypt_key(key, len << 3, &ks->ks_aes[1]) != 0)
+		return EKEYLEN;
 	return EOKAY;
 }
 
@@ -252,8 +253,8 @@ crypto_init(struct crypto_xf *xf, u_int8_t *key, u_int16_t len,
 
 	*err = xf->init(ks, key, len);
 	if (*err != EOKAY) {
-		LOG_DBG((LOG_CRYPTO, 30, "crypto_init: weak key found for %s",
-		    xf->name));
+		LOG_DBG((LOG_CRYPTO, 30, "crypto_init: %s key setup failed "
+		    "(key length %u, error %d)", xf->name, len, *err));
 		freezero(ks, sizeof *ks);
 		return 0;
 	}

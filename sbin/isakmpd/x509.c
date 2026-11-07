@@ -1279,12 +1279,15 @@ x509_cert_get_key(void *scert, void *keyp)
 	X509		*cert = scert;
 	EVP_PKEY	*key;
 
-	key = X509_get_pubkey(cert);
+	key = X509_get0_pubkey(cert);
+	if (key == NULL) {
+		log_print("x509_cert_get_key: failed to get public key");
+		return 0;
+	}
 
 	/* Check if we got the right key type.  */
 	if (EVP_PKEY_id(key) != EVP_PKEY_RSA) {
 		log_print("x509_cert_get_key: public key is not a RSA key");
-		X509_free(cert);
 		return 0;
 	}
 	*(RSA **)keyp = RSAPublicKey_dup(EVP_PKEY_get0_RSA(key));

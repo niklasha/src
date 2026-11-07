@@ -1499,6 +1499,8 @@ exchange_finalize(struct message *msg)
 	/* If we have nothing to retransmit we can safely remove ourselves.  */
 	if (!exchange->last_sent)
 		exchange_free(exchange);
+	else
+		exchange->flags |= EXCHANGE_FLAG_FINALIZED;
 }
 
 /* Stash a nonce into the exchange data.  */
