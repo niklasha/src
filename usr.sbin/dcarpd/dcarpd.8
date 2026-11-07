@@ -173,6 +173,25 @@ So does a member in the INIT state, which sends nothing,
 for example one whose
 .Fl i
 interface has no address yet.
+While the
+.Fl i
+interface has no IPv4 address,
+.Nm
+holds a demotion of the interface groups it is in,
+as the kernel does for a
+.Xr carp 4
+device whose link is down:
+.Xr carp 4
+authenticates its advertisements over the addresses of the interface,
+so such a member accepts no advertisements and sends none the others
+accept, and becomes master beside the master.
+Demoted, it takes the configuration, and with it the address,
+of a master that has one,
+and the others prefer another master.
+The demotion is lifted when the interface has an address,
+and when
+.Nm
+exits.
 As master,
 .Nm
 takes it only from a sender with a better

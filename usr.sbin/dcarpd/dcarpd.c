@@ -101,6 +101,9 @@ in_addr_t learned_backup_gw;
  */
 in_addr_t learned_gw;
 
+/* Whether we hold a demotion of the carp interface's groups: no address */
+int demoted;
+
 /*
  * How often the -x hook was asked to run, the one running, whether it must
  * run again when that one exits, and the reaper of its processes
@@ -548,6 +551,8 @@ int distribute_ip_addresses() {
 void send_timer_callback(int fd, short event, void *arg) {
 	struct timeval tv = { DCARP_INTERVAL, 0 };
 
+	/* In case an address change went by unseen */
+	update_demote();
 	if (current_carp_state == CARP_STATE_MASTER)
 		distribute_ip_addresses();
 	evtimer_add(&send_timer, &tv);
@@ -1106,6 +1111,97 @@ out:
 	return (rv);
 }
 
+/*
+ * Adjust the demote count of every group the carp interface is in, as the
+ * kernel does for a carp device whose link is down, by the given amount.
+ */
+int demote_groups(int adj) {
+	struct ifgroupreq ifgr, ifga;
+	struct ifg_req *ifg;
+	unsigned int len;
+	int sockfd, rv = -1;
+
+	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sockfd < 0) {
+		log_perror("socket");
+		return (-1);
+	}
+	memset(&ifgr, 0, sizeof(ifgr));
+	strlcpy(ifgr.ifgr_name, global_options.interface_name,
+	    sizeof(ifgr.ifgr_name));
+	if (ioctl(sockfd, SIOCGIFGROUP, &ifgr) < 0) {
+		log_perror("ioctl SIOCGIFGROUP");
+		goto out;
+	}
+	len = ifgr.ifgr_len;
+	if ((ifgr.ifgr_groups = calloc(1, len)) == NULL) {
+		log_perror("calloc");
+		goto out;
+	}
+	if (ioctl(sockfd, SIOCGIFGROUP, &ifgr) < 0) {
+		log_perror("ioctl SIOCGIFGROUP");
+		free(ifgr.ifgr_groups);
+		goto out;
+	}
+	rv = 0;
+	for (ifg = ifgr.ifgr_groups; len >= sizeof(*ifg); ifg++,
+	    len -= sizeof(*ifg)) {
+		memset(&ifga, 0, sizeof(ifga));
+		strlcpy(ifga.ifgr_name, ifg->ifgrq_group,
+		    sizeof(ifga.ifgr_name));
+		ifga.ifgr_attrib.ifg_carp_demoted = adj;
+		if (ioctl(sockfd, SIOCSIFGATTR, &ifga) < 0) {
+			log_perror("ioctl SIOCSIFGATTR");
+			log_message(LOG_ERR, "could not %s group %s",
+			    adj > 0 ? "demote" : "undemote", ifga.ifgr_name);
+			rv = -1;
+		}
+	}
+	free(ifgr.ifgr_groups);
+out:
+	close(sockfd);
+	return (rv);
+}
+
+/*
+ * carp(4) authenticates its advertisements over the addresses of the
+ * interface, so a member without an address neither accepts the master's
+ * advertisements nor sends any the others accept; it becomes master
+ * beside the master.  Hold a demotion of the carp interface's groups while
+ * it has no address, so that as master it takes the configuration, the
+ * address, of a master that has one, which it rejects from a sender of no
+ * better priority, and so that the others prefer another master.
+ */
+void update_demote(void) {
+	in_addr_t ip, netmask;
+	int has;
+
+	if (global_options.dry_run)
+		return;
+	has = get_interface_ip_and_netmask(global_options.interface_name,
+	    &ip, &netmask) == 0;
+	if (!has && !demoted) {
+		if (demote_groups(1) == 0) {
+			demoted = 1;
+			log_message(LOG_NOTICE, "%s has no address: demoted "
+			    "its groups", global_options.interface_name);
+		}
+	} else if (has && demoted) {
+		if (demote_groups(-1) == 0) {
+			demoted = 0;
+			log_message(LOG_NOTICE, "%s has an address: lifted the "
+			    "demotion of its groups",
+			    global_options.interface_name);
+		}
+	}
+}
+
+/* On exit, lest the demotion stay for good */
+void lift_demote(void) {
+	if (demoted && demote_groups(-1) == 0)
+		demoted = 0;
+}
+
 /* Whether the interface has the given IPv4 address */
 int interface_has_address(const char *if_name, in_addr_t ip) {
 	struct ifaddrs *ifaddr, *ifa;
@@ -1197,6 +1293,7 @@ void routing_callback(int fd, short event, void *arg) {
 		log_message(LOG_DEBUG, "Received %s for %s",
 		    rtm->rtm_type == RTM_NEWADDR ? "RTM_NEWADDR" : "RTM_DELADDR",
 		    global_options.interface_name);
+		update_demote();
 
 		/*
 		 * While the address we know is there, this is our own change
@@ -1431,6 +1528,7 @@ int main(int argc, char *argv[]) {
 	my_generation = lease_generation();
 	log_message(LOG_INFO, "generation %lld%s", (long long)my_generation,
 	    my_generation ? " from the DHCP lease" : ", no DHCP lease");
+	update_demote();
     
 	signal(SIGINT, handle_signal);
 	signal(SIGHUP, handle_signal);
@@ -1568,7 +1666,8 @@ void handle_signal(int signal)
 {
 	switch (signal) {
         case SIGTERM:
-		close_multicast_socket(); // You need to implement this
+		lift_demote();
+		close_multicast_socket();
 		log_message(LOG_NOTICE, "terminated by SIGTERM");
 		log_close();
 		exit(EXIT_SUCCESS);
