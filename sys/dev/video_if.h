@@ -69,5 +69,6 @@ struct video_attach_args {
 
 struct device  *video_attach_mi(const struct video_hw_if *, void *,
 	    struct device *);
+void	video_mmap_revoke(caddr_t, size_t);
 
 #endif /* _SYS_DEV_VIDEO_IF_H */
