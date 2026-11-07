@@ -461,7 +461,16 @@ codel_dequeue(struct codel *cd, struct codel_params *cp, int64_t now,
 		case DROPPING:
 			m = codel_commit(cd, m);
 			ml_enqueue(free_ml, m);
-			cd->drops++;
+
+			/*
+			 * Prevent counter wrap. Once drops saturates, lower
+			 * ldrops to preserve the delta for grace-period reuse,
+			 * until the delta itself saturates
+			 */
+			if (cd->drops < USHRT_MAX)
+				cd->drops++;
+			else if (cd->ldrops > 0)
+				cd->ldrops--;
 
 			*dpkts += 1;
 			*dbytes += m->m_pkthdr.len;
