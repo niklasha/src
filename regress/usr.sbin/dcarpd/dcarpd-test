@@ -37,7 +37,7 @@
 #	 replay | tampered | wrong-key | encrypted | sync-interface |
 #	 periodic | address-change | split-brain | address-follow |
 #	 older-generation | lower-priority | equal-priority | init-takes |
-#	 backup-follows-master | three-members | backup-gateway-kept | stale
+#	 no-address | backup-follows-master | three-members | backup-gateway-kept | stale
 
 : ${OBJDIR?} ${DCARPD?} ${REPLAY?}
 
@@ -112,6 +112,14 @@ retry() {
 
 carp_is() {	# $1 = interface, $2 = state
 	[ "$(ifconfig $1 | sed -n 's/.*carp: \([A-Z]*\) .*/\1/p')" = $2 ]
+}
+
+demote() {	# $1 = group
+	ifconfig -g $1 | sed -n 's/.*carp demote count \([0-9]*\).*/\1/p'
+}
+
+demote_is() {	# $1 = group, $2 = count
+	[ "$(demote $1)" = $2 ]
 }
 
 defroute() {	# $1 = rdomain, the backup's by default
@@ -627,6 +635,39 @@ init-takes)
 	grep -q "carp$RB is in INIT state" $BLOG ||
 	    fail "backup dcarpd did not see carp$RB as INIT"
 	;;
+no-address)
+	# A member whose carp interface has no address holds a demotion of
+	# the interface's groups while it has none: as master it then takes
+	# the address of a master that has one.  Note that the groups are
+	# host-wide: the count of "carp" rises for every carp(4) on the host
+	# while the test runs.
+	setup default
+	before=$(demote carp)
+	run ifconfig carp$RB $PREFIX.77 delete
+	run ifconfig carp$RB up
+	retry carp_is carp$RB INIT || fail "carp$RB without an address not INIT"
+	start_backup
+	retry demote_is carp $((before + 1)) ||
+	    fail "group carp not demoted: $(demote carp), was $before"
+	grep -q "carp$RB has no address: demoted its groups" $BLOG ||
+	    fail "backup dcarpd did not log the demotion"
+	start_master $PREFIX.254
+	retry only_address carp$RB $PREFIX.77 ||
+	    fail "carp$RB did not take $PREFIX.77: $(addresses carp$RB)"
+	retry demote_is carp $before ||
+	    fail "demotion not lifted with the address: $(demote carp)"
+	# A backup with its address taken away is demoted again
+	run ifconfig carp$RB $PREFIX.77 delete
+	retry demote_is carp $((before + 1)) ||
+	    fail "group carp not demoted again: $(demote carp)"
+	# Exiting lifts the demotion
+	kill $bpid 2>/dev/null || fail "backup dcarpd died"
+	wait $bpid 2>/dev/null
+	bpid=
+	retry demote_is carp $before ||
+	    fail "demotion not lifted on exit: $(demote carp)"
+	stop_master
+	;;
 backup-follows-master)
 	# Without preemption a member of better priority that comes back
 	# stays backup: carp(4) has elected the other, so it must take the
@@ -734,7 +775,8 @@ stale)
 	    "log-live | replay | tampered | wrong-key | encrypted |" \
 	    "sync-interface | periodic | address-change | split-brain |" \
 	    "address-follow | older-generation | lower-priority |" \
-	    "equal-priority | init-takes | backup-follows-master |" \
+	    "equal-priority | init-takes | no-address |" \
+	    "backup-follows-master |" \
 	    "three-members |" \
 	    "backup-gateway-kept | stale" >&2
 	exit 2
