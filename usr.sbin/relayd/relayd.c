@@ -195,6 +195,16 @@ main(int argc, char *argv[])
 	/* initialize the TLS session id to a random key for all relay procs */
 	arc4random_buf(env->sc_conf.tls_sid, sizeof(env->sc_conf.tls_sid));
 
+	/*
+	 * parse_config() opens the certificate, key and OCSP files of
+	 * every TLS listener and keeps them open until the configuration
+	 * has been handed to the other processes.  Many "tls keypair"s
+	 * times several "listen on" lines exceed the soft limit of the
+	 * daemon login class, so allow its maximum here, as the relay and
+	 * hce processes do.
+	 */
+	socket_rlimit(-1);
+
 	if (parse_config(env->sc_conffile, env) == -1)
 		exit(1);
 
