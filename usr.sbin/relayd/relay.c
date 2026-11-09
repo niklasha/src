@@ -94,6 +94,13 @@ objid_t relay_conid;
 
 static struct relayd		*env = NULL;
 
+/*
+ * Reload bookkeeping: table resets received from the parent and reset
+ * markers received from pfe.  While the two differ, a host status from
+ * pfe may refer to a host of the previous configuration.
+ */
+static u_int			 parent_resets, pfe_resets;
+
 static struct privsep_proc procs[] = {
 	{ "parent",	PROC_PARENT,	relay_dispatch_parent },
 	{ "pfe",	PROC_PFE,	relay_dispatch_pfe },
@@ -1920,9 +1927,19 @@ relay_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 		TAILQ_FOREACH(host, &table->hosts, entry)
 			host->up = HOST_UNKNOWN;
 		break;
+	case IMSG_CTL_RESET:
+		/* pfe reset marker, see pfe_dispatch_parent() */
+		pfe_resets++;
+		break;
 	case IMSG_HOST_STATUS:
 		if (imsg_get_data(imsg, &st, sizeof(st)) == -1)
 			fatalx("%s: imsg_get_data", __func__);
+		if (pfe_resets != parent_resets) {
+			/* forwarded before pfe saw the reload, stale id */
+			log_debug("%s: reload in progress, dropping status "
+			    "for host %u", __func__, st.id);
+			break;
+		}
 		if ((host = host_find(env, st.id)) == NULL)
 			fatalx("%s: invalid host id", __func__);
 		if (host->flags & F_DISABLE)
@@ -2015,6 +2032,7 @@ relay_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct rsession		*con;
 	struct timeval		 tv;
 	objid_t			 id;
+	u_int			 mode;
 
 	switch (imsg_get_type(imsg)) {
 	case IMSG_BINDANY:
@@ -2070,8 +2088,13 @@ relay_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		relay_launch();
 		break;
 	case IMSG_CTL_RESET:
-		if (config_getreset(env, imsg) != 0)
+		if (imsg_get_data(imsg, &mode, sizeof(mode)) == -1) {
+			log_warn("%s: imsg_get_data", __func__);
 			return (-1);
+		}
+		if (mode & CONFIG_TABLES)
+			parent_resets++;
+		config_purge(env, mode);
 		break;
 	case IMSG_TLSTICKET_REKEY:
 		if (imsg_get_data(imsg, &env->sc_ticket,

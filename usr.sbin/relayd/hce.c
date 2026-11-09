@@ -78,8 +78,10 @@ hce_setup_events(void)
 	struct timeval	 tv;
 	struct table	*table;
 
-	if (!event_initialized(&env->sc_ev)) {
+	if (!event_initialized(&env->sc_ev))
 		evtimer_set(&env->sc_ev, hce_launch_checks, env);
+	/* First start, or restart after hce_stop_checks() */
+	if (!evtimer_pending(&env->sc_ev, NULL)) {
 		bzero(&tv, sizeof(tv));
 		evtimer_add(&env->sc_ev, &tv);
 	}
@@ -95,6 +97,28 @@ hce_setup_events(void)
 			tls_config_insecure_noverifycert(table->tls_cfg);
 			tls_config_insecure_noverifyname(table->tls_cfg);
 		}
+	}
+}
+
+/*
+ * Stop the periodic checks for a reload.  Pending TCP/TLS checks are
+ * cancelled when their hosts are purged; the ICMP events and the check
+ * timer must not fire on a partially received configuration.  The
+ * checks are restarted by hce_setup_events() on IMSG_CTL_START, after
+ * pfe and the relays have received the whole new configuration.
+ */
+static void
+hce_stop_checks(void)
+{
+	if (event_initialized(&env->sc_ev))
+		evtimer_del(&env->sc_ev);
+	if (env->sc_has_icmp) {
+		event_del(&env->sc_icmp_send.ev);
+		event_del(&env->sc_icmp_recv.ev);
+	}
+	if (env->sc_has_icmp6) {
+		event_del(&env->sc_icmp6_send.ev);
+		event_del(&env->sc_icmp6_recv.ev);
 	}
 }
 
@@ -330,6 +354,12 @@ hce_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 			host->up = HOST_UNKNOWN;
 		break;
 	case IMSG_CTL_POLL:
+		if (!evtimer_pending(&env->sc_ev, NULL)) {
+			/* stopped for a reload, restarted by IMSG_CTL_START */
+			log_debug("%s: reload in progress, poll ignored",
+			    __func__);
+			break;
+		}
 		evtimer_del(&env->sc_ev);
 		TAILQ_FOREACH(table, env->sc_tables, entry)
 			table->skipped = 0;
@@ -346,6 +376,7 @@ int
 hce_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
 	struct ctl_script	 scr;
+	u_int			 mode;
 
 	switch (imsg_get_type(imsg)) {
 	case IMSG_SCRIPT:
@@ -369,8 +400,29 @@ hce_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		hce_setup_events();
 		break;
 	case IMSG_CTL_RESET:
-		if (config_getreset(env, imsg) != 0)
+		if (imsg_get_data(imsg, &mode, sizeof(mode)) == -1) {
+			log_warn("%s: imsg_get_data", __func__);
 			return (-1);
+		}
+		/*
+		 * Only a table reset purges hce (ps_what is CONFIG_TABLES)
+		 * and is counted by pfe, so only then stop the checks and
+		 * send the marker.  A reload follows the reset with the new
+		 * configuration and IMSG_CTL_START, which restarts them.
+		 */
+		if (mode & CONFIG_TABLES)
+			hce_stop_checks();
+		config_purge(env, mode);
+		if (mode & CONFIG_TABLES) {
+			/*
+			 * Every host status sent to pfe from now on
+			 * refers to the new tables; tell pfe (see
+			 * pfe_dispatch_hce()).
+			 */
+			if (proc_compose(env->sc_ps, PROC_PFE,
+			    IMSG_CTL_RESET, NULL, 0) == -1)
+				fatal("%s: proc_compose", __func__);
+		}
 		break;
 	default:
 		return (-1);

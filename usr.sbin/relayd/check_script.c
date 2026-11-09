@@ -66,8 +66,17 @@ script_done(struct relayd *env, struct ctl_script *scr)
 {
 	struct host		*host;
 
-	if ((host = host_find(env, scr->host)) == NULL)
-		fatalx("%s: invalid host id", __func__);
+	/*
+	 * The parent answers a script started before a reload after the
+	 * hosts were purged: the host is gone, or it is a new host with
+	 * the same id that has no script check pending.
+	 */
+	if ((host = host_find(env, scr->host)) == NULL ||
+	    (host->flags & (F_CHECK_SENT|F_CHECK_DONE)) != F_CHECK_SENT) {
+		log_debug("%s: no check pending for host %u, ignored",
+		    __func__, scr->host);
+		return;
+	}
 
 	if (scr->retval < 0)
 		host->up = HOST_UNKNOWN;
