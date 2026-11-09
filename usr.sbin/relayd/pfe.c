@@ -48,6 +48,14 @@ int	 pfe_dispatch_relay(int, struct privsep_proc *, struct imsg *);
 
 static struct relayd		*env = NULL;
 
+/*
+ * Reload bookkeeping: table resets received from the parent and reset
+ * markers received from hce.  hce sends its marker after it has purged
+ * its tables and stopped its checks, so while the two differ, a host
+ * status from hce may refer to a host of the previous configuration.
+ */
+static u_int			 parent_resets, hce_resets;
+
 static struct privsep_proc procs[] = {
 	{ "parent",	PROC_PARENT,	pfe_dispatch_parent },
 	{ "relay",	PROC_RELAY,	pfe_dispatch_relay },
@@ -124,12 +132,24 @@ pfe_dispatch_hce(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct table		*table;
 	struct ctl_status	 st;
 
+	if (imsg_get_type(imsg) == IMSG_CTL_RESET) {
+		/* hce reset marker, internal: not for relayctl monitor */
+		hce_resets++;
+		return (0);
+	}
+
 	control_imsg_forward(imsg);
 
 	switch (imsg_get_type(imsg)) {
 	case IMSG_HOST_STATUS:
 		if (imsg_get_data(imsg, &st, sizeof(st)) == -1)
 			return (-1);
+		if (hce_resets != parent_resets) {
+			/* sent before hce saw the reload, ids are stale */
+			log_debug("%s: reload in progress, dropping status "
+			    "for host %u", __func__, st.id);
+			break;
+		}
 		if ((host = host_find(env, st.id)) == NULL)
 			fatalx("%s: invalid host id", __func__);
 		host->he = st.he;
@@ -200,6 +220,8 @@ pfe_dispatch_hce(int fd, struct privsep_proc *p, struct imsg *imsg)
 int
 pfe_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
+	u_int		 mode;
+
 	switch (imsg_get_type(imsg)) {
 	case IMSG_CFG_TABLE:
 		if (config_gettable(env, imsg) != 0)
@@ -248,8 +270,21 @@ pfe_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		pfe_sync();
 		break;
 	case IMSG_CTL_RESET:
-		if (config_getreset(env, imsg) != 0)
+		if (imsg_get_data(imsg, &mode, sizeof(mode)) == -1) {
+			log_warn("%s: imsg_get_data", __func__);
 			return (-1);
+		}
+		if (mode & CONFIG_TABLES) {
+			parent_resets++;
+			/*
+			 * Every host status forwarded to the relays from
+			 * now on refers to the new tables; tell them.
+			 */
+			if (proc_compose(env->sc_ps, PROC_RELAY,
+			    IMSG_CTL_RESET, &mode, sizeof(mode)) == -1)
+				fatal("%s: proc_compose", __func__);
+		}
+		config_purge(env, mode);
 		break;
 	case IMSG_AGENTXSOCK:
 		agentx_getsock(imsg);
@@ -289,8 +324,16 @@ pfe_dispatch_relay(int fd, struct privsep_proc *p, struct imsg *imsg)
 			return (-1);
 		if (crs.proc > env->sc_conf.prefork_relay)
 			fatalx("%s: invalid relay proc", __func__);
-		if ((rlay = relay_find(env, crs.id)) == NULL)
-			fatalx("%s: invalid relay id", __func__);
+		if ((rlay = relay_find(env, crs.id)) == NULL) {
+			/*
+			 * The relays send statistics on their own timer,
+			 * also while a reload purges and reloads the
+			 * relays here and in the relay processes.
+			 */
+			log_debug("%s: statistics for unknown relay %u, "
+			    "ignored", __func__, crs.id);
+			break;
+		}
 		bcopy(&crs, &rlay->rl_stats[crs.proc], sizeof(crs));
 		rlay->rl_stats[crs.proc].interval =
 		    env->sc_conf.statinterval.tv_sec;
