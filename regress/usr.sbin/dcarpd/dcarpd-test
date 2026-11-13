@@ -37,7 +37,7 @@
 #	 replay | tampered | wrong-key | encrypted | sync-interface |
 #	 periodic | address-change | split-brain | address-follow |
 #	 older-generation | lower-priority | equal-priority | init-takes |
-#	 no-address | backup-follows-master | three-members | backup-gateway-kept | stale
+#	 no-address | demote-lifted | backup-follows-master | three-members | backup-gateway-kept | stale
 
 : ${OBJDIR?} ${DCARPD?} ${REPLAY?}
 
@@ -668,6 +668,38 @@ no-address)
 	    fail "demotion not lifted on exit: $(demote carp)"
 	stop_master
 	;;
+demote-lifted)
+	# Another program lifts the demotion dcarpd holds.  When the address
+	# comes back, dcarpd finds the count already 0: it holds no demotion
+	# there any more, and must neither fail nor retry for good.  Needs
+	# the count of "carp" at 0, so that lifting it is seen.
+	setup default
+	before=$(demote carp)
+	[ "$before" = 0 ] || { echo "carp demote count $before, not 0"; \
+	    echo SKIPPED; cleanup; exit 0; }
+	run ifconfig carp$RB $PREFIX.77 delete
+	run ifconfig carp$RB up
+	retry carp_is carp$RB INIT || fail "carp$RB without an address not INIT"
+	start_backup
+	retry demote_is carp 1 || fail "group carp not demoted: $(demote carp)"
+	run ifconfig -g carp -carpdemote 1
+	start_master $PREFIX.254
+	retry only_address carp$RB $PREFIX.77 ||
+	    fail "carp$RB did not take $PREFIX.77: $(addresses carp$RB)"
+	retry grep -q "the demotion of group carp was already lifted" $BLOG ||
+	    fail "lifting an already lifted demotion not logged"
+	retry grep -q "carp$RB has an address: lifted the demotion" $BLOG ||
+	    fail "backup dcarpd still holds a demotion"
+	sleep 3
+	! grep -q "could not undemote" $BLOG ||
+	    fail "backup dcarpd failed to undemote"
+	demote_is carp 0 || fail "group carp demote count $(demote carp)"
+	kill $bpid 2>/dev/null || fail "backup dcarpd died"
+	wait $bpid 2>/dev/null
+	bpid=
+	demote_is carp 0 || fail "group carp demote count $(demote carp) on exit"
+	stop_master
+	;;
 backup-follows-master)
 	# Without preemption a member of better priority that comes back
 	# stays backup: carp(4) has elected the other, so it must take the
@@ -775,7 +807,7 @@ stale)
 	    "log-live | replay | tampered | wrong-key | encrypted |" \
 	    "sync-interface | periodic | address-change | split-brain |" \
 	    "address-follow | older-generation | lower-priority |" \
-	    "equal-priority | init-takes | no-address |" \
+	    "equal-priority | init-takes | no-address | demote-lifted |" \
 	    "backup-follows-master |" \
 	    "three-members |" \
 	    "backup-gateway-kept | stale" >&2

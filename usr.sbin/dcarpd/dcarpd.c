@@ -105,6 +105,15 @@ in_addr_t learned_gw;
 int demoted;
 
 /*
+ * The groups we demoted, so that we lift exactly our own demotion: the
+ * interface may join or leave groups meanwhile (egress follows the default
+ * route), and another program may lift a group's demotion.
+ */
+#define DEMOTED_MAX	16
+char demoted_groups[DEMOTED_MAX][IFNAMSIZ];
+int ndemoted;
+
+/*
  * How often the -x hook was asked to run, the one running, whether it must
  * run again when that one exits, and the reaper of its processes
  */
@@ -1111,15 +1120,26 @@ out:
 	return (rv);
 }
 
+/* Adjust the carp demote count of a group by adj */
+static int group_demote(int sockfd, const char *group, int adj) {
+	struct ifgroupreq ifga;
+
+	memset(&ifga, 0, sizeof(ifga));
+	strlcpy(ifga.ifgr_name, group, sizeof(ifga.ifgr_name));
+	ifga.ifgr_attrib.ifg_carp_demoted = adj;
+	return (ioctl(sockfd, SIOCSIFGATTR, &ifga));
+}
+
 /*
- * Adjust the demote count of every group the carp interface is in, as the
- * kernel does for a carp device whose link is down, by the given amount.
+ * Demote every group the carp interface is in by one, as the kernel does
+ * for a carp device whose link is down, and remember which we demoted.
+ * Returns 0 if we hold a demotion of at least one group.
  */
-int demote_groups(int adj) {
-	struct ifgroupreq ifgr, ifga;
+int demote_groups(void) {
+	struct ifgroupreq ifgr;
 	struct ifg_req *ifg;
 	unsigned int len;
-	int sockfd, rv = -1;
+	int i, sockfd;
 
 	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sockfd < 0) {
@@ -1143,24 +1163,65 @@ int demote_groups(int adj) {
 		free(ifgr.ifgr_groups);
 		goto out;
 	}
-	rv = 0;
 	for (ifg = ifgr.ifgr_groups; len >= sizeof(*ifg); ifg++,
 	    len -= sizeof(*ifg)) {
-		memset(&ifga, 0, sizeof(ifga));
-		strlcpy(ifga.ifgr_name, ifg->ifgrq_group,
-		    sizeof(ifga.ifgr_name));
-		ifga.ifgr_attrib.ifg_carp_demoted = adj;
-		if (ioctl(sockfd, SIOCSIFGATTR, &ifga) < 0) {
-			log_perror("ioctl SIOCSIFGATTR");
-			log_message(LOG_ERR, "could not %s group %s",
-			    adj > 0 ? "demote" : "undemote", ifga.ifgr_name);
-			rv = -1;
+		for (i = 0; i < ndemoted; i++)
+			if (strcmp(demoted_groups[i], ifg->ifgrq_group) == 0)
+				break;
+		if (i < ndemoted)
+			continue;
+		if (ndemoted == DEMOTED_MAX) {
+			log_message(LOG_ERR, "too many groups, not demoting %s",
+			    ifg->ifgrq_group);
+			continue;
 		}
+		if (group_demote(sockfd, ifg->ifgrq_group, 1) < 0) {
+			log_perror("ioctl SIOCSIFGATTR");
+			log_message(LOG_ERR, "could not demote group %s",
+			    ifg->ifgrq_group);
+			continue;
+		}
+		strlcpy(demoted_groups[ndemoted++], ifg->ifgrq_group,
+		    sizeof(demoted_groups[0]));
 	}
 	free(ifgr.ifgr_groups);
 out:
 	close(sockfd);
-	return (rv);
+	return (ndemoted > 0 ? 0 : -1);
+}
+
+/*
+ * Lift the demotion of the groups we demoted.  A group whose demote count
+ * is already 0 (EINVAL) or which is gone (ENOENT) had its demotion lifted
+ * elsewhere: we hold none there any more.  Returns 0 once we hold none.
+ */
+int undemote_groups(void) {
+	int i, j, sockfd;
+
+	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sockfd < 0) {
+		log_perror("socket");
+		return (-1);
+	}
+	for (i = j = 0; i < ndemoted; i++) {
+		if (group_demote(sockfd, demoted_groups[i], -1) == 0)
+			continue;
+		if (errno == EINVAL || errno == ENOENT) {
+			log_message(LOG_NOTICE, "the demotion of group %s was "
+			    "already lifted", demoted_groups[i]);
+			continue;
+		}
+		log_perror("ioctl SIOCSIFGATTR");
+		log_message(LOG_ERR, "could not undemote group %s",
+		    demoted_groups[i]);
+		if (j != i)
+			memcpy(demoted_groups[j], demoted_groups[i],
+			    sizeof(demoted_groups[0]));
+		j++;
+	}
+	ndemoted = j;
+	close(sockfd);
+	return (ndemoted == 0 ? 0 : -1);
 }
 
 /*
@@ -1181,13 +1242,13 @@ void update_demote(void) {
 	has = get_interface_ip_and_netmask(global_options.interface_name,
 	    &ip, &netmask) == 0;
 	if (!has && !demoted) {
-		if (demote_groups(1) == 0) {
+		if (demote_groups() == 0) {
 			demoted = 1;
 			log_message(LOG_NOTICE, "%s has no address: demoted "
 			    "its groups", global_options.interface_name);
 		}
 	} else if (has && demoted) {
-		if (demote_groups(-1) == 0) {
+		if (undemote_groups() == 0) {
 			demoted = 0;
 			log_message(LOG_NOTICE, "%s has an address: lifted the "
 			    "demotion of its groups",
@@ -1198,7 +1259,7 @@ void update_demote(void) {
 
 /* On exit, lest the demotion stay for good */
 void lift_demote(void) {
-	if (demoted && demote_groups(-1) == 0)
+	if (demoted && undemote_groups() == 0)
 		demoted = 0;
 }
 

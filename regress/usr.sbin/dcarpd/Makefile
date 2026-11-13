@@ -49,7 +49,7 @@ TESTS =		state-file gateway-from-route other-carp log-live \
 		replay tampered wrong-key encrypted sync-interface \
 		periodic address-change split-brain address-follow \
 		older-generation lower-priority equal-priority init-takes \
-		no-address \
+		no-address demote-lifted \
 		backup-follows-master three-members backup-gateway-kept stale
 
 # Waits for a recorded message to age out.
