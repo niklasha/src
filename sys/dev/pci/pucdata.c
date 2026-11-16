@@ -75,6 +75,13 @@ const struct puc_device_description puc_devs[] = {
 		{ PUC_PORT_COM, 0x10, 0x0000 },
 	    },
 	},
+	{	/* C610 KT (Wellsburg / Haswell-EP AMT Serial-over-LAN) */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_C610_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
 	{	/* 9 Series KT */
 	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_9SERIES_KT, 0x0000, 0x0000 },
 	    {	0xffff, 0xffff,					0x0000, 0x0000 },
