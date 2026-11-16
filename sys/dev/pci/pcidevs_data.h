@@ -25180,6 +25180,14 @@ static const struct pci_known_product pci_known_products[] = {
 	    "C610 MEI",
 	},
 	{
+	    PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_C610_IDER,
+	    "C610 IDE-R",
+	},
+	{
+	    PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_C610_KT,
+	    "C610 KT",
+	},
+	{
 	    PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_C610_LPC,
 	    "C610 LPC",
 	},
