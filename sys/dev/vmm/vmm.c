@@ -63,6 +63,7 @@ int	vm_intr_pending(struct vm *, struct vm_intr_params *);
 int	vm_resetcpu(struct vm *, struct vm_resetcpu_params *);
 int	vm_rwvmparams(struct vm *, struct vm_rwvmparams_params *, int);
 int	vm_share_mem(struct vm *, struct vm_sharemem_params *, struct proc *);
+static void vm_unwire_page(struct vm_page *);
 void	vm_teardown(struct vm **);
 int	vm_rele(struct vm *);
 void	vm_request_stop(struct vm *);
@@ -386,6 +387,8 @@ vm_create(struct vm_create_params *vcp, struct proc *p)
 
 	/* Instantiate and configure the new vm. */
 	vm = pool_get(&vm_pool, PR_WAITOK | PR_ZERO);
+	TAILQ_INIT(&vm->vm_memory_pages);
+	rw_init(&vm->vm_memory_lock, "vmmem");
 
 	/* Create the VM's identity. */
 	vm->vm_creator_pid = p->p_p->ps_pid;
@@ -595,6 +598,7 @@ vm_teardown(struct vm **target)
 	struct vcpu *vcpu, *tmp;
 	struct vm *vm = *target;
 	struct uvm_object *uao;
+	struct vm_page *pg;
 
 	KERNEL_ASSERT_UNLOCKED();
 
@@ -613,6 +617,13 @@ vm_teardown(struct vm **target)
 		pmap_remove(vm->vm_pmap, sva, eva);
 	}
 
+	/* Nested translations are gone; release the VM's page wires. */
+	while (!TAILQ_EMPTY(&vm->vm_memory_pages)) {
+		pg = TAILQ_FIRST(&vm->vm_memory_pages);
+		TAILQ_REMOVE(&vm->vm_memory_pages, pg, pageq);
+		vm_unwire_page(pg);
+	}
+
 	/* Release UVM anon objects backing our guest memory. */
 	for (i = 0; i < vm->vm_nmemranges; i++) {
 		uao = vm->vm_memory_slot[i];
@@ -627,6 +638,77 @@ vm_teardown(struct vm **target)
 
 	pool_put(&vm_pool, vm);
 	*target = NULL;
+}
+
+/* Release one wire while the VM still owns the backing object. */
+static void
+vm_unwire_page(struct vm_page *pg)
+{
+	struct uvm_object *uobj = pg->uobject;
+
+	rw_enter_write(uobj->vmobjlock);
+	uvm_pageunwire(pg);
+	rw_exit_write(uobj->vmobjlock);
+}
+
+/*
+ * Populate one nested mapping from its VM-owned anonymous object.  EPT
+ * mappings do not participate in UVM's reverse mappings, so the VM must
+ * keep each backing page wired until its nested mappings are removed.
+ * In particular, a page already resident in a process map is not pinned.
+ *
+ * Serialize the lookup, wire and insertion so simultaneous vCPU faults
+ * cannot take duplicate wires or replace a live nested translation.  The
+ * UAO and wire also preserve the page when creator/helper mappings go away.
+ */
+int
+vm_fault_page(struct vm *vm, paddr_t gpa)
+{
+	struct vm_mem_range *vmr;
+	struct uvm_object *uobj = NULL;
+	struct vm_page *pg;
+	struct pglist pages;
+	voff_t off = 0;
+	paddr_t hpa;
+	size_t i;
+	int error;
+
+	gpa = trunc_page(gpa);
+	for (i = 0; i < vm->vm_nmemranges; i++) {
+		vmr = &vm->vm_memranges[i];
+		if (gpa >= vmr->vmr_gpa &&
+		    gpa - vmr->vmr_gpa < vmr->vmr_size) {
+			uobj = vm->vm_memory_slot[i];
+			off = gpa - vmr->vmr_gpa;
+			break;
+		}
+	}
+	if (uobj == NULL)
+		return (EFAULT);
+
+	rw_enter_write(&vm->vm_memory_lock);
+	if (pmap_extract(vm->vm_pmap, gpa, &hpa)) {
+		error = 0;
+		goto out;
+	}
+
+	TAILQ_INIT(&pages);
+	error = uvm_obj_wire(uobj, off, off + PAGE_SIZE, &pages);
+	if (error)
+		goto out;
+	pg = TAILQ_FIRST(&pages);
+	KASSERT(pg != NULL && TAILQ_NEXT(pg, pageq) == NULL);
+	TAILQ_REMOVE(&pages, pg, pageq);
+	hpa = VM_PAGE_TO_PHYS(pg);
+	error = pmap_enter(vm->vm_pmap, gpa, hpa,
+	    PROT_READ | PROT_WRITE | PROT_EXEC, PMAP_CANFAIL);
+	if (error)
+		vm_unwire_page(pg);
+	else
+		TAILQ_INSERT_TAIL(&vm->vm_memory_pages, pg, pageq);
+out:
+	rw_exit_write(&vm->vm_memory_lock);
+	return (error);
 }
 
 void

@@ -153,6 +153,7 @@ enum {
  *	a	atomic operations
  *	I	immutable after create
  *	K	kernel lock
+ *	m	memory rwlock (vm_memory_lock)
  *	r	reference count
  *	v	vcpu list rwlock (vm_vcpu_list)
  *	V	vmm_softc's vm_lock
@@ -167,6 +168,8 @@ struct vm {
 	size_t			 vm_memory_size;	/* [I] */
 	struct vm_mem_range	 vm_memranges[VMM_MAX_MEM_RANGES];
 	struct uvm_object	*vm_memory_slot[VMM_MAX_MEM_RANGES]; /* [I] */
+	TAILQ_HEAD(, vm_page)	 vm_memory_pages;	/* [m] VM-owned wires */
+	struct rwlock		 vm_memory_lock;
 
 	char			 vm_name[VMM_MAX_NAME_LEN];
 	struct refcnt		 vm_refcnt;		/* [a] */
@@ -232,6 +235,7 @@ struct vcpu *vm_find_vcpu(struct vm *, uint32_t);
 int vm_rwvmparams(struct vm *, struct vm_rwvmparams_params *, int);
 int vcpu_must_yield(struct vcpu *);
 int vm_run(struct vm *, struct vm_run_params *);
+int vm_fault_page(struct vm *, paddr_t);
 
 #ifdef VMM_DEBUG
 void dump_vcpu(struct vcpu *);

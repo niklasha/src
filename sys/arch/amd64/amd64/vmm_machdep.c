@@ -5189,43 +5189,12 @@ svm_get_guest_faulttype(struct vmcb *vmcb)
 enum vmm_action
 svm_fault_page(struct vcpu *vcpu, paddr_t gpa)
 {
-	struct proc *p = curproc;
-	paddr_t hpa, pa = trunc_page(gpa);
-	vaddr_t hva;
 	int ret;
 
-	hva = vmm_translate_gpa(vcpu->vc_parent, pa);
-	if (hva == 0) {
-		printf("%s: unable to translate gpa 0x%llx\n", __func__,
-		    (uint64_t)pa);
-		return (VMM_ACTION_TERMINATE);
-	}
-
-	/* If we don't already have a backing page... */
-	if (!pmap_extract(p->p_vmspace->vm_map.pmap, hva, &hpa)) {
-		/* ...fault a RW page into the p's address space... */
-		ret = uvm_fault_wire(&p->p_vmspace->vm_map, hva,
-		    hva + PAGE_SIZE, PROT_READ | PROT_WRITE);
-		if (ret) {
-			printf("%s: uvm_fault failed %d hva=0x%llx\n", __func__,
-			    ret, (uint64_t)hva);
-			return (VMM_ACTION_TERMINATE);
-		}
-
-		/* ...and then get the mapping. */
-		if (!pmap_extract(p->p_vmspace->vm_map.pmap, hva, &hpa)) {
-			printf("%s: failed to extract hpa for hva 0x%llx\n",
-			    __func__, (uint64_t)hva);
-			return (VMM_ACTION_TERMINATE);
-		}
-	}
-
-	/* Now we insert a RWX mapping into the guest's RVI pmap. */
-	ret = pmap_enter(vcpu->vc_parent->vm_pmap, pa, hpa,
-	    PROT_READ | PROT_WRITE | PROT_EXEC, 0);
+	ret = vm_fault_page(vcpu->vc_parent, gpa);
 	if (ret) {
-		printf("%s: pmap_enter failed pa=0x%llx, hpa=0x%llx\n",
-		    __func__, (uint64_t)pa, (uint64_t)hpa);
+		printf("%s: backing page failed %d gpa=0x%llx\n",
+		    __func__, ret, (uint64_t)gpa);
 		return (VMM_ACTION_TERMINATE);
 	}
 
@@ -5302,11 +5271,7 @@ svm_handle_np_fault(struct vcpu *vcpu)
 enum vmm_action
 vmx_fault_page(struct vcpu *vcpu, paddr_t gpa)
 {
-	struct proc *p = curproc;
-	enum vmm_action action = VMM_ACTION_TERMINATE;
 	int fault_type, error;
-	paddr_t hpa, pa = trunc_page(gpa);
-	vaddr_t hva;
 
 	fault_type = vmx_get_guest_faulttype();
 	switch (fault_type) {
@@ -5321,52 +5286,20 @@ vmx_fault_page(struct vcpu *vcpu, paddr_t gpa)
 		break;
 	}
 
-	hva = vmm_translate_gpa(vcpu->vc_parent, pa);
-	if (hva == 0) {
-		printf("%s: unable to translate gpa 0x%llx\n", __func__,
-		    (uint64_t)pa);
+	vcpu->vc_last_pcpu = curcpu(); /* Backing-page acquisition may sleep. */
+	error = vm_fault_page(vcpu->vc_parent, gpa);
+	if (error)
+		printf("%s: backing page failed %d gpa=0x%llx\n",
+		    __func__, error, (uint64_t)gpa);
+	/*
+	 * Reload even on failure: either the memory lock or UVM may have
+	 * slept, and vcpu_run_vmx() reads the VMCS on its way out.
+	 */
+	if (vcpu_reload_vmcs_vmx(vcpu)) {
+		printf("%s: failed to reload vmcs\n", __func__);
 		return (VMM_ACTION_TERMINATE);
 	}
-
-	/* If we don't already have a backing page... */
-	if (!pmap_extract(p->p_vmspace->vm_map.pmap, hva, &hpa)) {
-		/* ...fault a RW page into the p's address space... */
-		vcpu->vc_last_pcpu = curcpu(); /* uvm_fault may sleep. */
-		error = uvm_fault_wire(&p->p_vmspace->vm_map, hva,
-		    hva + PAGE_SIZE, PROT_READ | PROT_WRITE);
-		if (error)
-			printf("%s: uvm_fault failed %d hva=0x%llx\n", __func__,
-			    error, (uint64_t)hva);
-		/*
-		 * Reload even if the fault failed: we may have slept and
-		 * moved cpus, and vcpu_run_vmx() reads the VMCS and records
-		 * curcpu() in vc_last_pcpu on its way out.
-		 */
-		if (vcpu_reload_vmcs_vmx(vcpu)) {
-			printf("%s: failed to reload vmcs\n", __func__);
-			return (VMM_ACTION_TERMINATE);
-		}
-		if (error)
-			return (VMM_ACTION_TERMINATE);
-
-		/* ...and then get the mapping. */
-		if (!pmap_extract(p->p_vmspace->vm_map.pmap, hva, &hpa)) {
-			printf("%s: failed to extract hpa for hva 0x%llx\n",
-			    __func__, (uint64_t)hva);
-			return (VMM_ACTION_TERMINATE);
-		}
-	}
-
-	/* Now we insert a RWX mapping into the guest's EPT pmap. */
-	if (pmap_enter(vcpu->vc_parent->vm_pmap, pa, hpa,
-	    PROT_READ | PROT_WRITE | PROT_EXEC, 0)) {
-		printf("%s: pmap_enter failed pa=0x%llx, hpa=0x%llx\n",
-		    __func__, (uint64_t)pa, (uint64_t)hpa);
-		action = VMM_ACTION_TERMINATE;
-	} else
-		action = VMM_ACTION_RETRY;
-
-	return (action);
+	return (error ? VMM_ACTION_TERMINATE : VMM_ACTION_RETRY);
 }
 
 /*
