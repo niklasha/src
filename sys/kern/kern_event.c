@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_event.c,v 1.206 2026/06/01 18:24:58 mvs Exp $	*/
+/*	$OpenBSD: kern_event.c,v 1.206.2.1 2026/11/17 12:25:45 bluhm Exp $	*/
 
 /*-
  * Copyright (c) 1999,2000,2001 Jonathan Lemon <jlemon@FreeBSD.org>
@@ -380,6 +380,8 @@ filt_procattach(struct knote *kn)
 	if (pr->ps_flags & PS_EXITING)
 		goto fail;
 
+	/* Keep exit1() from passing us while the list lock can sleep. */
+	refcnt_take(&pr->ps_refcnt);
 	kn->kn_ptr.p_process = pr;
 	kn->kn_flags |= EV_CLEAR;		/* automatically set */
 
@@ -402,6 +404,7 @@ filt_procattach(struct knote *kn)
 	mtx_leave(&pr->ps_mtx);
 	if (!nolock)
 		rw_exit_write(&kqueue_ps_list_lock);
+	refcnt_rele_wake(&pr->ps_refcnt);
 
 	KERNEL_UNLOCK();
 
