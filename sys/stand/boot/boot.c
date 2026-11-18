@@ -70,6 +70,10 @@ boot(dev_t bootdev)
 	snprintf(prog_ident, sizeof(prog_ident),
 	    ">> OpenBSD/" MACHINE " %s %s", progname, version);
 	printf("%s\n", prog_ident);
+#ifdef CHECK_SKIP_CONF
+	printf("Hold Ctrl during startup to skip /etc/boot.conf "
+	    "and stop autoboot.\n");
+#endif
 
 	devboot(bootdev, cmd.bootdev);
 	strlcpy(cmd.image, kernelfile, sizeof(cmd.image));
