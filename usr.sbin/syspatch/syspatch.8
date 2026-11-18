@@ -58,6 +58,13 @@ If any sets are missing, patches are skipped accordingly.
 Patches are cumulative and as such it is not possible to install only a subset
 of them.
 .Pp
+If applying or reverting a patch changes boot loader files in
+.Pa /usr/mdec ,
+.Nm
+reports that
+.Xr installboot 8
+must be run on the boot disk or disks to activate those files.
+.Pp
 The options are as follows:
 .Bl -tag -width Ds
 .It Fl O
