@@ -32,6 +32,22 @@ usage()
 	return 1
 }
 
+report_bootloader()
+{
+	local _file
+
+	for _file in "$@"; do
+		case ${_file#./} in
+		usr/mdec/boot|usr/mdec/biosboot|usr/mdec/BOOTIA32.EFI|usr/mdec/BOOTX64.EFI)
+			echo "Boot loader files changed in /usr/mdec."
+			echo "Run installboot -v on the boot disk(s) to activate them."
+			break
+			;;
+		esac
+	done
+	return 0
+}
+
 apply_patch()
 {
 	local _edir _file _files _kernel _patch=$1 _rc=0 _s _upself=false
@@ -80,6 +96,7 @@ ${_KERNEL} (supported: ${_KERNELS})"
 	fi
 	# don't fill up /tmp when installing multiple patches at once; non-fatal
 	rm -rf ${_edir} ${_TMP}/syspatch${_patch}.tgz
+	report_bootloader ${_files}
 	trap exit INT
 
 	echo ${_files} | grep -Eqv \
@@ -239,6 +256,7 @@ rollback_patch()
 	((_rc == 0)) ||
 		err "Failed to revert patch ${_patch##${_PFX}-}" ${_rc}
 	rm -rf ${_edir} # don't fill up /tmp when using `-R'; non-fatal
+	report_bootloader ${_files}
 	trap exit INT
 
 	echo ${_files} | grep -Eqv \
