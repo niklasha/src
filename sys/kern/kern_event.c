@@ -380,6 +380,8 @@ filt_procattach(struct knote *kn)
 	if (pr->ps_flags & PS_EXITING)
 		goto fail;
 
+	/* Keep exit1() from passing us while the list lock can sleep. */
+	refcnt_take(&pr->ps_refcnt);
 	kn->kn_ptr.p_process = pr;
 	kn->kn_flags |= EV_CLEAR;		/* automatically set */
 
@@ -402,6 +404,7 @@ filt_procattach(struct knote *kn)
 	mtx_leave(&pr->ps_mtx);
 	if (!nolock)
 		rw_exit_write(&kqueue_ps_list_lock);
+	refcnt_rele_wake(&pr->ps_refcnt);
 
 	KERNEL_UNLOCK();
 
