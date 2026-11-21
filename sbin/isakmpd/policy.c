@@ -1,4 +1,4 @@
-/* $OpenBSD: policy.c,v 1.104 2026/06/23 13:31:24 hshoexer Exp $	 */
+/* $OpenBSD: policy.c,v 1.107 2026/10/03 01:38:25 deraadt Exp $	 */
 /* $EOM: policy.c,v 1.49 2000/10/24 13:33:39 niklas Exp $ */
 
 /*
@@ -1948,7 +1948,7 @@ policy_init(void)
 		policy_file = CONF_DFLT_POLICY_FILE;
 
 	/* Open policy file.  */
-	fd = monitor_open(policy_file, O_RDONLY, 0);
+	fd = monitor_open(policy_file, O_RDONLY);
 	if (fd == -1)
 		log_fatal("policy_init: open (\"%s\", O_RDONLY) failed",
 		    policy_file);
@@ -2164,6 +2164,14 @@ keynote_cert_obtain(u_int8_t *id, size_t id_len, void *data, u_int8_t **cert,
 
 	case IPSEC_ID_FQDN:
 	case IPSEC_ID_USER_FQDN:
+		/* The ID becomes exactly one pathname component. */
+		if (id_len == 0 || memchr(id, '\0', id_len) != NULL ||
+		    memchr(id, '/', id_len) != NULL ||
+		    (id_len == 1 && id[0] == '.') ||
+		    (id_len == 2 && memcmp(id, "..", 2) == 0)) {
+			log_print("keynote_cert_obtain: invalid textual ID");
+			return 0;
+		}
 		file = calloc(len + id_len, sizeof(char));
 		if (file == NULL) {
 			log_error("keynote_cert_obtain: "
@@ -2181,7 +2189,7 @@ keynote_cert_obtain(u_int8_t *id, size_t id_len, void *data, u_int8_t **cert,
 		return 0;
 	}
 
-	fd = monitor_open(file, O_RDONLY, 0);
+	fd = monitor_open(file, O_RDONLY);
 	if (fd < 0) {
 		LOG_DBG((LOG_POLICY, 30, "keynote_cert_obtain: "
 		    "failed to open \"%s\"", file));
@@ -2211,8 +2219,8 @@ keynote_cert_obtain(u_int8_t *id, size_t id_len, void *data, u_int8_t **cert,
 		LOG_DBG((LOG_POLICY, 30, "keynote_cert_obtain: "
 		    "failed to read %lu bytes from \"%s\"",
 		    (unsigned long)size, file));
-		free(cert);
-		cert = NULL;
+		free(*cert);
+		*cert = NULL;
 		free(file);
 		close(fd);
 		return 0;
