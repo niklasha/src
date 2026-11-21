@@ -1,4 +1,4 @@
-/*	$OpenBSD: qwx.c,v 1.144 2026/09/28 14:42:22 gnezdo Exp $	*/
+/*	$OpenBSD: qwx.c,v 1.146 2026/10/02 11:24:18 stsp Exp $	*/
 
 /*
  * Copyright 2023 Stefan Sperling <stsp@openbsd.org>
@@ -9847,6 +9847,8 @@ qwx_hal_srng_access_end(struct qwx_softc *sc, struct hal_srng *srng)
 		}
 	} else {
 		if (srng->ring_dir == HAL_SRNG_DIR_SRC) {
+			bus_dmamap_sync(sc->sc_dmat, QWX_DMA_MAP(sc->hal.wrpmem), 0,
+			    QWX_DMA_LEN(sc->hal.wrpmem), BUS_DMASYNC_POSTWRITE);
 			srng->u.src_ring.last_tp =
 			    *(volatile uint32_t *)srng->u.src_ring.tp_addr;
 			sc->ops.write32(sc,
@@ -16834,7 +16836,7 @@ qwx_hal_wbm_desc_parse_err(void *desc, struct hal_rx_wbm_rel_info *rel_info)
 
 	/* We expect only WBM_REL buffer type */
 	if (type != HAL_WBM_REL_DESC_TYPE_REL_MSDU)
-		return -EINVAL;
+		return EINVAL;
 
 	rel_src = FIELD_GET(HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE,
 	    wbm_desc->info0);
@@ -19777,7 +19779,7 @@ qwx_wmi_vdev_install_key(struct qwx_softc *sc,
 
 	m = qwx_wmi_alloc_mbuf(len);
 	if (m == NULL)
-		return -ENOMEM;
+		return ENOMEM;
 
 	cmd = (struct wmi_vdev_install_key_cmd *)(mtod(m, uint8_t *) +
 	    sizeof(struct ath11k_htc_hdr) + sizeof(struct wmi_cmd_hdr));
