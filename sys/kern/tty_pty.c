@@ -819,6 +819,11 @@ ptyioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
 	} else if (cdevsw[major(dev)].d_open == ptcopen)
 		switch (cmd) {
 
+		case TIOCSCTTY:
+		case TIOCNOTTY:
+		case TIOCSPGRP:
+			return (ENOTTY);
+
 		case TIOCGPGRP:
 			/*
 			 * We avoid calling ttioctl on the controller since,
