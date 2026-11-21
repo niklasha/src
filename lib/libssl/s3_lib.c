@@ -2511,7 +2511,8 @@ ssl3_renegotiate_check(SSL *s)
 {
 	if (!s->s3->renegotiate)
 		return 0;
-	if (SSL_in_init(s) || s->s3->rbuf.left != 0 || s->s3->wbuf.left != 0)
+	if (SSL_in_init(s) || s->s3->rbuf.left != 0 || s->s3->wbuf.left != 0 ||
+	    s->s3->tls_wrec != NULL)
 		return 0;
 
 	s->s3->hs.state = SSL_ST_RENEGOTIATE;
