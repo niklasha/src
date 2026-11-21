@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_http.c,v 1.104 2026/09/16 00:16:10 rsadowski Exp $	*/
+/*	$OpenBSD: relay_http.c,v 1.107 2026/10/02 18:06:20 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -215,6 +215,16 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	for (;;) {
 		line = evbuffer_readln(src, &linelen, EVBUFFER_EOL_CRLF);
 		if (line == NULL) {
+			/*
+			 * Do not buffer an unterminated line beyond
+			 * the header limit.
+			 */
+			if (EVBUFFER_LENGTH(src) >
+			    proto->httpheaderlen - cre->headerlen) {
+				relay_abort_http(con, 413,
+				    "request headers too large", 0);
+				goto abort;
+			}
 			/*
 			 * We do not process the last header on premature
 			 * EOF as it may not be complete.
@@ -732,8 +742,17 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 	case TOREAD_HTTP_CHUNK_LENGTH:
 		line = evbuffer_readln(src, &linelen, EVBUFFER_EOL_CRLF);
 		if (line == NULL) {
+			if (EVBUFFER_LENGTH(src) > proto->httpheaderlen) {
+				relay_close(con, "chunk size too long", 1);
+				return;
+			}
 			/* Ignore empty line, continue */
 			bufferevent_enable(bev, EV_READ);
+			return;
+		}
+		if (linelen > proto->httpheaderlen) {
+			free(line);
+			relay_close(con, "chunk size too long", 1);
 			return;
 		}
 		if (linelen == 0) {
@@ -776,10 +795,21 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		/* Last chunk is 0 bytes followed by trailer and empty line */
 		line = evbuffer_readln(src, &linelen, EVBUFFER_EOL_CRLF);
 		if (line == NULL) {
+			if (EVBUFFER_LENGTH(src) >
+			    proto->httpheaderlen - cre->headerlen) {
+				relay_close(con, "chunk trailer too long", 1);
+				return;
+			}
 			/* Ignore empty line, continue */
 			bufferevent_enable(bev, EV_READ);
 			return;
 		}
+		if (linelen > proto->httpheaderlen - cre->headerlen) {
+			free(line);
+			relay_close(con, "chunk trailer too long", 1);
+			return;
+		}
+		cre->headerlen += linelen;
 		if (relay_bufferevent_print(cre->dst, line) == -1 ||
 		    relay_bufferevent_print(cre->dst, "\r\n") == -1) {
 			free(line);
@@ -787,6 +817,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		}
 		if (linelen == 0) {
 			/* Switch to HTTP header mode */
+			cre->headerlen = 0;
 			cre->toread = TOREAD_HTTP_HEADER;
 			bev->readcb = relay_read_http;
 		}
@@ -1587,7 +1618,7 @@ relay_httpurl_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 	host = kv_find(&desc->http_headers, &key);
 
 	if (host == NULL || host->kv_value == NULL)
-		return (0);
+		return (RES_BAD);
 	else if (rule->rule_action != RULE_ACTION_BLOCK &&
 	    kv->kv_option == KEY_OPTION_LOG &&
 	    kv_match_key(kv, match->kv_key, FNM_CASEFOLD)) {
