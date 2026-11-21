@@ -247,7 +247,7 @@ unpack_dname(struct asr_unpack *p, char *dst, size_t max)
 		p->err = EINVAL;
 		return (-1);
 	}
-	if (e < 0 || e > MAXDNAME) {
+	if (e < 0 || e > MAXCDNAME) {
 		p->err = ERANGE;
 		return (-1);
 	}
