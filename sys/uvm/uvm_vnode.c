@@ -46,6 +46,7 @@
  */
 
 #include <sys/param.h>
+#include <sys/atomic.h>
 #include <sys/systm.h>
 #include <sys/pool.h>
 #include <sys/proc.h>
@@ -207,14 +208,12 @@ uvn_attach(struct vnode *vp, vm_prot_t accessprot)
 	if (uvn->u_flags & UVM_VNODE_VALID) {	/* already active? */
 
 		/* regain vref if we were persisting */
-		if (uvn->u_obj.uo_refs == 0) {
+		if (atomic_inc_int_nv(&uvn->u_obj.uo_refs) == 1)
 			vref(vp);
-		}
-		uvn->u_obj.uo_refs++;		/* bump uvn ref! */
 	} else {
 		/* now set up the uvn. */
 		KASSERT(uvn->u_obj.uo_refs == 0);
-		uvn->u_obj.uo_refs++;
+		atomic_inc_int(&uvn->u_obj.uo_refs);
 		uvn->u_flags = UVM_VNODE_VALID|UVM_VNODE_CANPERSIST;
 		uvn->u_nio = 0;
 		uvn->u_size = used_vnode_size;
@@ -269,7 +268,7 @@ uvn_reference(struct uvm_object *uobj)
 		panic("uvn_reference: invalid state");
 	}
 #endif
-	uobj->uo_refs++;
+	atomic_inc_int(&uobj->uo_refs);
 	rw_exit(uobj->vmobjlock);
 }
 
@@ -289,14 +288,14 @@ uvn_detach(struct uvm_object *uobj)
 	struct vnode *vp;
 	int oldflags;
 
+	KERNEL_LOCK();
 	rw_enter(uobj->vmobjlock, RW_WRITE);
-	uobj->uo_refs--;			/* drop ref! */
-	if (uobj->uo_refs) {			/* still more refs */
+	if (atomic_dec_int_nv(&uobj->uo_refs) != 0) {
 		rw_exit(uobj->vmobjlock);
+		KERNEL_UNLOCK();
 		return;
 	}
 
-	KERNEL_LOCK();
 	/* get other pointers ... */
 	uvn = (struct uvm_vnode *) uobj;
 	vp = uvn->u_vnode;
@@ -1355,7 +1354,7 @@ uvm_vnp_uncache(struct vnode *vp)
 	 * it so that we can call uvn_detach to kill the uvn.
 	 */
 	vref(vp);			/* seems ok, even with VOP_LOCK */
-	uvn->u_obj.uo_refs++;		/* value is now 1 */
+	atomic_inc_int(&uvn->u_obj.uo_refs);	/* value is now 1 */
 	rw_exit(uobj->vmobjlock);
 
 #ifdef VFSLCKDEBUG
@@ -1473,11 +1472,11 @@ uvm_vnp_sync(struct mount *mp)
 
 		/*
 		 * gain reference.   watch out for persisting uvns (need to
-		 * regain vnode REF).
+		 * regain vnode REF).  uvn_reference() can take another
+		 * reference without the kernel lock.
 		 */
-		if (uvn->u_obj.uo_refs == 0)
+		if (atomic_inc_int_nv(&uvn->u_obj.uo_refs) == 1)
 			vref(vp);
-		uvn->u_obj.uo_refs++;
 
 		SIMPLEQ_INSERT_HEAD(&uvn_sync_q, uvn, u_syncq);
 	}
