@@ -130,6 +130,9 @@ monitor_init(int debug)
 
 		if (unveil(ISAKMPD_ROOT, "r") == -1)
 			log_fatal("monitor_init: unveil %s", ISAKMPD_ROOT);
+		/* monitor_exit() removes the control FIFO. */
+		if (strcmp(ui_fifo, "-") != 0 && unveil(ui_fifo, "c") == -1)
+			log_fatal("monitor_init: unveil %s", ui_fifo);
 		if (unveil(NULL, NULL) == -1)
 			log_fatal("monitor_init: unveil");
 
