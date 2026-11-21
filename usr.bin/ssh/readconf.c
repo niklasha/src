@@ -1,4 +1,4 @@
-/* $OpenBSD: readconf.c,v 1.417 2026/09/16 00:13:58 djm Exp $ */
+/* $OpenBSD: readconf.c,v 1.419 2026/10/05 06:03:40 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -2310,7 +2310,9 @@ parse_pubkey_algos:
 			error("%.200s line %d: Bad mask.", filename, linenum);
 			goto out;
 		}
-		options->fwd_opts.streamlocal_bind_mask = (mode_t)value;
+		if (*activep &&
+		    options->fwd_opts.streamlocal_bind_mask == (mode_t)-1)
+			options->fwd_opts.streamlocal_bind_mask = (mode_t)value;
 		break;
 
 	case oStreamLocalBindUnlink:
@@ -3442,13 +3444,10 @@ ssh_valid_ruser(const char *s)
 	for (i = 0; s[i] != 0; i++) {
 		if (iscntrl((u_char)s[i]))
 			return 0;
-		if (strchr("'`\";&<>|(){}", s[i]) != NULL)
+		if (strchr("'`\";&<>|(){}$\\", s[i]) != NULL)
 			return 0;
 		/* Disallow '-' after whitespace */
 		if (isspace((u_char)s[i]) && s[i + 1] == '-')
-			return 0;
-		/* Disallow \ in last position */
-		if (s[i] == '\\' && s[i + 1] == '\0')
 			return 0;
 	}
 	return 1;
