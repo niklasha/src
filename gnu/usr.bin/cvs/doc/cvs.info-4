@@ -1032,16 +1032,16 @@ Keyword List
 `$Date: 2001/09/30 19:44:54 $'
      The date and time (UTC) the revision was checked in.
 
-`$Header: /home/cvs/src/gnu/usr.bin/cvs/doc/cvs.info-4,v 1.3 2001/09/30 19:44:54 tholo Exp $'
+`$Header: /cvs/src/gnu/usr.bin/cvs/doc/cvs.info-4,v 1.3 2001/09/30 19:44:54 tholo Exp $'
      A standard header containing the full pathname of the RCS file,
      the revision number, the date (UTC), the author, the state, and
      the locker (if locked).  Files will normally never be locked when
      you use CVS.
 
 `$Id: cvs.info-4,v 1.3 2001/09/30 19:44:54 tholo Exp $'
-     Same as `$Header: /home/cvs/src/gnu/usr.bin/cvs/doc/cvs.info-4,v 1.3 2001/09/30 19:44:54 tholo Exp $', except that the RCS filename is without a path.
+     Same as `$Header: /cvs/src/gnu/usr.bin/cvs/doc/cvs.info-4,v 1.3 2001/09/30 19:44:54 tholo Exp $', except that the RCS filename is without a path.
 
-`$Name:  $'
+`$Name: OPENBSD_8_0_BASE $'
      Tag name used to check out this file.  The keyword is expanded
      only if one checks out with an explicit tag name.  For example,
      when running the command `cvs co -r first', the keyword expands to
@@ -1098,7 +1098,7 @@ Keyword List
 `$Revision: 1.3 $'
      The revision number assigned to the revision.
 
-`$Source: /home/cvs/src/gnu/usr.bin/cvs/doc/cvs.info-4,v $'
+`$Source: /cvs/src/gnu/usr.bin/cvs/doc/cvs.info-4,v $'
      The full pathname of the RCS file.
 
 `$State: Exp $'

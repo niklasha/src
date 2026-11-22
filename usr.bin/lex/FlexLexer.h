@@ -1,6 +1,6 @@
 /*	$OpenBSD: FlexLexer.h,v 1.7 2015/11/19 19:43:40 tedu Exp $	*/
 
-// $Header: /home/cvs/src/usr.bin/lex/FlexLexer.h,v 1.7 2015/11/19 19:43:40 tedu Exp $
+// $Header: /cvs/src/usr.bin/lex/FlexLexer.h,v 1.7 2015/11/19 19:43:40 tedu Exp $
 
 // -*-C++-*-
 // FlexLexer.h -- define interfaces for lexical analyzer classes generated
