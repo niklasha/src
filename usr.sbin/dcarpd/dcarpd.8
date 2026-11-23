@@ -14,15 +14,16 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 2 2026 $
+.Dd $Mdocdate: November 23 2026 $
 .Dt DCARPD 8
 .Os
 .Sh NAME
 .Nm dcarpd
-.Nd Daemon implementing DCARP protocol
+.Nd distribute a dynamic carp address to backup hosts
 .Sh SYNOPSIS
 .Nm
 .Op Fl dnv
+.Op Fl c Ar control_socket
 .Op Fl f Ar state_file
 .Op Fl g Ar backup_gateway
 .Fl i Ar interface
@@ -32,289 +33,261 @@
 .Sh DESCRIPTION
 The
 .Nm
-daemon implements the DCARP protocol for dynamic IP address sharing.
-It gives the address of a
+daemon implements the Distributed Common Address Redundancy Protocol
+.Pq DCARP
+for a
 .Xr carp 4
-interface, which the master may get from DHCP,
-to the backups,
-and writes it with the gateway of that network to a state file,
-from which
+interface whose IPv4 address the master typically gets from
+.Xr dhcpleased 8 .
+As master, it gives the address to the backups.
+On every host,
+.Nm
+writes the configuration it holds to a state file, from which
 .Xr ifstated 8
-or other scripts set the routes.
+or a program run by
+.Nm
+sets the routes;
 .Nm
 changes no routes itself.
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
+.It Fl c Ar control_socket
+Use
+.Ar control_socket
+instead of the default
+.Pa /dev/dhcpleased.sock
+to communicate with
+.Xr dhcpleased 8 .
 .It Fl d
 Do not daemonize.
 If this option is specified,
 .Nm
-will run in the foreground and log to standard error.
+will run in the foreground and log to
+.Em stderr .
+Without this option,
+.Nm
+sends log messages to
+.Xr syslog 3 .
 .It Fl f Ar state_file
-Write the configuration held to
+Use
 .Ar state_file
-instead of
+as the state file instead of the default
 .Pa /var/db/dcarpd/ Ns Ar interface .
 .It Fl g Ar backup_gateway
-This host's address on another network that it shares with the other
-members, typically an internal network.
-As master it announces it,
-and the other members use it as their gateway while they are backup and
-cannot reach the gateway of the
-.Fl i
-interface's network themselves.
+This host's IPv4 address on another network the hosts share, typically
+the internal one, for the others to use as gateway while this host is
+master.
 .It Fl i Ar interface
 The
 .Xr carp 4
-interface whose address
-.Nm
-manages.
+interface whose IPv4 address the hosts share.
+It must have exactly one
+.Cm vhid .
 .It Fl k Ar key_file
 Read the shared key from
 .Ar key_file
-instead of
+instead of the default
 .Pa /etc/dcarp.key .
-The file must be owned by root and not readable by group or others.
+The key is the SHA-256 hash of the first 4096 bytes of the file and
+must be the same on all hosts;
+.Nm
+logs a fingerprint of it when it reads the file.
+The file must not be readable by group or others, and must be owned by
+root unless
+.Fl n
+is given.
 .It Fl n
-Run in dry-run mode.
-In this mode, the daemon goes through all the motions but does not
-actually reconfigure network interfaces.
-This is useful for testing.
+Do not change the addresses of the interface or any carp demote
+counter, and do not require root.
+.Nm
+still sends messages as master, writes the state file and runs
+.Ar program .
 .It Fl s Ar sync_interface
-Send and receive the DCARP messages on
-.Ar sync_interface ,
-for example a dedicated link between the nodes,
-instead of on the
-.Fl i
-interface.
-Messages received on any other interface are rejected.
+Send and receive the messages on
+.Ar sync_interface
+instead of on
+.Ar interface .
+All hosts must use the same network for them.
 .It Fl v
-Increase verbosity.
-Can be specified multiple times.
+Also log messages of priority debug.
 .It Fl x Ar program
 Run
 .Ar program ,
-an absolute path,
-whenever the state file is written and whenever the
+the absolute path of an executable, whenever
+.Nm
+writes the state file or puts the address back, and when the
 .Xr carp 4
-state of the
-.Fl i
-interface changes,
-with the state file and the state,
+state of the interface changes.
+Its arguments are the state file and the current carp state:
 .Cm MASTER ,
 .Cm BACKUP
 or
-.Cm INIT ,
-as arguments,
-for example to set the routes.
+.Cm INIT .
+Runs do not overlap: requests made while one is running are combined
+into a single run when it exits.
 .Nm
-does not wait for it,
-but runs one at a time:
-a run asked for while one is running is started when that one exits,
-and then gets the state of that time.
-A
-.Ar program
-that exits with a status other than 0 is logged.
+does not wait for them, and logs failures.
 .El
 .Pp
 As master,
 .Nm
-sends the address and netmask of the
-.Fl i
-interface,
-the gateway of that network,
-which it takes from its default route if that goes through the
-.Fl i
-interface, such as one
+sends its configuration: the address and netmask of the interface, the
+gateway of that network
+.Pq normally that of its default route through the interface ,
+its
+.Ar backup_gateway ,
+how long the DHCP lease lasts, and the generation.
+Each message also carries the sender's
+.Xr carp 4
+priority.
+It sends a message when it starts or becomes master, when another
+program changes the address, and every 10 seconds.
+The messages are encrypted and authenticated with XChaCha20-Poly1305
+using the shared key, and sent as UDP datagrams to the multicast group
+224.0.0.18, port 3522, on the interface or
+.Ar sync_interface .
+.Pp
+The generation is the time the address was obtained or its DHCP lease
+last renewed.
+A change of the address that
+.Nm
+did not make starts a new generation, and so does each acknowledgement
+of the lease.
+The master reads the lease from
 .Xr dhcpleased 8
-adds from the lease,
-and its
-.Fl g
-backup gateway.
-A backup that has become master may still route via the old master;
-until it has a default route of its own through the
-.Fl i
-interface it sends the gateway it last took or sent,
-if that is on the interface's network.
-It sends them when it becomes master,
-when that address changes,
-and every 10 seconds.
+before each message, as
+.Ql dhcpleasectl -l
+does;
+.Nm
+never requests a new lease.
+At startup the generation is that in the state file, or 0 if the file is
+missing or the interface has another address.
 .Pp
-Each configuration has a generation:
-the modification time of the DHCP lease
-.Pa /var/db/dhcpleased/ Ns Ar interface ,
-or 0 without one,
-and the time
 .Nm
-sees the address of the
-.Fl i
-interface change otherwise.
-In any state
-.Nm
-takes a configuration of a newer generation than its own,
-and rejects and logs one of an older generation.
-So a backup that has become master because the master's address
-changed, and with it the
-.Xr carp 4
-authentication, takes the new address and returns to backup,
-and the master does not take the old address back from it.
-.Pp
-Of the same generation,
-a backup takes the configuration of any sender:
-only a master sends, and
-.Xr carp 4
-has elected it,
-even one of worse priority than the backup's, as after the backup
-comes back with
-.Va net.inet.carp.preempt
-disabled.
-So does a member in the INIT state, which sends nothing,
-for example one whose
-.Fl i
-interface has no address yet.
-While the
-.Fl i
-interface has no IPv4 address,
-.Nm
-holds a demotion of the interface groups it is in,
-as the kernel does for a
-.Xr carp 4
-device whose link is down:
-.Xr carp 4
-authenticates its advertisements over the addresses of the interface,
-so such a member accepts no advertisements and sends none the others
-accept, and becomes master beside the master.
-Demoted, it takes the configuration, and with it the address,
-of a master that has one,
-and the others prefer another master.
-The demotion is lifted when the interface has an address,
-and when
-.Nm
-exits.
-As master,
-.Nm
-takes it only from a sender with a better
-.Xr carp 4
-priority, that is a lower demote count, or else a lower advbase and
-advskew,
-and of the same priority from the sender with the lower sender id,
-a random number each
-.Nm
-chooses when it starts.
-This decides between members that are master at the same time,
-and see each other's messages but not each other's
-.Xr carp 4
-advertisements.
-It rejects and logs any other.
-.Pp
+accepts only messages that arrive on the interface it sends on,
+authenticate, are not replays, and carry a timestamp within 30 seconds
+of its clock, so the clocks of the hosts must agree within 30 seconds.
+It takes a configuration of a newer generation than its own and rejects
+one of an older generation.
+A master takes a configuration of the same generation only from a
+sender with a better priority: a lower demote count, or else a lower
+.Cm advbase ,
+or else a lower
+.Cm advskew ,
+with ties broken by a random sender id.
+A host that is not master takes it from any sender.
 To take a configuration,
 .Nm
-makes its address the only IPv4 address of the
-.Fl i
-interface and writes it to the state file,
-but only when it differs from the one it took last.
-As master it writes the configuration it sends,
-but keeps the backup gateway it learned from the member that was master
-before, which it needs when it becomes backup again;
-its own is no use to it.
-The state file consists of
+makes its address the only IPv4 address of the interface and writes the
+state file.
+Rejected messages are logged with their source address, at most one
+every 10 seconds.
+.Pp
+As backup,
+.Nm
+puts the address back whenever the interface has no IPv4 address, for
+example after
+.Xr dhcpleased 8
+removed it at the expiry of a lease obtained while the host was master.
+It never does so as master.
+.Pp
+While the interface has no IPv4 address,
+.Nm
+increases the carp demote counter of every group of the interface by
+one, among them
+.Ql carp
+and
+.Ql all ,
+which demotes every
+.Xr carp 4
+interface of the host.
+It decreases them again when the interface has an address.
+.Pp
+The state file holds
 .Xr sh 1
-variable assignments, replaced atomically:
-.Bl -tag -width DCARP_GENERATION
-.It Ev DCARP_INTERFACE
-The
-.Fl i
-interface.
-.It Ev DCARP_ADDRESS
-Its address.
-.It Ev DCARP_NETMASK
+variable assignments.
+.Nm
+replaces it atomically whenever the configuration it sends or takes
+changes, as at a lease renewal, and reads it when it starts.
+.Bl -tag -width DCARP_BACKUP_GATEWAY
+.It Va DCARP_INTERFACE
+The interface.
+.It Va DCARP_ADDRESS
+The shared IPv4 address.
+.It Va DCARP_NETMASK
 Its netmask.
-.It Ev DCARP_GATEWAY
-The gateway on its network, to use as master, or empty if there is none.
-.It Ev DCARP_BACKUP_GATEWAY
+.It Va DCARP_GATEWAY
+The gateway to use as master, or empty.
+.It Va DCARP_BACKUP_GATEWAY
 The gateway to use as backup: the
-.Fl g
-address of the member that was master last,
-or empty if there is none.
-.It Ev DCARP_GENERATION
-The generation, in seconds since the Epoch.
+.Ar backup_gateway
+of the master whose configuration
+.Nm
+last took, or empty.
+.It Va DCARP_GENERATION
+The generation, in seconds since the Epoch, or 0 if unknown.
+.It Va DCARP_LEASE_TIME
+How long the DHCP lease lasts from the generation on, in seconds,
+or empty if unknown.
+.It Va DCARP_LEASE_EXPIRES
+When the lease runs out, in seconds since the Epoch, or empty.
 .El
 .Pp
-A backup thus knows the gateway the moment it becomes master,
-and a master the gateway to use the moment it becomes backup.
-.Pp
-Messages are encrypted and authenticated with XChaCha20-Poly1305,
-keyed with the SHA-256 hash of the key file.
-At startup and when the key file is reread on
+Upon receiving
 .Dv SIGHUP ,
 .Nm
-logs a fingerprint of the key,
-which must be the same on all nodes.
-.Pp
-A message is accepted only if it authenticates,
-it is at most 30 seconds old,
-and its sequence number is higher than the last one accepted from the
-same sender.
-The last 64 senders are remembered,
-more than the members of any group.
-Rejected messages are logged with their source address,
-at most once every 10 seconds.
-The clocks of the nodes must therefore agree within 30 seconds.
+rereads the key file, keeping the old key if that fails, and resumes
+reading the lease from
+.Xr dhcpleased 8
+if it had stopped; see
+.Sx CAVEATS .
+Upon receiving
+.Dv SIGTERM ,
+it lifts any demotion it holds and exits.
 .Sh FILES
 .Bl -tag -width "/etc/examples/ifstated-dcarpd.conf" -compact
+.It Pa /dev/dhcpleased.sock
+Default
+.Ux Ns -domain
+socket used for communication with
+.Xr dhcpleased 8 .
 .It Pa /etc/dcarp.key
-The shared key.
+Default shared key file.
 .It Pa /etc/examples/ifstated-dcarpd.conf
 Example
 .Xr ifstated.conf 5
-for a pair of firewalls.
+for a pair of hosts.
 .It Pa /var/db/dcarpd/ Ns Ar interface
-The state file.
-.It Pa /var/db/dhcpleased/ Ns Ar interface
-The DHCP lease of the carp interface, whose time is the generation.
+Default state file.
 .El
 .Sh EXAMPLES
+Create the key on one host and copy it unchanged to the others:
+.Pp
+.Dl # (umask 077; openssl rand -hex 32 > /etc/dcarp.key)
+.Pp
+Let the messages through in
+.Xr pf.conf 5 :
+.Pp
+.Dl pass quick proto udp to 224.0.0.18 port 3522
+.Pp
 Run
 .Nm
-on both firewalls of a pair, for carp0, whose address the master gets
-by DHCP, with the firewall's own address on the internal network:
+for carp0 on each host, with its own address on the internal network:
 .Bd -literal -offset indent
 # rcctl enable dcarpd
 # rcctl set dcarpd flags -i carp0 -g 192.168.1.2
 # rcctl start dcarpd
 .Ed
 .Pp
-In
-.Xr ifstated.conf 5 ,
-route via the gateways from the state file when carp0 changes state,
-and keep the current route if there is none:
-.Bd -literal -offset indent
-if carp0.link.up {
-	run "[ -r /var/db/dcarpd/carp0 ] && . /var/db/dcarpd/carp0 && \e
-	    [ -n \e"$DCARP_GATEWAY\e" ] && \e
-	    { route -q delete default; \e
-	    route -q add default $DCARP_GATEWAY; }"
-}
-if carp0.link.down {
-	run "[ -r /var/db/dcarpd/carp0 ] && . /var/db/dcarpd/carp0 && \e
-	    [ -n \e"$DCARP_BACKUP_GATEWAY\e" ] && \e
-	    { route -q delete default; \e
-	    route -q add default $DCARP_BACKUP_GATEWAY; }"
-}
-.Ed
-.Pp
-A complete example, which also demotes the master if the gateway is
-unreachable, is in
+For a pair of hosts,
+.Xr ifstated 8
+can set the routes from the state file; see
 .Pa /etc/examples/ifstated-dcarpd.conf .
-.Pp
-With more than two members a backup must route via a new master
-although it stays backup, and its carp0 does not change state.
-Leave the routes out of
-.Xr ifstated.conf 5
-then, and set them with a program run by
-.Fl x ,
-here
+With more than two hosts, a backup must also follow a new master while
+it stays backup; set the routes with a program given with
+.Fl x
+instead, such as this
 .Pa /etc/dcarpd-route :
 .Bd -literal -offset indent
 #!/bin/sh
@@ -328,16 +301,20 @@ esac
 route -q change default $gw 2>/dev/null || route -q add default $gw
 .Ed
 .Pp
-and on each member, with its own internal address:
-.Bd -literal -offset indent
-# rcctl set dcarpd flags -i carp0 -g 192.168.1.2 -x /etc/dcarpd-route
-.Ed
+Make it executable, and add
+.Fl x Pa /etc/dcarpd-route
+to the flags of every host.
 .Sh SEE ALSO
+.Xr syslog 3 ,
 .Xr carp 4 ,
 .Xr ifstated.conf 5 ,
+.Xr pf.conf 5 ,
+.Xr dhcpleasectl 8 ,
 .Xr dhcpleased 8 ,
+.Xr ifconfig 8 ,
 .Xr ifstated 8 ,
-.Xr syslogd 8
+.Xr ntpd 8 ,
+.Xr rcctl 8
 .Sh HISTORY
 The
 .Nm
@@ -349,3 +326,26 @@ The
 .Nm
 program was written by
 .An Niklas Hallqvist .
+.Sh CAVEATS
+.Nm
+reads the DHCP lease with control messages internal to
+.Xr dhcpleased 8 ,
+and must be built from the same source tree.
+After an answer it does not expect, or none within a second, it logs
+this and does not read the lease again until
+.Dv SIGHUP ;
+renewals then start no new generations and do not update the lease
+times in the state files.
+.Pp
+If
+.Nm
+exits other than on
+.Dv SIGTERM
+while it holds a demotion, the demotion remains; lift it with
+.Ic ifconfig Fl g Ar group Cm -carpdemote
+for each group of the interface, including
+.Ql all .
+.Sh BUGS
+.Nm
+ignores
+.Dv SIGINT .

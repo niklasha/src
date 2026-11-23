@@ -2,8 +2,9 @@
 
 # Regress tests for dcarpd(8).  A master and a backup dcarpd, and for one
 # test a second backup, run in routing domains 75, 77 and 78, joined by
-# veb(4); this needs root.  The installed dcarpd is tested unless DCARPD
-# names another binary:
+# veb(4); this needs root.  fake-dhcpleased plays dhcpleased(8)'s control
+# socket.  The installed dcarpd is tested unless DCARPD names another
+# binary:
 #	make DCARPD=/usr/src/usr.sbin/dcarpd/obj/dcarpd
 
 DCARPD ?=	/usr/sbin/dcarpd
@@ -50,7 +51,11 @@ TESTS =		state-file gateway-from-route other-carp log-live \
 		periodic address-change split-brain address-follow \
 		older-generation lower-priority equal-priority init-takes \
 		no-address demote-lifted \
-		backup-follows-master three-members backup-gateway-kept stale
+		backup-follows-master three-members backup-gateway-kept stale \
+		restore-address restore-on-start state-generation \
+		address-generation renew lease-time lease-size lease-silent \
+		lease-future renew-ahead restore-address-v4 restore-master \
+		lease-other restore-on-up replace-on-backup
 
 # Waits for a recorded message to age out.
 REGRESS_SLOW_TARGETS +=	stale
@@ -58,15 +63,22 @@ REGRESS_SLOW_TARGETS +=	stale
 .for t in ${TESTS}
 REGRESS_TARGETS +=	$t
 REGRESS_ROOT_TARGETS +=	$t
-$t: dcarp-replay
+$t: dcarp-replay fake-dhcpleased
 	${SUDO} env OBJDIR=${.OBJDIR} DCARPD=${DCARPD} \
-	    REPLAY=${.OBJDIR}/dcarp-replay sh ${.CURDIR}/dcarpd-test $t
+	    REPLAY=${.OBJDIR}/dcarp-replay LEASED=${.OBJDIR}/fake-dhcpleased \
+	    sh ${.CURDIR}/dcarpd-test $t
 .endfor
 
 dcarp-replay: dcarp-replay.c
 	${CC} ${CFLAGS} -Wall -Werror -o $@ ${.CURDIR}/dcarp-replay.c
 
-CLEANFILES +=	dcarp-replay dcarp.key dcarp.key.other dcarpd-hook \
-		dcarpd-*.hook dcarpd-*.log dcarpd-*.msg dcarpd-*.state
+fake-dhcpleased: fake-dhcpleased.c
+	${CC} ${CFLAGS} -Wall -Werror -I${.CURDIR}/../../../sbin/dhcpleased \
+	    -o $@ ${.CURDIR}/fake-dhcpleased.c -lutil
+
+CLEANFILES +=	dcarp-replay fake-dhcpleased dcarp.key dcarp.key.other \
+		dcarpd-hook dcarpd-*.hook dcarpd-*.lease dcarpd-*.lease.new \
+		dcarpd-*.log dcarpd-*.msg dcarpd-*.sock dcarpd-*.sock.new \
+		dcarpd-*.state
 
 .include <bsd.regress.mk>

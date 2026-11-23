@@ -26,8 +26,11 @@
 #include <endian.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -35,6 +38,7 @@
 #include <net/route.h>
 #include <netinet/in.h>
 #include <netinet/in_var.h>
+#include <netinet/if_ether.h>
 #include <netinet/ip_carp.h>
 #include <arpa/inet.h>
 #include <openssl/evp.h>
@@ -42,8 +46,11 @@
 #include <ifaddrs.h>
 #include <errno.h>
 #include <event.h>
+#include <imsg.h>
+#include <poll.h>
 
 #include "dcarpd.h"
+#include "dhcpleased.h"
 
 void usage(void);
 
@@ -81,12 +88,37 @@ struct event send_timer;
 struct dcarp_config last_sent, last_applied;
 
 /*
- * The generation of the configuration we hold, and the carp address that
- * goes with it, to tell address changes from outside, e.g. by dhcpleased,
- * from our own.
+ * The generation of the configuration we hold, and the carp address and
+ * netmask that go with it: to tell address changes from outside, e.g. by
+ * dhcpleased, from our own, and to put the address back as backup.
  */
 int64_t my_generation;
-in_addr_t known_ip;
+in_addr_t known_ip, known_mask;
+
+/*
+ * The DHCP lease time that goes with the generation, 0 if unknown; and
+ * when dhcpleased last acknowledged the lease, by its monotonic clock, to
+ * notice the next acknowledgement, e.g. of a renewal.
+ */
+uint32_t my_lease_time;
+struct timespec lease_acked;
+int64_t lease_acked_at;		/* the same, by our wall clock */
+
+/*
+ * Whether to ask dhcpleased for the lease: not after it gave a wrong
+ * answer, or none, until SIGHUP.  Its control messages are internal to
+ * it, and we ask with IMSG_CTL_SHOW_INTERFACE_INFO only: a dhcpleased
+ * whose messages are numbered otherwise might take ours for
+ * IMSG_CTL_SEND_REQUEST and request its lease anew.  Look again when
+ * dhcpleased.h changes.
+ */
+volatile sig_atomic_t lease_asking = 1;
+_Static_assert(IMSG_CTL_SHOW_INTERFACE_INFO == 2 &&
+    IMSG_CTL_SEND_REQUEST == 3, "dhcpleased's control messages changed");
+
+/* Puts the address back as backup, a moment after its removal */
+struct event restore_timer;
+void restore_timer_callback(int, short, void *);
 
 /*
  * The backup gateway, -g, of the member we last took a configuration
@@ -224,7 +256,8 @@ int config_matches(const struct dcarp_config *config,
 	    config->netmask == message->netmask &&
 	    config->gateway_ip == message->gateway_ip &&
 	    config->backup_gateway == message->backup_gateway &&
-	    config->generation == message->generation);
+	    config->generation == message->generation &&
+	    config->lease_time == message->lease_time);
 }
 
 void config_record(struct dcarp_config *config,
@@ -235,6 +268,7 @@ void config_record(struct dcarp_config *config,
 	config->gateway_ip = message->gateway_ip;
 	config->backup_gateway = message->backup_gateway;
 	config->generation = message->generation;
+	config->lease_time = message->lease_time;
 }
 
 const char *carp_state_name(int state) {
@@ -263,11 +297,16 @@ void update_carp_state(int new_state) {
 
 		/*
 		 * Let the hook route for the new state.  As master, sending
-		 * writes the state file, which runs it already.
+		 * writes the state file, which runs it already, and so does
+		 * putting the address back as backup: back without it, e.g.
+		 * removed while the interface was down.
 		 */
 		runs = hook_runs;
 		if (new_state == CARP_STATE_MASTER) {
 			distribute_ip_addresses();
+		} else if (new_state == CARP_STATE_BACKUP) {
+			restore_address();
+			update_demote();
 		}
 		if (hook_runs == runs)
 			run_hook();
@@ -306,6 +345,8 @@ void start_hook(void) {
 		log_perror("fork");
 		return;
 	case 0:
+		/* We ignore it, lest dhcpleased going away kill us */
+		signal(SIGPIPE, SIG_DFL);
 		execv(argv[0], argv);
 		log_perror(argv[0]);
 		_exit(127);
@@ -509,13 +550,13 @@ int distribute_ip_addresses() {
 		inet_pton(AF_INET, global_options.gateway_ip,
 		    &message.backup_gateway);
 
+	/* A bind or a renewal of the DHCP lease is a new generation */
+	lease_update(message.carp_ip);
 	message.sender = htobe64(my_sender);
 	message.sequence = htobe64(++my_sequence);
 	message.timestamp = htobe64(time(NULL));
-	/* dhcpleased renews the lease without changing the address */
-	if (lease_generation() > my_generation)
-		my_generation = lease_generation();
 	message.generation = htobe64(my_generation);
+	message.lease_time = htonl(my_lease_time);
 	if (get_carp_priority(global_options.interface_name, &demote,
 	    &message.advbase, &message.advskew) != 0)
 		return (-1);
@@ -540,12 +581,12 @@ int distribute_ip_addresses() {
 	    sizeof(backup_gw_str));
 	log_message(LOG_INFO, "sent %s netmask %s gateway %s backup gateway "
 	    "%s on %s (sender %016llx sequence %llu generation %lld "
-	    "priority %u/%u/%u)", carp_ip_str, netmask_str,
+	    "lease %u priority %u/%u/%u)", carp_ip_str, netmask_str,
 	    message.gateway_ip != INADDR_ANY ? gateway_ip_str : "none",
 	    message.backup_gateway != INADDR_ANY ? backup_gw_str : "none",
 	    global_options.sync_interface,
 	    (unsigned long long)my_sender, (unsigned long long)my_sequence,
-	    (long long)my_generation, demote, message.advbase,
+	    (long long)my_generation, my_lease_time, demote, message.advbase,
 	    message.advskew);
 	config_record(&last_sent, &message);
 	/*
@@ -561,6 +602,10 @@ void send_timer_callback(int fd, short event, void *arg) {
 	struct timeval tv = { DCARP_INTERVAL, 0 };
 
 	/* In case an address change went by unseen */
+	if (current_carp_state == CARP_STATE_BACKUP &&
+	    get_carp_interface_state(global_options.interface_name) ==
+	    CARP_STATE_BACKUP)
+		restore_address();
 	update_demote();
 	if (current_carp_state == CARP_STATE_MASTER)
 		distribute_ip_addresses();
@@ -637,6 +682,7 @@ int process_received_message(const struct dcarp_message *message,
 			return (0);
 		}
 		my_generation = gen;
+		my_lease_time = ntohl(message->lease_time);
 
 		/*
 		 * A master resends every DCARP_INTERVAL seconds; only a
@@ -654,11 +700,13 @@ int process_received_message(const struct dcarp_message *message,
 			return (0);
 		}
 		log_message(LOG_INFO, "Received IP distribution message from %s "
-		    "(sender %016llx sequence %llu generation %lld): CARP IP: "
-		    "%s, Netmask: %s, Gateway IP: %s, Backup Gateway: %s%s",
-		    from_str, (unsigned long long)be64toh(message->sender),
+		    "(sender %016llx sequence %llu generation %lld lease %u): "
+		    "CARP IP: %s, Netmask: %s, Gateway IP: %s, Backup Gateway: "
+		    "%s%s", from_str,
+		    (unsigned long long)be64toh(message->sender),
 		    (unsigned long long)be64toh(message->sequence),
-		    (long long)gen, carp_ip_str, netmask_str, gateway_ip_str,
+		    (long long)gen, my_lease_time, carp_ip_str, netmask_str,
+		    gateway_ip_str,
 		    backup_gw_str, current_carp_state == CARP_STATE_BACKUP ? "" :
 		    ", taking it although not backup");
 		/*
@@ -670,6 +718,7 @@ int process_received_message(const struct dcarp_message *message,
 		} else {
 			/* Our own address change, not one from outside */
 			known_ip = message->carp_ip;
+			known_mask = message->netmask;
 			/* On failure, the next resend tries again */
 			if (configure_interface(global_options.interface_name, message->carp_ip, message->netmask) != 0)
 				return (-1);
@@ -758,10 +807,7 @@ void handle_master_transition() {
  */
 int configure_interface(const char *interface, const in_addr_t ip, const in_addr_t netmask) {
 	struct ifaddrs *ifaddr, *ifa;
-	struct sockaddr_in *sin;
 	struct in_aliasreq ifra;
-	char carp_ip_str[INET_ADDRSTRLEN];
-	char netmask_str[INET_ADDRSTRLEN];
 	char old_str[INET_ADDRSTRLEN];
 	int sockfd, have = 0, others = 0, rv = 0;
 
@@ -785,8 +831,6 @@ int configure_interface(const char *interface, const in_addr_t ip, const in_addr
 		return (0);
 	}
 
-	inet_ntop(AF_INET, &ip, carp_ip_str, INET_ADDRSTRLEN);
-	inet_ntop(AF_INET, &netmask, netmask_str, INET_ADDRSTRLEN);
 	sockfd = socket(PF_INET, SOCK_DGRAM, 0);
 	if (sockfd < 0) {
 		log_perror("socket");
@@ -794,25 +838,9 @@ int configure_interface(const char *interface, const in_addr_t ip, const in_addr
 		return (-1);
 	}
 
-	if (!have) {
-		memset(&ifra, 0, sizeof(ifra));
-		strlcpy(ifra.ifra_name, interface, sizeof(ifra.ifra_name));
-		sin = (struct sockaddr_in *)&ifra.ifra_addr;
-		sin->sin_len = sizeof(*sin);	/* the kernel rejects sin_len 0 */
-		sin->sin_family = AF_INET;
-		sin->sin_addr.s_addr = ip;
-		sin = (struct sockaddr_in *)&ifra.ifra_mask;
-		sin->sin_len = sizeof(*sin);
-		sin->sin_family = AF_INET;
-		sin->sin_addr.s_addr = netmask;
-		if (ioctl(sockfd, SIOCAIFADDR, &ifra) < 0) {
-			log_perror("ioctl SIOCAIFADDR");
-			log_message(LOG_ERR, "IP: %s, Netmask: %s", carp_ip_str, netmask_str);
-			rv = -1;
-			goto out;
-		}
-		log_message(LOG_NOTICE, "%s: added %s netmask %s", interface,
-		    carp_ip_str, netmask_str);
+	if (!have && add_address(interface, ip, netmask) != 0) {
+		rv = -1;
+		goto out;
 	}
 
 	/* Remove the other addresses; one with our address got the netmask */
@@ -840,6 +868,44 @@ int configure_interface(const char *interface, const in_addr_t ip, const in_addr
 out:
 	close(sockfd);
 	freeifaddrs(ifaddr);
+	return (rv);
+}
+
+/* Add an address, with its netmask, to the interface */
+int add_address(const char *interface, const in_addr_t ip,
+    const in_addr_t netmask) {
+	struct sockaddr_in *sin;
+	struct in_aliasreq ifra;
+	char carp_ip_str[INET_ADDRSTRLEN];
+	char netmask_str[INET_ADDRSTRLEN];
+	int sockfd, rv = 0;
+
+	inet_ntop(AF_INET, &ip, carp_ip_str, INET_ADDRSTRLEN);
+	inet_ntop(AF_INET, &netmask, netmask_str, INET_ADDRSTRLEN);
+	sockfd = socket(PF_INET, SOCK_DGRAM, 0);
+	if (sockfd < 0) {
+		log_perror("socket");
+		return (-1);
+	}
+	memset(&ifra, 0, sizeof(ifra));
+	strlcpy(ifra.ifra_name, interface, sizeof(ifra.ifra_name));
+	sin = (struct sockaddr_in *)&ifra.ifra_addr;
+	sin->sin_len = sizeof(*sin);	/* the kernel rejects sin_len 0 */
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = ip;
+	sin = (struct sockaddr_in *)&ifra.ifra_mask;
+	sin->sin_len = sizeof(*sin);
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = netmask;
+	if (ioctl(sockfd, SIOCAIFADDR, &ifra) < 0) {
+		log_perror("ioctl SIOCAIFADDR");
+		log_message(LOG_ERR, "IP: %s, Netmask: %s", carp_ip_str,
+		    netmask_str);
+		rv = -1;
+	} else
+		log_message(LOG_NOTICE, "%s: added %s netmask %s", interface,
+		    carp_ip_str, netmask_str);
+	close(sockfd);
 	return (rv);
 }
 
@@ -936,7 +1002,9 @@ int write_state_file(const struct dcarp_message *message,
 	char netmask_str[INET_ADDRSTRLEN];
 	char gateway_ip_str[INET_ADDRSTRLEN] = "";
 	char backup_gw_str[INET_ADDRSTRLEN] = "";
+	char lease_str[16] = "", expires_str[24] = "";
 	long long gen = (long long)be64toh(message->generation);
+	uint32_t lease_time = ntohl(message->lease_time);
 	FILE *f;
 	int fd;
 
@@ -948,6 +1016,13 @@ int write_state_file(const struct dcarp_message *message,
 	if (backup_gateway != INADDR_ANY)
 		inet_ntop(AF_INET, &backup_gateway, backup_gw_str,
 		    sizeof(backup_gw_str));
+	/* The generation is when the lease was acknowledged */
+	if (lease_time != 0) {
+		snprintf(lease_str, sizeof(lease_str), "%u", lease_time);
+		if (gen > 0 && gen <= LLONG_MAX - lease_time)
+			snprintf(expires_str, sizeof(expires_str), "%lld",
+			    gen + lease_time);
+	}
 
 	if (snprintf(tmp, sizeof(tmp), "%s.XXXXXXXXXX",
 	    global_options.state_file) >= (int)sizeof(tmp)) {
@@ -970,9 +1045,11 @@ int write_state_file(const struct dcarp_message *message,
 	    "DCARP_NETMASK=%s\n"
 	    "DCARP_GATEWAY=%s\n"
 	    "DCARP_BACKUP_GATEWAY=%s\n"
-	    "DCARP_GENERATION=%lld\n", global_options.interface_name,
+	    "DCARP_GENERATION=%lld\n"
+	    "DCARP_LEASE_TIME=%s\n"
+	    "DCARP_LEASE_EXPIRES=%s\n", global_options.interface_name,
 	    global_options.interface_name, carp_ip_str, netmask_str,
-	    gateway_ip_str, backup_gw_str, gen);
+	    gateway_ip_str, backup_gw_str, gen, lease_str, expires_str);
 	if (fflush(f) == EOF || fsync(fd) == -1) {
 		log_perror(tmp);
 		fclose(f);
@@ -986,10 +1063,11 @@ int write_state_file(const struct dcarp_message *message,
 		return (-1);
 	}
 	log_message(LOG_INFO, "wrote %s: address %s netmask %s gateway %s "
-	    "backup gateway %s generation %lld", global_options.state_file,
-	    carp_ip_str, netmask_str,
+	    "backup gateway %s generation %lld lease %s",
+	    global_options.state_file, carp_ip_str, netmask_str,
 	    gateway_ip_str[0] ? gateway_ip_str : "none",
-	    backup_gw_str[0] ? backup_gw_str : "none", gen);
+	    backup_gw_str[0] ? backup_gw_str : "none", gen,
+	    lease_str[0] ? lease_str : "none");
 	run_hook();
 	return (0);
 }
@@ -1018,6 +1096,29 @@ in_addr_t read_state_address(const char *name) {
 	}
 	fclose(f);
 	return (gw);
+}
+
+/* A number our state file holds from before, if any, else 0 */
+long long read_state_number(const char *name, long long max) {
+	char line[128];
+	size_t len = strlen(name);
+	const char *errstr;
+	long long n = 0;
+	FILE *f;
+
+	if ((f = fopen(global_options.state_file, "r")) == NULL)
+		return (0);
+	while (fgets(line, sizeof(line), f) != NULL) {
+		if (strncmp(line, name, len) != 0 || line[len] != '=')
+			continue;
+		line[strcspn(line, "\n")] = '\0';
+		n = strtonum(line + len + 1, 0, max, &errstr);
+		if (errstr != NULL)
+			n = 0;
+		break;
+	}
+	fclose(f);
+	return (n);
 }
 
 int get_carp_interface_state(const char *if_name) {
@@ -1263,6 +1364,53 @@ void lift_demote(void) {
 		demoted = 0;
 }
 
+/*
+ * As backup, put back the address of the configuration we hold when the
+ * carp interface has no IPv4 address, e.g. after dhcpleased removed it at
+ * the expiry of a lease that it bound while we were master: carp(4)
+ * authenticates its advertisements over the addresses, so without it we
+ * would become master beside the master, or, left without any address, be
+ * taken down.  Add it only: an address that turns up meanwhile is a new
+ * one from outside.  The callers tell when we are backup; never as
+ * master, where the address follows dhcpleased's lease.
+ */
+void restore_address(void) {
+	char ip_str[INET_ADDRSTRLEN], netmask_str[INET_ADDRSTRLEN];
+	in_addr_t ip, netmask;
+
+	if (known_ip == INADDR_ANY || known_mask == INADDR_ANY ||
+	    current_carp_state == CARP_STATE_MASTER ||
+	    get_carp_interface_state(global_options.interface_name) ==
+	    CARP_STATE_MASTER)
+		return;
+	/* Ours, or a new address from outside, is there */
+	if (get_interface_ip_and_netmask(global_options.interface_name, &ip,
+	    &netmask) == 0)
+		return;
+	inet_ntop(AF_INET, &known_ip, ip_str, sizeof(ip_str));
+	inet_ntop(AF_INET, &known_mask, netmask_str, sizeof(netmask_str));
+	if (global_options.dry_run) {
+		log_message(LOG_WARNING, "Dry-run mode: not restoring %s on %s",
+		    ip_str, global_options.interface_name);
+		return;
+	}
+	log_message(LOG_NOTICE, "%s lost its address as backup: restoring %s "
+	    "netmask %s", global_options.interface_name, ip_str, netmask_str);
+	/* With the address, the kernel removed the routes through it */
+	if (add_address(global_options.interface_name, known_ip,
+	    known_mask) == 0)
+		run_hook();
+}
+
+/*
+ * After a removal as backup: put the address back, unless another one has
+ * turned up meanwhile, which makes it a replacement from outside.
+ */
+void restore_timer_callback(int fd, short event, void *arg) {
+	restore_address();
+	update_demote();
+}
+
 /* Whether the interface has the given IPv4 address */
 int interface_has_address(const char *if_name, in_addr_t ip) {
 	struct ifaddrs *ifaddr, *ifa;
@@ -1285,19 +1433,211 @@ int interface_has_address(const char *if_name, in_addr_t ip) {
 	return (found);
 }
 
-/*
- * The generation of a DHCP-provisioned carp address: when dhcpleased last
- * wrote the lease of the interface, or 0 if there is none.
- */
-int64_t lease_generation(void) {
-	char path[PATH_MAX];
-	struct stat st;
+/* A CLOCK_MONOTONIC time, e.g. dhcpleased's, as seconds since the epoch */
+int64_t mono_to_wall(const struct timespec *mono) {
+	struct timespec real, now, age, then;
 
-	snprintf(path, sizeof(path), "%s/%s", DCARP_LEASE_DIR,
-	    global_options.interface_name);
-	if (stat(path, &st) < 0)
-		return (0);
-	return (st.st_mtime);
+	clock_gettime(CLOCK_REALTIME, &real);
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	timespecsub(&now, mono, &age);
+	timespecsub(&real, &age, &then);
+	return (then.tv_sec + (then.tv_nsec >= 500000000));
+}
+
+/*
+ * Ask dhcpleased(8) for its lease of the carp interface, as "dhcpleasectl
+ * -l" does: with IMSG_CTL_SHOW_INTERFACE_INFO, never with
+ * IMSG_CTL_SEND_REQUEST, which makes it request the lease anew.  The
+ * answer is a struct ctl_engine_info, which is internal to dhcpleased:
+ * take only one of the size in the dhcpleased.h we were built with.
+ * Returns 0 with the answer, -1 and why not if there is none, or -2 and
+ * why if the answer was wrong, or none came.
+ */
+int query_lease(struct ctl_engine_info *cei, char *why, size_t whylen) {
+	const char *path = global_options.control_socket;
+	struct timespec deadline, now, left;
+	struct sockaddr_un sun;
+	struct imsgbuf ibuf;
+	struct imsg imsg;
+	struct pollfd pfd;
+	uint32_t if_index = carp_ifindex;
+	size_t len;
+	int fd, n, rv = -1;
+
+	if ((fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) == -1) {
+		snprintf(why, whylen, "socket: %s", strerror(errno));
+		return (-1);
+	}
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	strlcpy(sun.sun_path, path, sizeof(sun.sun_path));
+	if (connect(fd, (struct sockaddr *)&sun, sizeof(sun)) == -1) {
+		snprintf(why, whylen, "%s: %s", path, strerror(errno));
+		close(fd);
+		return (-1);
+	}
+	if (imsgbuf_init(&ibuf, fd) == -1) {
+		snprintf(why, whylen, "imsgbuf_init: %s", strerror(errno));
+		close(fd);
+		return (-1);
+	}
+	if (imsg_compose(&ibuf, IMSG_CTL_SHOW_INTERFACE_INFO, 0, 0, -1,
+	    &if_index, sizeof(if_index)) == -1 || imsgbuf_flush(&ibuf) == -1) {
+		snprintf(why, whylen, "%s: %s", path, strerror(errno));
+		goto out;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += DCARP_LEASE_WAIT;
+	while ((n = imsgbuf_get(&ibuf, &imsg)) == 0) {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		timespecsub(&deadline, &now, &left);
+		if (left.tv_sec < 0) {
+			snprintf(why, whylen, "%s: no answer", path);
+			rv = -2;
+			goto out;
+		}
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		n = poll(&pfd, 1, left.tv_sec * 1000 + left.tv_nsec / 1000000);
+		if (n == -1 && errno != EINTR) {
+			snprintf(why, whylen, "poll: %s", strerror(errno));
+			goto out;
+		}
+		if (n <= 0)
+			continue;
+		if ((n = imsgbuf_read(&ibuf)) == -1) {
+			snprintf(why, whylen, "%s: %s", path, strerror(errno));
+			goto out;
+		}
+		if (n == 0) {
+			snprintf(why, whylen, "%s: closed", path);
+			goto out;
+		}
+	}
+	if (n == -1) {
+		snprintf(why, whylen, "%s: %s", path, strerror(errno));
+		rv = -2;
+		goto out;
+	}
+
+	rv = -2;
+	switch (imsg_get_type(&imsg)) {
+	case IMSG_CTL_SHOW_INTERFACE_INFO:
+		len = imsg_get_len(&imsg);
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (len != sizeof(*cei) ||
+		    imsg_get_data(&imsg, cei, sizeof(*cei)) == -1)
+			snprintf(why, whylen, "%s: answer of %zu bytes, "
+			    "expected %zu: dhcpleased and dcarpd built from "
+			    "different sources?", path, len, sizeof(*cei));
+		else if (cei->if_index != carp_ifindex)
+			snprintf(why, whylen, "%s: answer for interface index "
+			    "%u, not %u", path, cei->if_index, carp_ifindex);
+		else if (cei->request_time.tv_sec < 0 ||
+		    cei->request_time.tv_nsec < 0 ||
+		    cei->request_time.tv_nsec >= 1000000000 ||
+		    timespeccmp(&cei->request_time, &now, >))
+			snprintf(why, whylen, "%s: lease acknowledged in the "
+			    "future", path);
+		else {
+			cei->state[sizeof(cei->state) - 1] = '\0';
+			rv = 0;
+		}
+		break;
+	case IMSG_CTL_END:
+		snprintf(why, whylen, "dhcpleased does not handle %s",
+		    global_options.interface_name);
+		rv = -1;
+		break;
+	default:
+		snprintf(why, whylen, "%s: answer of type %u", path,
+		    imsg_get_type(&imsg));
+		break;
+	}
+	imsg_free(&imsg);
+out:
+	imsgbuf_clear(&ibuf);
+	close(fd);
+	return (rv);
+}
+
+/*
+ * As master: when dhcpleased last accepted an acknowledgement of the DHCP
+ * lease of our carp address, at a bind or at a renewal.  A renewal keeps
+ * the address, so only dhcpleased can tell of it.  Each acknowledgement is
+ * a new generation, and the lease time from it on goes with it.  Without
+ * an answer we keep what we hold, e.g. the configuration taken over from
+ * the master before us, until our dhcpleased has the lease.  Why not is
+ * logged once.
+ */
+void lease_update(in_addr_t carp_ip) {
+	static char last[192];
+	struct ctl_engine_info cei;
+	char why[192], ip_str[INET_ADDRSTRLEN];
+	int64_t acked, end;
+	int first, rv;
+
+	if (!lease_asking)
+		return;
+	if ((rv = query_lease(&cei, why, sizeof(why))) == -2) {
+		lease_asking = 0;
+		log_message(LOG_ERR, "no DHCP lease: %s; not asking dhcpleased "
+		    "again until SIGHUP", why);
+		last[0] = '\0';
+		return;
+	}
+	if (rv == 0) {
+		inet_ntop(AF_INET, &cei.requested_ip, ip_str, sizeof(ip_str));
+		if ((strcmp(cei.state, "Bound") == 0 ||
+		    strcmp(cei.state, "Renewing") == 0 ||
+		    strcmp(cei.state, "Rebinding") == 0) &&
+		    cei.requested_ip.s_addr == carp_ip && cei.lease_time != 0)
+			why[0] = '\0';
+		else
+			snprintf(why, sizeof(why), "dhcpleased has %s for %s, "
+			    "%s", ip_str, global_options.interface_name,
+			    cei.state);
+	}
+	if (why[0] != '\0') {
+		log_message(strcmp(why, last) == 0 ? LOG_DEBUG : LOG_INFO,
+		    "no DHCP lease: %s", why);
+		strlcpy(last, why, sizeof(last));
+		return;
+	}
+	last[0] = '\0';
+
+	if (timespeccmp(&cei.request_time, &lease_acked, !=)) {
+		first = !timespecisset(&lease_acked);
+		lease_acked = cei.request_time;
+		acked = mono_to_wall(&cei.request_time);
+		if (acked > time(NULL))		/* rounded up */
+			acked = time(NULL);
+		lease_acked_at = acked;
+		log_message(LOG_INFO, "DHCP lease of %s on %s acknowledged at "
+		    "%lld, for %u seconds", ip_str,
+		    global_options.interface_name, (long long)acked,
+		    cei.lease_time);
+		/*
+		 * A new generation, later than the one held even if that is
+		 * ahead of our clock; but not for the acknowledgement we knew
+		 * before we started, give or take its rounding.
+		 */
+		if (!first || acked > my_generation + 1) {
+			my_generation = acked > my_generation ? acked :
+			    my_generation + 1;
+			log_message(LOG_INFO, "generation %lld from the DHCP "
+			    "lease", (long long)my_generation);
+		}
+	}
+	/* From the generation on, so that both give when the lease ends */
+	end = lease_acked_at + cei.lease_time;
+	if (end <= my_generation)
+		my_lease_time = 0;
+	else if (end - my_generation > UINT32_MAX)
+		my_lease_time = UINT32_MAX;
+	else
+		my_lease_time = end - my_generation;
 }
 
 int get_interface_ip_and_netmask(const char *if_name, in_addr_t *ip, in_addr_t *netmask) {
@@ -1354,7 +1694,23 @@ void routing_callback(int fd, short event, void *arg) {
 		log_message(LOG_DEBUG, "Received %s for %s",
 		    rtm->rtm_type == RTM_NEWADDR ? "RTM_NEWADDR" : "RTM_DELADDR",
 		    global_options.interface_name);
-		update_demote();
+		/*
+		 * Removed as backup, unless replaced: put it back in a
+		 * moment, without demoting us meanwhile.  carp(4) reports
+		 * INIT only after this, if it was the last address.
+		 */
+		if (rtm->rtm_type == RTM_DELADDR &&
+		    current_carp_state == CARP_STATE_BACKUP &&
+		    known_ip != INADDR_ANY &&
+		    get_interface_ip_and_netmask(global_options.interface_name,
+		    &ip, &netmask) != 0 &&
+		    !evtimer_pending(&restore_timer, NULL)) {
+			struct timeval tv = { 0, DCARP_RESTORE_DELAY * 1000 };
+
+			evtimer_add(&restore_timer, &tv);
+		}
+		if (!evtimer_pending(&restore_timer, NULL))
+			update_demote();
 
 		/*
 		 * While the address we know is there, this is our own change
@@ -1375,10 +1731,16 @@ void routing_callback(int fd, short event, void *arg) {
 		/*
 		 * A new address from outside, e.g. a new DHCP lease: a new
 		 * generation, which wins over the old configuration
-		 * wherever it is.
+		 * wherever it is, also over one from a clock ahead of ours.
 		 */
 		known_ip = ip;
-		my_generation = time(NULL);
+		known_mask = netmask;
+		if (time(NULL) > my_generation)
+			my_generation = time(NULL);
+		else
+			my_generation++;
+		/* As master, dhcpleased may know its lease */
+		my_lease_time = 0;
 		inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
 		log_message(LOG_INFO, "address of %s changed to %s, generation "
 		    "%lld", global_options.interface_name, ip_str,
@@ -1472,11 +1834,14 @@ void multicast_callback(int fd, short event, void *arg) {
 }
 
 int main(int argc, char *argv[]) {
-	in_addr_t ip, netmask;
+	in_addr_t ip, netmask, held;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "dnvf:i:g:k:s:x:")) != -1) {
+	while ((ch = getopt(argc, argv, "c:dnvf:i:g:k:s:x:")) != -1) {
 		switch (ch) {
+		case 'c':
+			global_options.control_socket = optarg;
+			break;
 		case 'd':
 			global_options.foreground = 1;
 			break;
@@ -1520,6 +1885,14 @@ int main(int argc, char *argv[]) {
 	    access(global_options.hook, X_OK) == -1)) {
 		fprintf(stderr, "%s: -x %s: not an absolute path to an "
 		    "executable\n", getprogname(), global_options.hook);
+		usage();
+	}
+	if (global_options.control_socket == NULL)
+		global_options.control_socket = _PATH_DHCPLEASED_SOCKET;
+	else if (strlen(global_options.control_socket) >=
+	    sizeof(((struct sockaddr_un *)NULL)->sun_path)) {
+		fprintf(stderr, "%s: -c %s: name too long\n", getprogname(),
+		    global_options.control_socket);
 		usage();
 	}
 	if (global_options.gateway_ip != NULL) {
@@ -1579,21 +1952,37 @@ int main(int argc, char *argv[]) {
 		goto err;
 
 	/*
-	 * Start with the address the carp interface has, if any, and the
-	 * time of its DHCP lease as its generation: without a lease, any
-	 * configuration received from a master wins.
+	 * Start with the configuration held before, from the state file: its
+	 * generation, and its address if the carp interface has none.  Without
+	 * one, any configuration received from a master wins.  The time of a
+	 * DHCP lease file is no generation: dhcpleased writes the file when it
+	 * binds a lease, not when it renews it.
 	 */
+	held = read_state_address("DCARP_ADDRESS");
 	if (get_interface_ip_and_netmask(global_options.interface_name, &ip,
-	    &netmask) == 0)
+	    &netmask) == 0) {
 		known_ip = ip;
-	my_generation = lease_generation();
-	log_message(LOG_INFO, "generation %lld%s", (long long)my_generation,
-	    my_generation ? " from the DHCP lease" : ", no DHCP lease");
-	update_demote();
+		known_mask = netmask;
+	} else {
+		known_ip = held;
+		known_mask = read_state_address("DCARP_NETMASK");
+	}
+	if (known_ip != INADDR_ANY && known_ip == held) {
+		my_generation = read_state_number("DCARP_GENERATION", LLONG_MAX);
+		my_lease_time = read_state_number("DCARP_LEASE_TIME",
+		    UINT32_MAX);
+		log_message(LOG_INFO, "generation %lld from %s",
+		    (long long)my_generation, global_options.state_file);
+	} else
+		log_message(LOG_INFO, "generation 0: %s holds no configuration "
+		    "of the address of %s", global_options.state_file,
+		    global_options.interface_name);
     
 	signal(SIGINT, handle_signal);
 	signal(SIGHUP, handle_signal);
 	signal(SIGTERM, handle_signal);
+	/* dhcpleased may go away while we ask it */
+	signal(SIGPIPE, SIG_IGN);
 
 	setup_multicast_socket();
 	setup_routing_socket();
@@ -1605,6 +1994,12 @@ int main(int argc, char *argv[]) {
 	signal_add(&sigchld_event, NULL);
 
 	current_carp_state = get_carp_interface_state(global_options.interface_name);
+	evtimer_set(&restore_timer, restore_timer_callback, NULL);
+
+	/* As backup, put back the address held if it is gone */
+	if (current_carp_state == CARP_STATE_BACKUP)
+		restore_address();
+	update_demote();
 
 	if (current_carp_state == CARP_STATE_MASTER) {
 		log_message(LOG_NOTICE, "%s is in MASTER state.", global_options.interface_name);
@@ -1734,6 +2129,8 @@ void handle_signal(int signal)
 		exit(EXIT_SUCCESS);
 		break;
         case SIGHUP: {
+		/* Ask dhcpleased again, after a wrong answer or none */
+		lease_asking = 1;
 		// Reread keyfile
 		EVP_AEAD_CTX *new_ctx = read_keyfile(global_options.keyfile_path);
 		if (new_ctx) {
@@ -1839,9 +2236,9 @@ void close_multicast_socket() {
 void usage(void) {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-dnv] [-f state_file] [-g backup_gateway] "
-	    "-i interface\n"
-	    "              [-k key_file] [-s sync_interface] [-x program]\n",
-	    __progname);
+	fprintf(stderr, "usage: %s [-dnv] [-c control_socket] [-f state_file] "
+	    "[-g backup_gateway]\n"
+	    "              -i interface [-k key_file] [-s sync_interface] "
+	    "[-x program]\n", __progname);
 	exit(EXIT_FAILURE);
 }

@@ -4,8 +4,8 @@
 
 Network Working Group                                       N. Hallqvist
 Internet-Draft                                                     Appli
-Intended status: Experimental                            2 November 2026
-Expires: 6 May 2027
+Intended status: Experimental                           22 November 2026
+Expires: 26 May 2027
 
 
     DCARP: Distributing Dynamic Addresses to CARP Redundancy Groups
@@ -41,7 +41,7 @@ Status of This Memo
    time.  It is inappropriate to use Internet-Drafts as reference
    material or to cite them other than as "work in progress."
 
-   This Internet-Draft will expire on 6 May 2027.
+   This Internet-Draft will expire on 26 May 2027.
 
 Copyright Notice
 
@@ -53,7 +53,7 @@ Copyright Notice
 
 
 
-Hallqvist                  Expires 6 May 2027                   [Page 1]
+Hallqvist                  Expires 26 May 2027                  [Page 1]
 
 Internet-Draft                    DCARP                    November 2026
 
@@ -77,21 +77,21 @@ Table of Contents
    5.  Transport . . . . . . . . . . . . . . . . . . . . . . . . . .   8
    6.  Generations . . . . . . . . . . . . . . . . . . . . . . . . .   8
    7.  Sending . . . . . . . . . . . . . . . . . . . . . . . . . . .   9
-   8.  Receiving . . . . . . . . . . . . . . . . . . . . . . . . . .   9
-     8.1.  Validation  . . . . . . . . . . . . . . . . . . . . . . .   9
+   8.  Receiving . . . . . . . . . . . . . . . . . . . . . . . . . .  10
+     8.1.  Validation  . . . . . . . . . . . . . . . . . . . . . . .  10
      8.2.  Acceptance  . . . . . . . . . . . . . . . . . . . . . . .  10
-     8.3.  Taking a Configuration  . . . . . . . . . . . . . . . . .  10
+     8.3.  Taking a Configuration  . . . . . . . . . . . . . . . . .  11
    9.  Interaction with CARP . . . . . . . . . . . . . . . . . . . .  11
    10. Local Use of the Configuration  . . . . . . . . . . . . . . .  12
-   11. Operational Considerations  . . . . . . . . . . . . . . . . .  12
+   11. Operational Considerations  . . . . . . . . . . . . . . . . .  13
    12. Security Considerations . . . . . . . . . . . . . . . . . . .  13
    13. IANA Considerations . . . . . . . . . . . . . . . . . . . . .  14
    14. References  . . . . . . . . . . . . . . . . . . . . . . . . .  14
      14.1.  Normative References . . . . . . . . . . . . . . . . . .  14
-     14.2.  Informative References . . . . . . . . . . . . . . . . .  14
-   Appendix A.  Reference Implementation . . . . . . . . . . . . . .  15
+     14.2.  Informative References . . . . . . . . . . . . . . . . .  15
+   Appendix A.  Reference Implementation . . . . . . . . . . . . . .  16
    Acknowledgments . . . . . . . . . . . . . . . . . . . . . . . . .  16
-   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .  16
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .  17
 
 1.  Introduction
 
@@ -109,7 +109,7 @@ Table of Contents
 
 
 
-Hallqvist                  Expires 6 May 2027                   [Page 2]
+Hallqvist                  Expires 26 May 2027                  [Page 2]
 
 Internet-Draft                    DCARP                    November 2026
 
@@ -165,7 +165,7 @@ Internet-Draft                    DCARP                    November 2026
 
 
 
-Hallqvist                  Expires 6 May 2027                   [Page 3]
+Hallqvist                  Expires 26 May 2027                  [Page 3]
 
 Internet-Draft                    DCARP                    November 2026
 
@@ -221,7 +221,7 @@ Internet-Draft                    DCARP                    November 2026
 
 
 
-Hallqvist                  Expires 6 May 2027                   [Page 4]
+Hallqvist                  Expires 26 May 2027                  [Page 4]
 
 Internet-Draft                    DCARP                    November 2026
 
@@ -277,7 +277,7 @@ Internet-Draft                    DCARP                    November 2026
 
 
 
-Hallqvist                  Expires 6 May 2027                   [Page 5]
+Hallqvist                  Expires 26 May 2027                  [Page 5]
 
 Internet-Draft                    DCARP                    November 2026
 
@@ -295,7 +295,7 @@ Internet-Draft                    DCARP                    November 2026
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
    |                        Backup Gateway                         |
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |                           Reserved                            |
+   |                          Lease Time                           |
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
    |                                                               |
    +                            Sender                             +
@@ -333,7 +333,7 @@ Internet-Draft                    DCARP                    November 2026
 
 
 
-Hallqvist                  Expires 6 May 2027                   [Page 6]
+Hallqvist                  Expires 26 May 2027                  [Page 6]
 
 Internet-Draft                    DCARP                    November 2026
 
@@ -342,8 +342,11 @@ Internet-Draft                    DCARP                    November 2026
       network that the members share, which the other members are to use
       as gateway while they are Backups, or 0.0.0.0 if there is none.
 
-   Reserved (4 octets):  Senders MUST set it to zero; receivers MUST
-      ignore it.
+   Lease Time (4 octets):  The number of seconds the DHCP lease of the
+      Address lasts from the Generation on, or 0 if the sender knows of
+      no lease.  Receivers MAY use it, for example to tell when the
+      lease runs out.  The field was reserved before, so that earlier
+      senders set it to zero and earlier receivers ignore it.
 
    Sender (8 octets):  A random value the sender chooses when it starts,
       which identifies it for replay detection.
@@ -383,16 +386,15 @@ Internet-Draft                    DCARP                    November 2026
    Additional data:  The 8 octets of the ASCII string "DCARP 1" followed
       by a zero octet, which binds the key to this protocol and version.
 
-   Plaintext:  The 64 octets of Section 3.2.
 
 
 
-
-
-Hallqvist                  Expires 6 May 2027                   [Page 7]
+Hallqvist                  Expires 26 May 2027                  [Page 7]
 
 Internet-Draft                    DCARP                    November 2026
 
+
+   Plaintext:  The 64 octets of Section 3.2.
 
    The message is the nonce, followed by the ciphertext and the 16-octet
    authentication tag.  A receiver MUST authenticate a message before it
@@ -420,35 +422,50 @@ Internet-Draft                    DCARP                    November 2026
 6.  Generations
 
    Every Configuration has a Generation: the time its address was
-   obtained.  Comparing Generations tells which of two Configurations is
-   newer.  A member keeps the Generation of the Configuration it holds:
+   obtained or its DHCP lease last renewed.  Comparing Generations tells
+   which of two Configurations is newer.  A member keeps the Generation
+   of the Configuration it holds:
 
-   *  When it starts, the Generation is the time at which its DHCP
-      client last obtained or renewed the lease of the CARP interface,
-      or 0 if there is none.
+   *  When it starts, the Generation is that of the Configuration it
+      held before for the address its CARP interface has, which it keeps
+      in stable storage, or 0 if there is none.
 
    *  When the address of its CARP interface changes other than by
       DCARP, for example when the DHCP client obtains a new address, the
-      Generation becomes the current time.
+      Generation becomes the current time, or one more than the
+      Generation it held if that is not earlier.
 
    *  When it takes a Configuration (Section 8), it adopts the
       Configuration's Generation.
 
-   *  As Master, before sending, it updates the Generation to the time
-      of the latest renewal of the lease if that is later, since a
-      renewal does not change the address.
-
-   Generations use wall-clock time, so the members' clocks MUST be
-   synchronized, for example with NTP; see also Section 12.
 
 
 
 
 
-Hallqvist                  Expires 6 May 2027                   [Page 8]
+
+
+Hallqvist                  Expires 26 May 2027                  [Page 8]
 
 Internet-Draft                    DCARP                    November 2026
 
+
+   *  As Master, before sending, it learns from its DHCP client when the
+      client last obtained or renewed the lease of the address.  Each
+      such time is a new Generation: that time, or one more than the
+      Generation it held if that is not earlier.  A renewal does not
+      change the address, but is a new Generation, so that the other
+      members learn of it.
+
+   While a member runs, its Generation never decreases.  A member MUST
+   NOT take the time at which a lease was stored, for example the
+   modification time of a lease file, for the time of its latest
+   renewal: DHCP clients commonly store a lease when they obtain it, but
+   not when they renew it, so that a Backup's stored lease can be newer
+   than the Master's Generation.
+
+   Generations use wall-clock time, so the members' clocks MUST be
+   synchronized, for example with NTP; see also Section 12.
 
 7.  Sending
 
@@ -481,6 +498,14 @@ Internet-Draft                    DCARP                    November 2026
    count is the sum over the groups the CARP interface belongs to, as
    CARP computes it.
 
+
+
+
+Hallqvist                  Expires 26 May 2027                  [Page 9]
+
+Internet-Draft                    DCARP                    November 2026
+
+
 8.  Receiving
 
 8.1.  Validation
@@ -495,16 +520,6 @@ Internet-Draft                    DCARP                    November 2026
 
    3.  its Timestamp differs from the member's clock by more than the
        maximum age, 30 seconds; or
-
-
-
-
-
-
-Hallqvist                  Expires 6 May 2027                   [Page 9]
-
-Internet-Draft                    DCARP                    November 2026
-
 
    4.  its Sequence is not higher than the highest Sequence accepted
        from the same Sender.  A member MUST remember the Sequence of the
@@ -539,6 +554,14 @@ Internet-Draft                    DCARP                    November 2026
    It MUST discard, and SHOULD log, any other.  The Generation comes
    first because after a failover the member with the worse Priority may
    hold the newer lease; the Priority decides only between
+
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 10]
+
+Internet-Draft                    DCARP                    November 2026
+
+
    Configurations of the same Generation, and there only for members
    that are Master at the same time and receive each other's messages
    but not each other's advertisements, for example over a separate Sync
@@ -555,12 +578,16 @@ Internet-Draft                    DCARP                    November 2026
    it SHOULD add the new address before removing the old ones, since a
    CARP interface without an address leaves the election.
 
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 10]
-
-Internet-Draft                    DCARP                    November 2026
-
+   A member that is Backup SHOULD put the address of the Configuration
+   it holds back when its CARP interface has no IPv4 address: shortly
+   after something else removed it, such as its DHCP client at the
+   expiry of a lease that it obtained while the member was Master,
+   unless another address has turned up meanwhile; and when the
+   interface becomes Backup without it.  Without the address, CARP
+   rejects the Master's advertisements: an interface that keeps another
+   address, such as an IPv6 link-local one, makes the member Master
+   beside the Master, and one without any leaves the election.  A Master
+   MUST NOT do so, since its address follows its DHCP lease.
 
    Each change of the addresses restarts CARP on the interface, so a
    member MUST NOT change them when the address is already the only one,
@@ -581,6 +608,15 @@ Internet-Draft                    DCARP                    November 2026
        and Backup and becomes Master again after about three
        advertisement intervals.  Meanwhile it neither sends
        advertisements nor, on the CARP interface, DCARP messages.
+
+
+
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 11]
+
+Internet-Draft                    DCARP                    November 2026
+
 
    2.  The Backups reject the Master's advertisements, whose
        authentication now covers a different set of addresses.  A Backup
@@ -607,17 +643,6 @@ Internet-Draft                    DCARP                    November 2026
    member takes Configurations in Init as well, such a member obtains
    its address from the Master and then joins the election.
 
-
-
-
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 11]
-
-Internet-Draft                    DCARP                    November 2026
-
-
 10.  Local Use of the Configuration
 
    DCARP does not set routes, so that it does not compete with the tools
@@ -641,6 +666,14 @@ Internet-Draft                    DCARP                    November 2026
    With more than two members, the Master can change while a member
    stays Backup: its own CARP state does not change, but its Backup
    Gateway does.  Tools that act only on the member's CARP state changes
+
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 12]
+
+Internet-Draft                    DCARP                    November 2026
+
+
    miss this.  A member SHOULD therefore notify the tools whenever the
    Configuration it holds changes, as well as when its CARP state
    changes.
@@ -657,22 +690,16 @@ Internet-Draft                    DCARP                    November 2026
 
    *  The DHCP client of the shared address runs on the CARP interface
       and gets no lease on Backups, whose CARP interface does not pass
-      traffic.  On some systems the DHCP client also changes the local
-      resolver configuration; operators may want to prevent that on the
-      CARP interface.
+      traffic.  A DHCP client left running on a Backup removes the
+      address when the lease it obtained as Master expires
+      (Section 8.3).  On some systems the DHCP client also changes the
+      local resolver configuration; operators may want to prevent that
+      on the CARP interface.
 
-   *  A member restarted without a DHCP lease has Generation 0.  Until
-      its address changes, the other members discard the Configuration
-      it sends as Master if they hold a newer one.
-
-
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 12]
-
-Internet-Draft                    DCARP                    November 2026
-
+   *  A member restarted without the Configuration it held has
+      Generation 0.  Until its address changes or it learns of its DHCP
+      lease, the other members discard the Configuration it sends as
+      Master if they hold a newer one.
 
 12.  Security Considerations
 
@@ -691,6 +718,17 @@ Internet-Draft                    DCARP                    November 2026
    example after a restart; such a message carries a Configuration that
    was current 30 seconds earlier, and is discarded anyway if the member
    holds a newer Generation.
+
+
+
+
+
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 13]
+
+Internet-Draft                    DCARP                    November 2026
+
 
    DCARP depends on synchronized clocks.  An attacker who can move a
    member's clock, for example by attacking its time synchronization,
@@ -716,20 +754,6 @@ Internet-Draft                    DCARP                    November 2026
    Tools that set routes from a Configuration act on data that is
    authenticated, but chosen by another member.
 
-
-
-
-
-
-
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 13]
-
-Internet-Draft                    DCARP                    November 2026
-
-
 13.  IANA Considerations
 
    This document makes no requests of IANA.  The reference
@@ -751,6 +775,16 @@ Internet-Draft                    DCARP                    November 2026
               Draft, draft-irtf-cfrg-xchacha-03, January 2020,
               <https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-
               xchacha-03>.
+
+
+
+
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 14]
+
+Internet-Draft                    DCARP                    November 2026
+
 
    [RFC768]   Postel, J., "User Datagram Protocol", STD 6, RFC 768,
               DOI 10.17487/RFC0768, August 1980,
@@ -775,16 +809,6 @@ Internet-Draft                    DCARP                    November 2026
               <https://www.rfc-editor.org/info/rfc8439>.
 
 14.2.  Informative References
-
-
-
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 14]
-
-Internet-Draft                    DCARP                    November 2026
-
 
    [CARP]     The OpenBSD Project, "carp(4): Common Address Redundancy
               Protocol", OpenBSD manual page,
@@ -811,12 +835,23 @@ Internet-Draft                    DCARP                    November 2026
               DOI 10.17487/RFC9568, April 2024,
               <https://www.rfc-editor.org/info/rfc9568>.
 
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 15]
+
+Internet-Draft                    DCARP                    November 2026
+
+
 Appendix A.  Reference Implementation
 
    dcarpd(8) implements DCARP on OpenBSD.  It derives the 256-bit key as
-   the SHA-256 hash of a key file, reads the lease time from the lease
-   file of dhcpleased(8), sends every 10 seconds, and remembers 64
-   Senders.
+   the SHA-256 hash of a key file, sends every 10 seconds, and remembers
+   64 Senders.  As Master it asks dhcpleased(8) over its control socket,
+   read-only as "dhcpleasectl -l" does, when the lease of the address
+   was last acknowledged and how long it lasts; after a malformed answer
+   or none, it does not ask again until it is told to, lest a dhcpleased
+   whose messages differ take the question for a request for a new
+   lease.
 
    It writes the Configuration it holds to a state file of shell
    variable assignments, which it replaces atomically:
@@ -827,20 +862,17 @@ Appendix A.  Reference Implementation
    DCARP_GATEWAY=192.0.2.1
    DCARP_BACKUP_GATEWAY=192.168.1.2
    DCARP_GENERATION=1793625676
+   DCARP_LEASE_TIME=86400
+   DCARP_LEASE_EXPIRES=1793712076
+
+   It starts with the Generation of the state file, and as Backup puts
+   the address back as Section 8.3 describes.
 
    ifstated(8) sources the file and routes via DCARP_GATEWAY when the
    CARP interface becomes Master, and via DCARP_BACKUP_GATEWAY when it
    becomes Backup, so that its configuration is the same on every
    member.  A complete ifstated configuration is distributed with the
    implementation.  The Backup Gateway is the -g option of dcarpd.
-
-
-
-
-Hallqvist                  Expires 6 May 2027                  [Page 15]
-
-Internet-Draft                    DCARP                    November 2026
-
 
    With more than two members, dcarpd runs the program given with its -x
    option, with the state file and the CARP state as arguments, whenever
@@ -851,11 +883,20 @@ Internet-Draft                    DCARP                    November 2026
    members in separate routing domains of one host, including the split
    of Section 9, failovers among three members, a member returning
    without preemption, Masters of equal Priority, replays, tampered and
-   stale messages, and messages with another key.
+   stale messages, messages with another key, a Backup that loses its
+   address, and renewals of the lease.
 
 Acknowledgments
 
    DCARP builds on CARP, written for OpenBSD.
+
+
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 16]
+
+Internet-Draft                    DCARP                    November 2026
+
 
 Author's Address
 
@@ -893,4 +934,19 @@ Author's Address
 
 
 
-Hallqvist                  Expires 6 May 2027                  [Page 16]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 17]
