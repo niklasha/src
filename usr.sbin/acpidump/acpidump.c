@@ -282,7 +282,9 @@ acpi_check_rsd_ptr(vm_offset_t pa)
 	if (memcmp(rp.signature, "RSD PTR ", 8) != 0)
 		return NULL;
 
-	if (rp.rev >= 2) {
+	/* the longer revision 2 RSDP never reads on into the VGA hole */
+	if (rp.rev >= 2 &&
+	    (pa >= 0xa0000 || pa + sizeof(struct ACPIrsdp) <= 0xa0000)) {
 		read(acpi_mem_fd, &(rp.len),
 		    sizeof(struct ACPIrsdp) - SIZEOF_RSDP_REV_0);
 		if (acpi_checksum(&rp, sizeof(struct ACPIrsdp)) == 0)
@@ -307,7 +309,35 @@ acpi_find_rsd_ptr(void)
 	}
 
 #if defined(__amd64__) || defined (__i386__)
-	for (addr = 0; addr < 1024 * 1024; addr += 16) {
+	/*
+	 * Look only where the ACPI specification says the RSDP may be, as
+	 * the kernel's acpi_probe() does: the first KB of the Extended BIOS
+	 * Data Area (its segment is stored at 0x40e), then the BIOS ROM
+	 * window 0xe0000-0xfffff.  Do not sweep the whole first megabyte:
+	 * 0xa0000-0xbffff is legacy VGA memory, and reading it while the
+	 * graphics device has powered down its VGA logic can hang the
+	 * machine or raise a machine check (seen on Skylake ThinkCentres).
+	 */
+	{
+		u_int16_t	ebda_seg;
+		u_long		ebda;
+
+		if (lseek(acpi_mem_fd, 0x40e, SEEK_SET) == 0x40e &&
+		    read(acpi_mem_fd, &ebda_seg, sizeof(ebda_seg)) ==
+		    sizeof(ebda_seg)) {
+			ebda = (u_long)ebda_seg << 4;
+			if (ebda != 0 && ebda < 0xa0000) {
+				/* every probe reads SIZEOF_RSDP_REV_0 bytes */
+				for (addr = ebda; addr < ebda + 1024 &&
+				    addr + SIZEOF_RSDP_REV_0 <= 0xa0000;
+				    addr += 16) {
+					if ((rp = acpi_check_rsd_ptr(addr)))
+						return rp;
+				}
+			}
+		}
+	}
+	for (addr = 0xe0000; addr < 0x100000; addr += 16) {
 		if ((rp = acpi_check_rsd_ptr(addr)))
 			return rp;
 	}
