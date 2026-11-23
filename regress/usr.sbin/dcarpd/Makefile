@@ -10,7 +10,7 @@
 DCARPD ?=	/usr/sbin/dcarpd
 
 # Must match the interfaces created by dcarpd-test.
-INTERFACES =	carp75 carp77 carp78 carp79 veb77 veb79 \
+INTERFACES =	carp75 carp77 carp78 carp79 carp88 veb77 veb79 vether77 \
 		vport75 vport76 vport77 vport78 vport79 vport85 vport89
 
 .if ! (make(clean) || make(cleandir) || make(obj))
@@ -29,10 +29,11 @@ regress:
 	@echo SKIPPED
 .endif
 
-# A member of better priority comes back as backup only without preemption.
+# A member of better priority comes back, or stays, backup only without
+# preemption.
 SYSCTL_PREEMPT !=	/sbin/sysctl -n net.inet.carp.preempt
 .if ${SYSCTL_PREEMPT} != 0
-REGRESS_SKIP_TARGETS +=	backup-follows-master
+REGRESS_SKIP_TARGETS +=	backup-follows-master no-address
 .endif
 
 IFS_IN_USE !=	for i in ${INTERFACES}; do \
@@ -50,12 +51,15 @@ TESTS =		state-file gateway-from-route other-carp log-live \
 		replay tampered wrong-key encrypted sync-interface \
 		periodic address-change split-brain address-follow \
 		older-generation lower-priority equal-priority init-takes \
-		no-address demote-lifted \
+		no-address \
 		backup-follows-master three-members backup-gateway-kept stale \
 		restore-address restore-on-start state-generation \
 		address-generation renew lease-time lease-size lease-silent \
 		lease-future renew-ahead restore-address-v4 restore-master \
-		lease-other restore-on-up replace-on-backup
+		lease-other restore-on-up replace-on-backup sigint start-fails \
+		desync reject-repeat start-errors state-retry carp-copies \
+		key-mode second-daemon short-messages interface-gone \
+		two-addresses other-rdomain
 
 # Waits for a recorded message to age out.
 REGRESS_SLOW_TARGETS +=	stale

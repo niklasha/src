@@ -100,7 +100,13 @@ struct dcarp_config {
 #define DCARP_SENDERS		64	/* senders remembered against replay,
 					   at least the members of a group */
 #define DCARP_REJECT_LOG_INTERVAL 10	/* seconds between logged rejects */
+#define DCARP_REJECT_REPEAT_INTERVAL 600 /* seconds before the same reject
+					   from the same sender is logged
+					   again */
+#define DCARP_REJECT_RECENT	8	/* rejections remembered for that */
 #define DCARP_LEASE_WAIT	1	/* seconds to wait for dhcpleased(8) */
+#define DCARP_ROUTE_RCVBUF	(256 * 1024) /* bytes, routing socket */
+#define DCARP_ROUTE_BURST	64	/* routing messages read at a time */
 #define DCARP_RESTORE_DELAY	200	/* ms after the address was removed as
 					   backup to put it back: a replacement
 					   adds another one sooner */
@@ -122,19 +128,22 @@ void daemonize(void);
 int determine_carp_state(struct if_msghdr *);
 int get_carp_interface_state(const char *);
 int get_carp_priority(const char *, uint32_t *, uint8_t *, uint8_t *);
-int demote_groups(void);
-int undemote_groups(void);
-void update_demote(void);
-void lift_demote(void);
+void address_changed(int);
+int resync(void);
+void routing_message(char *, size_t);
+int same_link(const char *, const char *);
+int our_rdomain(void);
+int interface_rdomain(const char *);
 void restore_address(void);
 int interface_has_address(const char *, in_addr_t);
+int count_addresses(const char *);
 int64_t mono_to_wall(const struct timespec *);
 int query_lease(struct ctl_engine_info *, char *, size_t);
 void lease_update(in_addr_t);
 uint32_t priority_key(uint32_t, uint8_t, uint8_t);
 int distribute_ip_addresses(void);
 int get_interface_ip_and_netmask(const char *, in_addr_t *, in_addr_t *);
-void handle_signal(int sig);
+void signal_callback(int, short, void *);
 void log_close(void);
 void log_init(void);
 void log_message(int, const char *, ...);

@@ -40,12 +40,14 @@
 #	 replay | tampered | wrong-key | encrypted | sync-interface |
 #	 periodic | address-change | split-brain | address-follow |
 #	 older-generation | lower-priority | equal-priority | init-takes |
-#	 no-address | demote-lifted | backup-follows-master | three-members |
+#	 no-address | backup-follows-master | three-members |
 #	 backup-gateway-kept | stale | restore-address | restore-on-start |
 #	 state-generation | address-generation | renew | lease-time |
 #	 lease-size | lease-silent | lease-future | renew-ahead |
 #	 restore-address-v4 | restore-master | lease-other | restore-on-up |
-#	 replace-on-backup
+#	 replace-on-backup | sigint | start-fails | desync | reject-repeat |
+#	 start-errors | state-retry | carp-copies | key-mode | second-daemon |
+#	 short-messages | interface-gone | two-addresses | other-rdomain
 
 : ${OBJDIR?} ${DCARPD?} ${REPLAY?} ${LEASED?}
 
@@ -57,8 +59,8 @@ VHID=177
 PREFIX=10.77.0		# carp net
 INTERNAL=10.79.0	# internal net
 MAX_AGE=30		# DCARP_MAX_AGE in dcarpd.h
-INTERFACES="carp$RB carp$RM carp$RT carp79 veb77 veb79 vport$RT vport76
-    vport77 vport78 vport79 vport85 vport89"
+INTERFACES="carp$RB carp$RM carp$RT carp79 carp88 veb77 veb79 vether77
+    vport$RT vport76 vport77 vport78 vport79 vport85 vport89"
 
 KEY=$OBJDIR/dcarp.key
 HOOK=$OBJDIR/dcarpd-hook
@@ -69,13 +71,16 @@ BSTATE=$OBJDIR/dcarpd-$1-backup.state
 MSTATE=$OBJDIR/dcarpd-$1-master.state
 TSTATE=$OBJDIR/dcarpd-$1-third.state
 MSG=$OBJDIR/dcarpd-$1.msg
+DIR=$OBJDIR/dcarpd-$1.dir		# a directory of the test's own
 CTL=$OBJDIR/dcarpd-$1.sock		# fake-dhcpleased's control socket
 LEASE=$OBJDIR/dcarpd-$1.lease		# the lease it reports
 FLOG=$OBJDIR/dcarpd-$1-dhcpleased.log	# the requests it got
 
 cleanup() {
 	for p in $bpid $cpid $mpid $tpid $fpid; do
+		kill -CONT $p 2>/dev/null	# desync stops one
 		kill $p 2>/dev/null
+		retry_for 5 exited $p || kill -KILL $p 2>/dev/null
 		wait $p 2>/dev/null
 	done
 	bpid=
@@ -89,6 +94,11 @@ cleanup() {
 	for i in $INTERFACES; do
 		ifconfig $i destroy 2>/dev/null
 	done
+	# Not ifconfig lo$RB alone, which would create it
+	! ifconfig lo$RB >/dev/null 2>&1 ||
+	    ifconfig lo$RB -alias 127.0.0.2 2>/dev/null
+	rm -rf $DIR
+	chmod 600 $KEY 2>/dev/null
 }
 
 fail() {
@@ -172,6 +182,12 @@ only_address() {	# $1 = interface, $2 = address
 	[ "$(addresses $1)" = $2 ]
 }
 
+# Whether a process has exited: gone, or a zombie not waited for yet
+exited() {	# $1 = pid
+	st=$(ps -o stat= -p $1 2>/dev/null)
+	[ -z "$st" ] || [ "${st#Z}" != "$st" ]
+}
+
 listening() {	# $1 = pid
 	fstat -p $1 2>/dev/null | grep -q ':3522'
 }
@@ -213,7 +229,8 @@ setup() {	# $1 = "default" to give the backup an internal default route
 	retry carp_is carp$RB BACKUP || fail "carp$RB did not become BACKUP"
 	retry carp_is carp79 MASTER || fail "carp79 did not become MASTER"
 
-	(umask 077; echo dcarpd-regress-key > $KEY) || fail "cannot write $KEY"
+	(umask 077; echo dcarpd-regress-key > $KEY && chmod 600 $KEY) ||
+	    fail "cannot write $KEY"
 	# A -x hook routing as ifstated-dcarpd.conf does, logging each route
 	cat > $HOOK <<-'EOF' || fail "cannot write $HOOK"
 	#!/bin/sh
@@ -252,6 +269,9 @@ start_third() {		# extra dcarpd arguments
 	    -f $TSTATE -c $CTL "$@" > $TLOG 2>&1 &
 	tpid=$!
 	retry listening $tpid || fail "third dcarpd did not start"
+	# Logged once it handles signals, after the bind
+	retry grep -q "carp$RT is in [A-Z]* state" $TLOG ||
+	    fail "third dcarpd did not report its state"
 }
 
 start_backup() {	# extra dcarpd arguments
@@ -259,6 +279,9 @@ start_backup() {	# extra dcarpd arguments
 	    -f $BSTATE -c $CTL "$@" > $BLOG 2>&1 &
 	bpid=$!
 	retry listening $bpid || fail "backup dcarpd did not start"
+	# Logged once it handles signals, after the bind
+	retry grep -q "carp$RB is in [A-Z]* state" $BLOG ||
+	    fail "backup dcarpd did not report its state"
 }
 
 stop_backup() {
@@ -693,75 +716,46 @@ init-takes)
 	    fail "backup dcarpd did not see carp$RB as INIT"
 	;;
 no-address)
-	# A member whose carp interface has no address holds a demotion of
-	# the interface's groups while it has none: as master it then takes
-	# the address of a master that has one.  Note that the groups are
-	# host-wide: the count of "carp" rises for every carp(4) on the host
-	# while the test runs.
+	# A member whose carp interface has no IPv4 address takes the
+	# configuration of a master that has one, also as master and of
+	# better priority: without its address carp(4) neither elects it
+	# nor lets it serve.  Here the backup, of better priority than the
+	# master once that has advskew 200 (no preemption), is cut off,
+	# becomes master, and loses its address; its IPv6 link-local address
+	# keeps it up and master.  dcarpd changes no carp demote count.
 	setup default
-	before=$(demote carp)
-	run ifconfig carp$RB $PREFIX.77 delete
-	run ifconfig carp$RB up
-	retry carp_is carp$RB INIT || fail "carp$RB without an address not INIT"
+	carpbefore=$(demote carp)
+	allbefore=$(demote all)
+	# An address added sends carp through INIT: wait for each election
+	run ifconfig carp$RM inet6 eui64
+	retry carp_is carp$RM MASTER || fail "carp$RM not MASTER again"
+	run ifconfig carp$RB inet6 eui64
+	sleep 5
+	run ifconfig carp$RM advskew 200
+	sleep 2
+	retry carp_is carp$RM MASTER && carp_is carp$RB BACKUP ||
+	    fail "carp$RM and carp$RB are not MASTER and BACKUP"
 	start_backup
-	retry demote_is carp $((before + 1)) ||
-	    fail "group carp not demoted: $(demote carp), was $before"
-	grep -q "carp$RB has no address: demoted its groups" $BLOG ||
-	    fail "backup dcarpd did not log the demotion"
 	start_master $PREFIX.254
-	retry only_address carp$RB $PREFIX.77 ||
-	    fail "carp$RB did not take $PREFIX.77: $(addresses carp$RB)"
-	retry demote_is carp $before ||
-	    fail "demotion not lifted with the address: $(demote carp)"
-	# A member that is not backup, here taken down, and loses its
-	# address is demoted again: only a backup puts its address back
-	seen=$(grep -c "CARP state changed to INIT" $BLOG)
-	run ifconfig carp$RB down
-	retry logged_more "CARP state changed to INIT" $BLOG $seen ||
-	    fail "backup dcarpd did not see carp$RB in INIT"
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	run ifconfig veb77 del vport$RB
+	retry carp_is carp$RB MASTER || fail "cut off carp$RB did not become MASTER"
 	run ifconfig carp$RB $PREFIX.77 delete
-	retry demote_is carp $((before + 1)) ||
-	    fail "group carp not demoted again: $(demote carp)"
-	! grep -q "restoring" $BLOG || fail "member in INIT put its address back"
-	# Exiting lifts the demotion
-	kill $bpid 2>/dev/null || fail "backup dcarpd died"
-	wait $bpid 2>/dev/null
-	bpid=
-	retry demote_is carp $before ||
-	    fail "demotion not lifted on exit: $(demote carp)"
+	sleep 1
+	[ -z "$(addresses carp$RB)" ] ||
+	    fail "master carp$RB put $(addresses carp$RB) back"
+	run ifconfig veb77 add vport$RB
+	retry_for 15 only_address carp$RB $PREFIX.77 ||
+	    fail "carp$RB without an address did not take $PREFIX.77: $(addresses carp$RB)"
+	demote_is carp $carpbefore || fail "group carp demoted: $(demote carp)"
+	demote_is all $allbefore || fail "group all demoted: $(demote all)"
+	stop_backup
 	stop_master
-	;;
-demote-lifted)
-	# Another program lifts the demotion dcarpd holds.  When the address
-	# comes back, dcarpd finds the count already 0: it holds no demotion
-	# there any more, and must neither fail nor retry for good.  Needs
-	# the count of "carp" at 0, so that lifting it is seen.
-	setup default
-	before=$(demote carp)
-	[ "$before" = 0 ] || { echo "carp demote count $before, not 0"; \
-	    echo SKIPPED; cleanup; exit 0; }
-	run ifconfig carp$RB $PREFIX.77 delete
-	run ifconfig carp$RB up
-	retry carp_is carp$RB INIT || fail "carp$RB without an address not INIT"
-	start_backup
-	retry demote_is carp 1 || fail "group carp not demoted: $(demote carp)"
-	run ifconfig -g carp -carpdemote 1
-	start_master $PREFIX.254
-	retry only_address carp$RB $PREFIX.77 ||
-	    fail "carp$RB did not take $PREFIX.77: $(addresses carp$RB)"
-	retry grep -q "the demotion of group carp was already lifted" $BLOG ||
-	    fail "lifting an already lifted demotion not logged"
-	retry grep -q "carp$RB has an address: lifted the demotion" $BLOG ||
-	    fail "backup dcarpd still holds a demotion"
-	sleep 3
-	! grep -q "could not undemote" $BLOG ||
-	    fail "backup dcarpd failed to undemote"
-	demote_is carp 0 || fail "group carp demote count $(demote carp)"
-	kill $bpid 2>/dev/null || fail "backup dcarpd died"
-	wait $bpid 2>/dev/null
-	bpid=
-	demote_is carp 0 || fail "group carp demote count $(demote carp) on exit"
-	stop_master
+	grep -q "taking it although not backup" $BLOG ||
+	    fail "taking the configuration as master not logged"
+	! grep -q "demot" $BLOG || fail "backup dcarpd demoted: $(grep demot $BLOG)"
+	! grep -q "UNKNOWN state" $BLOG || fail "INIT logged as an unknown state"
 	;;
 backup-follows-master)
 	# Without preemption a member of better priority that comes back
@@ -1237,18 +1231,266 @@ renew-ahead)
 	stop_master
 	stop_dhcpleased
 	;;
+sigint)
+	# SIGINT stops dcarpd as SIGTERM does.
+	setup default
+	start_backup
+	kill -INT $bpid
+	retry_for 5 grep -q "terminated by SIGINT" $BLOG ||
+	    fail "SIGINT not logged"
+	retry_for 5 exited $bpid || fail "backup dcarpd did not stop on SIGINT"
+	wait $bpid 2>/dev/null
+	bpid=
+	;;
+start-fails)
+	# dcarpd refuses an interface that is not carp(4), at start, and
+	# demotes nothing.
+	setup default
+	allbefore=$(demote all)
+	run ifconfig vether77 create
+	run ifconfig vether77 rdomain $RB
+	run ifconfig vether77 up
+	route -T $RB exec $DCARPD -d -v -i vether77 -k $KEY -f $BSTATE -c $CTL \
+	    > $BLOG 2>&1 &
+	bpid=$!
+	retry_for 5 exited $bpid || fail "dcarpd started on vether77"
+	wait $bpid && fail "dcarpd on vether77 exited with 0"
+	bpid=
+	grep -q "vether77: not a carp(4) interface" $BLOG ||
+	    fail "refusing vether77 not logged: $(cat $BLOG)"
+	demote_is vether 0 || fail "group vether demoted: $(demote vether)"
+	demote_is all $allbefore || fail "group all demoted: $(demote all)"
+	;;
+desync)
+	# When its routing socket overflows, dcarpd gets RTM_DESYNC instead
+	# of the messages lost, and catches up with the kernel: here the
+	# backup became master, cut off from the master, while dcarpd was
+	# stopped and its socket full.  Its 256 KB take some 1400 pairs of
+	# address messages of 96 bytes.
+	setup default
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	kill -STOP $bpid
+	i=0
+	while [ $i -lt 2000 ]; do
+		ifconfig vport79 alias $INTERNAL.100/32
+		ifconfig vport79 -alias $INTERNAL.100
+		i=$((i + 1))
+	done
+	run ifconfig veb77 del vport$RB
+	retry carp_is carp$RB MASTER || fail "cut off carp$RB did not become MASTER"
+	kill -CONT $bpid
+	retry_for 5 grep -q "CARP state changed to MASTER" $BLOG ||
+	    fail "backup dcarpd did not see carp$RB become MASTER"
+	retry grep -q "routing messages lost" $BLOG ||
+	    fail "lost routing messages not logged"
+	stop_backup
+	stop_master
+	! grep -q "unexpected routing message" $BLOG ||
+	    fail "RTM_DESYNC taken for an unexpected message"
+	;;
+reject-repeat)
+	# A sender that keeps resending a configuration that is rejected,
+	# here an older one, is logged once, not at every resend.
+	# Another rejection logged meanwhile, of the same sender, changes
+	# nothing.
+	setup default
+	(umask 077; echo another-key > $KEY.other) || fail "cannot write key"
+	statefile $BSTATE $PREFIX.77 $(($(date +%s) + 3600))
+	start_backup
+	start_master $PREFIX.254
+	retry rejected $PREFIX.77 "older configuration" ||
+	    fail "older configuration not rejected"
+	sleep 25	# two more resends
+	stop_master
+	start_master $PREFIX.254 -k $KEY.other
+	retry_for 15 rejected $PREFIX.77 "authentication failed" ||
+	    fail "another rejection of the same sender not logged"
+	stop_master
+	sleep 11	# past the limit for any rejection
+	# The same rejection of another sender is logged
+	dd if=/dev/zero of=$MSG bs=104 count=1 2>/dev/null
+	replay
+	retry rejected $PREFIX.$RA "authentication failed" ||
+	    fail "the same rejection of another sender not logged"
+	sleep 11
+	start_master $PREFIX.254
+	sleep 12	# a resend
+	stop_backup
+	stop_master
+	count=$(grep -c "rejected message from $PREFIX.77: older configuration" $BLOG)
+	[ $count -eq 1 ] || fail "older configuration logged $count times"
+	;;
+start-errors)
+	# Errors at start reach the terminal, naming the file, and dcarpd
+	# exits with an error, also without -d.
+	setup default
+	route -T $RB exec $DCARPD -i carp$RB -k $OBJDIR/nonexistent.key \
+	    -f $BSTATE -c $CTL > $BLOG 2>&1 && fail "dcarpd started without its key"
+	grep -q "$OBJDIR/nonexistent.key" $BLOG ||
+	    fail "key file not named: $(cat $BLOG)"
+	;;
+state-retry)
+	# A master whose state file could not be written writes it at its
+	# next resend.
+	setup default
+	rm -rf $DIR
+	route -T $RM exec $DCARPD -d -v -i carp$RM -g $PREFIX.254 -k $KEY \
+	    -f $DIR/master.state -c $CTL > $MLOG 2>&1 &
+	mpid=$!
+	retry listening $mpid || fail "master dcarpd did not start"
+	retry grep -q "^sent " $MLOG || fail "master did not send"
+	[ ! -e $DIR/master.state ] || fail "state file written without its directory"
+	run mkdir $DIR
+	retry_for 15 test -s $DIR/master.state ||
+	    fail "state file not written at the next resend"
+	stop_master
+	;;
+carp-copies)
+	# carp(4) hands every multicast datagram on its carpdev to every
+	# carp interface there: dcarpd drops the copies of the master's
+	# messages that another carp interface delivers, without logging
+	# them as rejected.
+	setup default
+	mkcarp carp88 $RB vport$RB 188 100 $PREFIX.88/24
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	sleep 12	# a resend
+	stop_backup
+	stop_master
+	grep -q "dropped a copy received on carp88" $BLOG ||
+	    fail "no copy on carp88 seen"
+	! grep -q "rejected message .*received on carp88" $BLOG ||
+	    fail "copy on carp88 rejected: $(grep 'received on carp88' $BLOG | head -1)"
+	;;
+key-mode)
+	# The key file must be a regular file without any permission for
+	# group or others: one that they can read or write is refused.
+	setup default
+	for mode in 640 604 620 602 610 601; do
+		run chmod $mode $KEY
+		route -T $RB exec $DCARPD -d -v -i carp$RB -g $PREFIX.250 \
+		    -k $KEY -f $BSTATE -c $CTL > $BLOG 2>&1 &
+		bpid=$!
+		retry_for 3 grep -q "$KEY: accessible by group or others" \
+		    $BLOG || fail "key file of mode $mode not refused"
+		retry_for 5 exited $bpid ||
+		    fail "dcarpd runs with a key file of mode $mode"
+		wait $bpid 2>/dev/null
+		bpid=
+	done
+	;;
+second-daemon)
+	# One dcarpd per routing domain: a second one fails before it
+	# becomes a daemon, with the error on the terminal.
+	setup default
+	start_backup
+	route -T $RB exec $DCARPD -i carp$RB -k $KEY -f $BSTATE.2 -c $CTL \
+	    > $TLOG 2>&1 && fail "second dcarpd started"
+	grep -q "Address already in use" $TLOG ||
+	    fail "bind failure not reported: $(cat $TLOG)"
+	stop_backup
+	;;
+short-messages)
+	# Address messages of other interfaces, e.g. of lo(4), are shorter
+	# than a routing message header: no error.
+	setup default
+	start_backup
+	run ifconfig lo$RB alias 127.0.0.2/32
+	run ifconfig lo$RB -alias 127.0.0.2
+	sleep 1
+	stop_backup
+	! grep -E -q "too short|too small" $BLOG ||
+	    fail "short routing message logged: $(grep -E 'too short|too small' $BLOG)"
+	;;
+interface-gone)
+	# A carp interface created anew gets another index, of which dcarpd
+	# would hear nothing: when its interface is destroyed, it exits.
+	setup default
+	start_backup
+	# Not for any interface
+	run ifconfig vether77 create
+	run ifconfig vether77 destroy
+	sleep 1
+	! exited $bpid || fail "backup dcarpd exited when vether77 was destroyed"
+	run ifconfig carp$RB destroy
+	retry_for 5 grep -q "carp$RB was destroyed: exiting" $BLOG ||
+	    fail "destroying carp$RB not logged"
+	retry_for 5 exited $bpid ||
+	    fail "backup dcarpd did not exit when carp$RB was destroyed"
+	wait $bpid 2>/dev/null
+	bpid=
+	# The same for the sync interface
+	mkcarp carp$RB $RB vport$RB $VHID 100 $PREFIX.77/24
+	start_backup -s vport79
+	run ifconfig vport79 destroy
+	retry_for 5 grep -q "vport79 was destroyed: exiting" $BLOG ||
+	    fail "destroying vport79 not logged"
+	retry_for 5 exited $bpid ||
+	    fail "backup dcarpd did not exit when vport79 was destroyed"
+	wait $bpid 2>/dev/null
+	bpid=
+	;;
+two-addresses)
+	# carp(4) authenticates over all the addresses of the interface: a
+	# master whose carp interface has two IPv4 addresses sends neither,
+	# and says so.
+	setup default
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	sent=$(grep -c -E "^sent |^resent unchanged" $MLOG)
+	run ifconfig carp$RM inet $PREFIX.66/24 alias
+	retry_for 25 grep -q "carp$RM has 2 IPv4 addresses, not sending" $MLOG ||
+	    fail "two addresses on carp$RM not logged"
+	[ $(grep -c -E "^sent |^resent unchanged" $MLOG) -eq $sent ] ||
+	    fail "master sent with two addresses"
+	stop_backup
+	stop_master
+	! grep -q "Received IP distribution message .*CARP IP: $PREFIX.66" $BLOG ||
+	    fail "backup took the alias $PREFIX.66"
+	;;
+other-rdomain)
+	# dcarpd hears the routing messages of its own routing domain only,
+	# so it refuses an interface in another one.
+	setup default
+	$DCARPD -d -v -i carp$RB -k $KEY -f $BSTATE -c $CTL > $BLOG 2>&1 &
+	bpid=$!
+	retry_for 3 grep -q "carp$RB is in rdomain $RB" $BLOG ||
+	    fail "carp$RB in rdomain $RB not refused: $(cat $BLOG)"
+	retry_for 5 exited $bpid || fail "dcarpd runs for carp$RB from rdomain 0"
+	wait $bpid 2>/dev/null
+	bpid=
+	# The sync interface too
+	route -T $RB exec $DCARPD -d -v -i carp$RB -s vport89 -k $KEY \
+	    -f $BSTATE -c $CTL > $BLOG 2>&1 &
+	bpid=$!
+	retry_for 3 grep -q "vport89 is in rdomain $RM" $BLOG ||
+	    fail "vport89 in rdomain $RM not refused: $(cat $BLOG)"
+	retry_for 5 exited $bpid || fail "dcarpd runs with vport89 from rdomain $RB"
+	wait $bpid 2>/dev/null
+	bpid=
+	;;
 *)
 	echo "usage: dcarpd-test state-file | gateway-from-route | other-carp |" \
 	    "log-live | replay | tampered | wrong-key | encrypted |" \
 	    "sync-interface | periodic | address-change | split-brain |" \
 	    "address-follow | older-generation | lower-priority |" \
-	    "equal-priority | init-takes | no-address | demote-lifted |" \
+	    "equal-priority | init-takes | no-address |" \
 	    "backup-follows-master | three-members | backup-gateway-kept |" \
 	    "stale | restore-address | restore-on-start | state-generation |" \
 	    "address-generation | renew | lease-time | lease-size |" \
 	    "lease-silent | lease-future | renew-ahead | restore-address-v4 |" \
 	    "restore-master | lease-other | restore-on-up |" \
-	    "replace-on-backup" >&2
+	    "replace-on-backup | sigint | start-fails | desync |" \
+	    "reject-repeat | start-errors | state-retry | carp-copies |" \
+	    "key-mode | second-daemon | short-messages | interface-gone |" \
+	    "two-addresses | other-rdomain" >&2
 	exit 2
 	;;
 esac

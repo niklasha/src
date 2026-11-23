@@ -15,6 +15,7 @@
  */
 
 #include <limits.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 #include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -44,7 +46,9 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <ifaddrs.h>
+#include <paths.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <event.h>
 #include <imsg.h>
 #include <poll.h>
@@ -133,17 +137,12 @@ in_addr_t learned_backup_gw;
  */
 in_addr_t learned_gw;
 
-/* Whether we hold a demotion of the carp interface's groups: no address */
-int demoted;
+/* Whether we have become a daemon: until then errors go to stderr too */
+int daemonized;
 
-/*
- * The groups we demoted, so that we lift exactly our own demotion: the
- * interface may join or leave groups meanwhile (egress follows the default
- * route), and another program may lift a group's demotion.
- */
-#define DEMOTED_MAX	16
-char demoted_groups[DEMOTED_MAX][IFNAMSIZ];
-int ndemoted;
+/* SIGTERM and SIGINT stop us, SIGHUP rereads the key */
+struct event sigterm_event, sigint_event, sighup_event;
+void signal_callback(int, short, void *);
 
 /*
  * How often the -x hook was asked to run, the one running, whether it must
@@ -178,7 +177,7 @@ void log_init() {
 }
 
 void log_message(int level, const char *format, ...) {
-	va_list args;
+	va_list args, copy;
 	va_start(args, format);
 
 	if (level <= LOG_INFO + global_options.verbose) {
@@ -187,6 +186,14 @@ void log_message(int level, const char *format, ...) {
 			vfprintf(stderr, format, args);
 			fprintf(stderr, "\n");
 		} else {
+			/* Until we are a daemon, warnings reach the terminal */
+			if (!daemonized && level <= LOG_WARNING) {
+				va_copy(copy, args);
+				fprintf(stderr, "%s: ", getprogname());
+				vfprintf(stderr, format, copy);
+				fprintf(stderr, "\n");
+				va_end(copy);
+			}
 			vsyslog(level, format, args);
 		}
 	}
@@ -201,16 +208,44 @@ void log_close() {
 /*
  * Log why a message was rejected, with its source address.  Anyone on
  * the segment can send to us, so log at most one rejection every
- * DCARP_REJECT_LOG_INTERVAL seconds and count the ones left out.
+ * DCARP_REJECT_LOG_INTERVAL seconds, and the same rejection of the same
+ * sender, e.g. at each resend, only every DCARP_REJECT_REPEAT_INTERVAL
+ * seconds; count the ones left out.
  */
 void log_rejected(const struct sockaddr_in *from, const char *format, ...) {
+	static struct {
+		in_addr_t from;
+		const char *format;	/* the kind of rejection */
+		time_t logged;
+	} recent[DCARP_REJECT_RECENT];
 	static time_t last;
 	static unsigned int suppressed;
+	struct timespec mono;
 	char from_str[INET_ADDRSTRLEN];
 	char reason[128];
-	time_t now = time(NULL);
+	time_t now;
 	va_list args;
+	int i, slot = 0;
 
+	/* Not the wall clock, which may be stepped back */
+	clock_gettime(CLOCK_MONOTONIC, &mono);
+	now = mono.tv_sec;
+
+	/* The same rejection of the same sender, else the oldest entry */
+	for (i = 0; i < DCARP_REJECT_RECENT; i++) {
+		if (recent[i].format == format &&
+		    recent[i].from == from->sin_addr.s_addr)
+			break;
+		if (recent[i].logged < recent[slot].logged)
+			slot = i;
+	}
+	if (i < DCARP_REJECT_RECENT) {
+		if (now - recent[i].logged < DCARP_REJECT_REPEAT_INTERVAL) {
+			suppressed++;
+			return;
+		}
+		slot = i;
+	}
 	if (last != 0 && now - last < DCARP_REJECT_LOG_INTERVAL) {
 		suppressed++;
 		return;
@@ -229,6 +264,9 @@ void log_rejected(const struct sockaddr_in *from, const char *format, ...) {
 		log_message(LOG_WARNING, "rejected message from %s: %s",
 		    from_str, reason);
 	last = now;
+	recent[slot].from = from->sin_addr.s_addr;
+	recent[slot].format = format;
+	recent[slot].logged = now;
 	suppressed = 0;
 }
 
@@ -245,7 +283,9 @@ void log_perror(const char *message) {
 		// In debug mode, log to stderr
 		fprintf(stderr, "%s\n", buffer);
 	} else {
-		// In normal mode, log to syslog
+		/* Until we are a daemon, errors reach the terminal */
+		if (!daemonized)
+			fprintf(stderr, "%s: %s\n", getprogname(), buffer);
 		syslog(LOG_ERR, "%s", buffer);
 	}
 }
@@ -304,10 +344,8 @@ void update_carp_state(int new_state) {
 		runs = hook_runs;
 		if (new_state == CARP_STATE_MASTER) {
 			distribute_ip_addresses();
-		} else if (new_state == CARP_STATE_BACKUP) {
+		} else if (new_state == CARP_STATE_BACKUP)
 			restore_address();
-			update_demote();
-		}
 		if (hook_runs == runs)
 			run_hook();
 	}
@@ -347,6 +385,10 @@ void start_hook(void) {
 	case 0:
 		/* We ignore it, lest dhcpleased going away kill us */
 		signal(SIGPIPE, SIG_DFL);
+		/* Until execv, libevent's handlers would wake our loop */
+		signal(SIGTERM, SIG_DFL);
+		signal(SIGINT, SIG_DFL);
+		signal(SIGHUP, SIG_DFL);
 		execv(argv[0], argv);
 		log_perror(argv[0]);
 		_exit(127);
@@ -428,6 +470,15 @@ int receive_message() {
 	if (ifindex != sync_ifindex) {
 		if (if_indextoname(ifindex, ifname) == NULL)
 			snprintf(ifname, sizeof(ifname), "index %u", ifindex);
+		/*
+		 * carp(4) hands every multicast datagram on its carpdev to
+		 * every carp interface there: a copy, not an error.
+		 */
+		else if (same_link(ifname, global_options.sync_interface)) {
+			log_message(LOG_DEBUG, "dropped a copy received on %s",
+			    ifname);
+			return (-1);
+		}
 		log_rejected(&from_addr, "received on %s, not on %s", ifname,
 		    global_options.sync_interface);
 		return (-1);
@@ -509,14 +560,14 @@ int send_message(const struct dcarp_message *message) {
 }
 
 int distribute_ip_addresses() {
-	static int no_address;
+	static int no_address, several;
 	struct dcarp_message message;
 	char carp_ip_str[INET_ADDRSTRLEN];
 	char netmask_str[INET_ADDRSTRLEN];
 	char gateway_ip_str[INET_ADDRSTRLEN];
 	char backup_gw_str[INET_ADDRSTRLEN];
 	uint32_t demote;
-	int rv;
+	int n, rv;
 
 	memset(&message, 0, sizeof(message));
 	message.message_type = htonl(MSG_TYPE_IP_DISTRIBUTION);
@@ -529,6 +580,20 @@ int distribute_ip_addresses() {
 		return (0);
 	}
 	no_address = 0;
+
+	/*
+	 * carp(4) authenticates over all the addresses: which one would we
+	 * give?  Not while a new address replaces the old one either; say so
+	 * if it lasts.
+	 */
+	if ((n = count_addresses(global_options.interface_name)) > 1) {
+		if (several++ == 1)
+			log_message(LOG_ERR, "%s has %d IPv4 addresses, not "
+			    "sending until it has one",
+			    global_options.interface_name, n);
+		return (0);
+	}
+	several = 0;
 
 	/*
 	 * The gateway of the carp network, which the provider gives us, for
@@ -588,12 +653,13 @@ int distribute_ip_addresses() {
 	    (unsigned long long)my_sender, (unsigned long long)my_sequence,
 	    (long long)my_generation, my_lease_time, demote, message.advbase,
 	    message.advskew);
-	config_record(&last_sent, &message);
 	/*
 	 * Our own -g is no use to us: keep the backup gateway learned from
 	 * the members that were master before, for when we are backup again.
+	 * Sent only once written, lest a failed write be never repeated.
 	 */
-	write_state_file(&message, learned_backup_gw);
+	if (write_state_file(&message, learned_backup_gw) == 0)
+		config_record(&last_sent, &message);
 	return (0);
 }
 
@@ -601,13 +667,8 @@ int distribute_ip_addresses() {
 void send_timer_callback(int fd, short event, void *arg) {
 	struct timeval tv = { DCARP_INTERVAL, 0 };
 
-	/* In case an address change went by unseen */
-	if (current_carp_state == CARP_STATE_BACKUP &&
-	    get_carp_interface_state(global_options.interface_name) ==
-	    CARP_STATE_BACKUP)
-		restore_address();
-	update_demote();
-	if (current_carp_state == CARP_STATE_MASTER)
+	/* In case a change of the state or the address went by unseen */
+	if (resync() == 0 && current_carp_state == CARP_STATE_MASTER)
 		distribute_ip_addresses();
 	evtimer_add(&send_timer, &tv);
 }
@@ -621,6 +682,7 @@ int process_received_message(const struct dcarp_message *message,
 	char from_str[INET_ADDRSTRLEN];
 	uint32_t demote, their_prio, my_prio;
 	uint8_t advbase, advskew;
+	in_addr_t ip, netmask;
 	int64_t gen;
 	int better;
 
@@ -652,7 +714,9 @@ int process_received_message(const struct dcarp_message *message,
 		 * address yet.  A master takes it only from a sender with a
 		 * better carp(4) priority, the lower sender id breaking ties,
 		 * which decides between masters that see each other's
-		 * messages but not each other's advertisements.
+		 * messages but not each other's advertisements; or while it
+		 * has no IPv4 address, as carp authenticates its
+		 * advertisements over the addresses.
 		 */
 		gen = (int64_t)be64toh(message->generation);
 		their_prio = priority_key(ntohl(message->demote),
@@ -662,7 +726,9 @@ int process_received_message(const struct dcarp_message *message,
 			return (-1);
 		my_prio = priority_key(demote, advbase, advskew);
 		better = their_prio < my_prio || (their_prio == my_prio &&
-		    be64toh(message->sender) < my_sender);
+		    be64toh(message->sender) < my_sender) ||
+		    get_interface_ip_and_netmask(global_options.interface_name,
+		    &ip, &netmask) == -1;
 		if (gen < my_generation) {
 			log_rejected(from, "older configuration %s gateway %s "
 			    "(generation %lld, ours %lld)", carp_ip_str,
@@ -681,8 +747,6 @@ int process_received_message(const struct dcarp_message *message,
 			    message->advskew, demote, advbase, advskew);
 			return (0);
 		}
-		my_generation = gen;
-		my_lease_time = ntohl(message->lease_time);
 
 		/*
 		 * A master resends every DCARP_INTERVAL seconds; only a
@@ -705,24 +769,41 @@ int process_received_message(const struct dcarp_message *message,
 		    "%s%s", from_str,
 		    (unsigned long long)be64toh(message->sender),
 		    (unsigned long long)be64toh(message->sequence),
-		    (long long)gen, my_lease_time, carp_ip_str, netmask_str,
-		    gateway_ip_str,
+		    (long long)gen, ntohl(message->lease_time), carp_ip_str,
+		    netmask_str, gateway_ip_str,
 		    backup_gw_str, current_carp_state == CARP_STATE_BACKUP ? "" :
 		    ", taking it although not backup");
 		/*
 		 * Set the address; the routes are left to ifstated(8) and
-		 * the like, which find the gateway in the state file.
+		 * the like, which find the gateway in the state file.  Take
+		 * nothing unless that works: the next resend, newer than what
+		 * we hold, then tries again, also as master.
 		 */
 		if (global_options.dry_run) {
 			log_message(LOG_WARNING, "Dry-run mode: Skipping network reconfiguration.");
 		} else {
-			/* Our own address change, not one from outside */
+			if (configure_interface(global_options.interface_name, message->carp_ip, message->netmask) != 0) {
+				/*
+				 * Added, but an old one not removed: ours, lest
+				 * its removal look like a change from outside.
+				 * The next resend does the rest.
+				 */
+				if (interface_has_address(global_options.interface_name,
+				    message->carp_ip) == 1) {
+					known_ip = message->carp_ip;
+					known_mask = message->netmask;
+				}
+				return (-1);
+			}
+			/*
+			 * Our own address change, not one from outside: the
+			 * routing messages it caused are read after this.
+			 */
 			known_ip = message->carp_ip;
 			known_mask = message->netmask;
-			/* On failure, the next resend tries again */
-			if (configure_interface(global_options.interface_name, message->carp_ip, message->netmask) != 0)
-				return (-1);
 		}
+		my_generation = gen;
+		my_lease_time = ntohl(message->lease_time);
 		/* The sender's -g is our gateway while we are backup */
 		learned_backup_gw = message->backup_gateway;
 		if (message->gateway_ip != INADDR_ANY)
@@ -927,15 +1008,26 @@ int get_default_gateway(in_addr_t *gateway_ip) {
 	char buf[2048];
 	struct rt_msghdr *rtm = (struct rt_msghdr *)buf;
 	struct sockaddr *sa;
+	unsigned int filter;
 	char *cp;
 	ssize_t n;
 	int sockfd, i, rv = -1;
 
-	sockfd = socket(AF_ROUTE, SOCK_RAW, AF_INET);
+	/*
+	 * Not blocking: the kernel queues the answer before write(2)
+	 * returns, or drops it, e.g. short of memory, and then we must not
+	 * wait for it.
+	 */
+	sockfd = socket(AF_ROUTE, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
+	    AF_INET);
 	if (sockfd < 0) {
 		log_perror("socket");
 		return (-1);
 	}
+	filter = ROUTE_FILTER(RTM_GET);
+	if (setsockopt(sockfd, PF_ROUTE, ROUTE_MSGFILTER, &filter,
+	    sizeof(filter)) == -1)
+		log_perror("setsockopt(ROUTE_MSGFILTER)");
 
 	/*
 	 * The kernel takes exactly one routing message per write(2), so the
@@ -962,10 +1054,14 @@ int get_default_gateway(in_addr_t *gateway_ip) {
 	}
 	do {
 		n = read(sockfd, buf, sizeof(buf));
-	} while (n > 0 && (rtm->rtm_version != RTM_VERSION ||
-	    rtm->rtm_type != RTM_GET || rtm->rtm_seq != seq ||
-	    rtm->rtm_pid != getpid()));
-	if (n < (ssize_t)sizeof(*rtm) || rtm->rtm_errno != 0 ||
+	} while (n >= (ssize_t)sizeof(*rtm) && rtm->rtm_type != RTM_DESYNC &&
+	    (rtm->rtm_version != RTM_VERSION || rtm->rtm_type != RTM_GET ||
+	    rtm->rtm_seq != seq || rtm->rtm_pid != getpid()));
+	if (n == -1 && errno == EAGAIN)
+		log_message(LOG_WARNING, "no answer to RTM_GET of the default "
+		    "route");
+	if (n < (ssize_t)sizeof(*rtm) || rtm->rtm_type != RTM_GET ||
+	    rtm->rtm_errno != 0 ||
 	    rtm->rtm_index != carp_ifindex || !(rtm->rtm_addrs & RTA_GATEWAY))
 		goto out;
 
@@ -1122,6 +1218,7 @@ long long read_state_number(const char *name, long long max) {
 }
 
 int get_carp_interface_state(const char *if_name) {
+	static int failing;	/* logged, until it works again */
 	int sockfd;
 	struct ifreq ifr;
 	struct carpreq carpr;
@@ -1137,7 +1234,9 @@ int get_carp_interface_state(const char *if_name) {
 	ifr.ifr_data = (caddr_t)&carpr;
 
 	if (ioctl(sockfd, SIOCGVH, &ifr) < 0) {
-		log_perror("ioctl");
+		if (!failing)
+			log_perror(if_name);
+		failing = 1;
 		close(sockfd);
 		return (-1);
 	}
@@ -1145,10 +1244,14 @@ int get_carp_interface_state(const char *if_name) {
 	close(sockfd);
 
 	if (carpr.carpr_vhids[0] == 0 || carpr.carpr_vhids[1] != 0) {
-		log_message(LOG_ERR, "carp interface not active, or in balancing mode");
+		if (!failing)
+			log_message(LOG_ERR, "%s: carp interface not active, "
+			    "or in balancing mode", if_name);
+		failing = 1;
 		return (-1);
 	}
 
+	failing = 0;
 	return (carpr.carpr_states[0]);
 }
 
@@ -1221,149 +1324,6 @@ out:
 	return (rv);
 }
 
-/* Adjust the carp demote count of a group by adj */
-static int group_demote(int sockfd, const char *group, int adj) {
-	struct ifgroupreq ifga;
-
-	memset(&ifga, 0, sizeof(ifga));
-	strlcpy(ifga.ifgr_name, group, sizeof(ifga.ifgr_name));
-	ifga.ifgr_attrib.ifg_carp_demoted = adj;
-	return (ioctl(sockfd, SIOCSIFGATTR, &ifga));
-}
-
-/*
- * Demote every group the carp interface is in by one, as the kernel does
- * for a carp device whose link is down, and remember which we demoted.
- * Returns 0 if we hold a demotion of at least one group.
- */
-int demote_groups(void) {
-	struct ifgroupreq ifgr;
-	struct ifg_req *ifg;
-	unsigned int len;
-	int i, sockfd;
-
-	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sockfd < 0) {
-		log_perror("socket");
-		return (-1);
-	}
-	memset(&ifgr, 0, sizeof(ifgr));
-	strlcpy(ifgr.ifgr_name, global_options.interface_name,
-	    sizeof(ifgr.ifgr_name));
-	if (ioctl(sockfd, SIOCGIFGROUP, &ifgr) < 0) {
-		log_perror("ioctl SIOCGIFGROUP");
-		goto out;
-	}
-	len = ifgr.ifgr_len;
-	if ((ifgr.ifgr_groups = calloc(1, len)) == NULL) {
-		log_perror("calloc");
-		goto out;
-	}
-	if (ioctl(sockfd, SIOCGIFGROUP, &ifgr) < 0) {
-		log_perror("ioctl SIOCGIFGROUP");
-		free(ifgr.ifgr_groups);
-		goto out;
-	}
-	for (ifg = ifgr.ifgr_groups; len >= sizeof(*ifg); ifg++,
-	    len -= sizeof(*ifg)) {
-		for (i = 0; i < ndemoted; i++)
-			if (strcmp(demoted_groups[i], ifg->ifgrq_group) == 0)
-				break;
-		if (i < ndemoted)
-			continue;
-		if (ndemoted == DEMOTED_MAX) {
-			log_message(LOG_ERR, "too many groups, not demoting %s",
-			    ifg->ifgrq_group);
-			continue;
-		}
-		if (group_demote(sockfd, ifg->ifgrq_group, 1) < 0) {
-			log_perror("ioctl SIOCSIFGATTR");
-			log_message(LOG_ERR, "could not demote group %s",
-			    ifg->ifgrq_group);
-			continue;
-		}
-		strlcpy(demoted_groups[ndemoted++], ifg->ifgrq_group,
-		    sizeof(demoted_groups[0]));
-	}
-	free(ifgr.ifgr_groups);
-out:
-	close(sockfd);
-	return (ndemoted > 0 ? 0 : -1);
-}
-
-/*
- * Lift the demotion of the groups we demoted.  A group whose demote count
- * is already 0 (EINVAL) or which is gone (ENOENT) had its demotion lifted
- * elsewhere: we hold none there any more.  Returns 0 once we hold none.
- */
-int undemote_groups(void) {
-	int i, j, sockfd;
-
-	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sockfd < 0) {
-		log_perror("socket");
-		return (-1);
-	}
-	for (i = j = 0; i < ndemoted; i++) {
-		if (group_demote(sockfd, demoted_groups[i], -1) == 0)
-			continue;
-		if (errno == EINVAL || errno == ENOENT) {
-			log_message(LOG_NOTICE, "the demotion of group %s was "
-			    "already lifted", demoted_groups[i]);
-			continue;
-		}
-		log_perror("ioctl SIOCSIFGATTR");
-		log_message(LOG_ERR, "could not undemote group %s",
-		    demoted_groups[i]);
-		if (j != i)
-			memcpy(demoted_groups[j], demoted_groups[i],
-			    sizeof(demoted_groups[0]));
-		j++;
-	}
-	ndemoted = j;
-	close(sockfd);
-	return (ndemoted == 0 ? 0 : -1);
-}
-
-/*
- * carp(4) authenticates its advertisements over the addresses of the
- * interface, so a member without an address neither accepts the master's
- * advertisements nor sends any the others accept; it becomes master
- * beside the master.  Hold a demotion of the carp interface's groups while
- * it has no address, so that as master it takes the configuration, the
- * address, of a master that has one, which it rejects from a sender of no
- * better priority, and so that the others prefer another master.
- */
-void update_demote(void) {
-	in_addr_t ip, netmask;
-	int has;
-
-	if (global_options.dry_run)
-		return;
-	has = get_interface_ip_and_netmask(global_options.interface_name,
-	    &ip, &netmask) == 0;
-	if (!has && !demoted) {
-		if (demote_groups() == 0) {
-			demoted = 1;
-			log_message(LOG_NOTICE, "%s has no address: demoted "
-			    "its groups", global_options.interface_name);
-		}
-	} else if (has && demoted) {
-		if (undemote_groups() == 0) {
-			demoted = 0;
-			log_message(LOG_NOTICE, "%s has an address: lifted the "
-			    "demotion of its groups",
-			    global_options.interface_name);
-		}
-	}
-}
-
-/* On exit, lest the demotion stay for good */
-void lift_demote(void) {
-	if (demoted && undemote_groups() == 0)
-		demoted = 0;
-}
-
 /*
  * As backup, put back the address of the configuration we hold when the
  * carp interface has no IPv4 address, e.g. after dhcpleased removed it at
@@ -1378,14 +1338,16 @@ void restore_address(void) {
 	char ip_str[INET_ADDRSTRLEN], netmask_str[INET_ADDRSTRLEN];
 	in_addr_t ip, netmask;
 
-	if (known_ip == INADDR_ANY || known_mask == INADDR_ANY ||
+	/* A removal waits for a replacement first */
+	if (evtimer_pending(&restore_timer, NULL) ||
+	    known_ip == INADDR_ANY || known_mask == INADDR_ANY ||
 	    current_carp_state == CARP_STATE_MASTER ||
 	    get_carp_interface_state(global_options.interface_name) ==
 	    CARP_STATE_MASTER)
 		return;
-	/* Ours, or a new address from outside, is there */
+	/* Ours, or a new address from outside, is there, or who knows */
 	if (get_interface_ip_and_netmask(global_options.interface_name, &ip,
-	    &netmask) == 0)
+	    &netmask) != -1)
 		return;
 	inet_ntop(AF_INET, &known_ip, ip_str, sizeof(ip_str));
 	inet_ntop(AF_INET, &known_mask, netmask_str, sizeof(netmask_str));
@@ -1408,17 +1370,34 @@ void restore_address(void) {
  */
 void restore_timer_callback(int fd, short event, void *arg) {
 	restore_address();
-	update_demote();
 }
 
-/* Whether the interface has the given IPv4 address */
+/* How many IPv4 addresses the interface has, or -1 */
+int count_addresses(const char *if_name) {
+	struct ifaddrs *ifaddr, *ifa;
+	int n = 0;
+
+	if (getifaddrs(&ifaddr) == -1) {
+		log_perror("getifaddrs");
+		return (-1);
+	}
+	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+		if (ifa->ifa_addr != NULL &&
+		    ifa->ifa_addr->sa_family == AF_INET &&
+		    strcmp(ifa->ifa_name, if_name) == 0)
+			n++;
+	freeifaddrs(ifaddr);
+	return (n);
+}
+
+/* Whether the interface has the given IPv4 address: 1, 0, or -1 on error */
 int interface_has_address(const char *if_name, in_addr_t ip) {
 	struct ifaddrs *ifaddr, *ifa;
 	int found = 0;
 
 	if (getifaddrs(&ifaddr) == -1) {
 		log_perror("getifaddrs");
-		return (0);
+		return (-1);
 	}
 	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
 		if (ifa->ifa_addr != NULL &&
@@ -1640,6 +1619,10 @@ void lease_update(in_addr_t carp_ip) {
 		my_lease_time = end - my_generation;
 }
 
+/*
+ * The (first) IPv4 address of the interface and its netmask: 0, or -1 if
+ * it has none, or -2 if that cannot be told, which is not "none".
+ */
 int get_interface_ip_and_netmask(const char *if_name, in_addr_t *ip, in_addr_t *netmask) {
 	struct ifaddrs *ifaddr, *ifa;
 	struct sockaddr_in *sa;
@@ -1647,7 +1630,7 @@ int get_interface_ip_and_netmask(const char *if_name, in_addr_t *ip, in_addr_t *
 
 	if (getifaddrs(&ifaddr) == -1) {
 		log_perror("getifaddrs");
-		return -1;
+		return -2;
 	}
 
 	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
@@ -1671,119 +1654,270 @@ int get_interface_ip_and_netmask(const char *if_name, in_addr_t *ip, in_addr_t *
 	return found ? 0 : -1;
 }
 
-// Callback function for routing messages
-void routing_callback(int fd, short event, void *arg) {
-	char msg[2048];
-	struct rt_msghdr *rtm = (struct rt_msghdr *)msg;
+/*
+ * The addresses of the carp interface changed, or may have.  removed: an
+ * address was, which a replacement may follow at once.
+ */
+void address_changed(int removed) {
+	char ip_str[INET_ADDRSTRLEN];
+	in_addr_t ip, netmask;
+	int has;
 
-	ssize_t n = read(fd, msg, sizeof(msg));
-	if (n < sizeof(*rtm)) {
-		log_message(LOG_ERR, "Error: routing message is too small (%zd bytes)", n);
+	/* If that cannot be told, the next message or resend tells */
+	if ((has = get_interface_ip_and_netmask(global_options.interface_name,
+	    &ip, &netmask)) == -2)
 		return;
-	}
+	has = has == 0;
 
-	switch (rtm->rtm_type) {
-	case RTM_NEWADDR:
-	case RTM_DELADDR: {
-		struct ifa_msghdr *ifam = (struct ifa_msghdr *)msg;
-		char ip_str[INET_ADDRSTRLEN];
-		in_addr_t ip, netmask;
-
-		if (n < sizeof(*ifam) || ifam->ifam_index != carp_ifindex)
-			return;
-		log_message(LOG_DEBUG, "Received %s for %s",
-		    rtm->rtm_type == RTM_NEWADDR ? "RTM_NEWADDR" : "RTM_DELADDR",
-		    global_options.interface_name);
-		/*
-		 * Removed as backup, unless replaced: put it back in a
-		 * moment, without demoting us meanwhile.  carp(4) reports
-		 * INIT only after this, if it was the last address.
-		 */
-		if (rtm->rtm_type == RTM_DELADDR &&
-		    current_carp_state == CARP_STATE_BACKUP &&
-		    known_ip != INADDR_ANY &&
-		    get_interface_ip_and_netmask(global_options.interface_name,
-		    &ip, &netmask) != 0 &&
-		    !evtimer_pending(&restore_timer, NULL)) {
+	/*
+	 * Without an address as backup, put ours back: after a removal in a
+	 * moment, unless replaced.  carp(4) reports INIT only after this, if
+	 * it was the last address.
+	 */
+	if (!has && current_carp_state == CARP_STATE_BACKUP &&
+	    known_ip != INADDR_ANY && !evtimer_pending(&restore_timer, NULL)) {
+		if (!removed)
+			restore_address();
+		else {
 			struct timeval tv = { 0, DCARP_RESTORE_DELAY * 1000 };
 
 			evtimer_add(&restore_timer, &tv);
 		}
-		if (!evtimer_pending(&restore_timer, NULL))
-			update_demote();
+	}
 
-		/*
-		 * While the address we know is there, this is our own change
-		 * or one in progress: a renewal may add the new address
-		 * before removing the old, or the other way around.
-		 */
-		if (known_ip != INADDR_ANY &&
-		    interface_has_address(global_options.interface_name,
-		    known_ip))
-			break;
-		if (get_interface_ip_and_netmask(global_options.interface_name,
-		    &ip, &netmask) != 0) {
+	/*
+	 * While the address we know is there, this is our own change or one
+	 * in progress: a renewal may add the new address before removing the
+	 * old, or the other way around.
+	 */
+	if (known_ip != INADDR_ANY &&
+	    interface_has_address(global_options.interface_name, known_ip) != 0)
+		return;
+	if (get_interface_ip_and_netmask(global_options.interface_name, &ip,
+	    &netmask) != 0) {
+		if (removed)
 			log_message(LOG_INFO, "%s has no address now",
 			    global_options.interface_name);
-			break;
-		}
+		return;
+	}
 
 		/*
 		 * A new address from outside, e.g. a new DHCP lease: a new
 		 * generation, which wins over the old configuration
 		 * wherever it is, also over one from a clock ahead of ours.
 		 */
-		known_ip = ip;
-		known_mask = netmask;
-		if (time(NULL) > my_generation)
-			my_generation = time(NULL);
-		else
-			my_generation++;
-		/* As master, dhcpleased may know its lease */
-		my_lease_time = 0;
-		inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
-		log_message(LOG_INFO, "address of %s changed to %s, generation "
-		    "%lld", global_options.interface_name, ip_str,
-		    (long long)my_generation);
+	known_ip = ip;
+	known_mask = netmask;
+	if (time(NULL) > my_generation)
+		my_generation = time(NULL);
+	else
+		my_generation++;
+	/* As master, dhcpleased may know its lease */
+	my_lease_time = 0;
+	inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
+	log_message(LOG_INFO, "address of %s changed to %s, generation %lld",
+	    global_options.interface_name, ip_str, (long long)my_generation);
 
-		/*
-		 * As master, tell the backups now rather than at the next
-		 * resend.  Changing the addresses of a carp(4) interface
-		 * usually sends it through INIT, and it cannot send until
-		 * it is master again; RTM_IFINFO for that follows, and we
-		 * send then.  So ask the kernel rather than trusting our
-		 * state, which the queued RTM_IFINFO has not updated yet.
-		 */
-		if (current_carp_state != CARP_STATE_MASTER)
-			break;
-		if (get_carp_interface_state(global_options.interface_name) !=
-		    CARP_STATE_MASTER) {
-			log_message(LOG_INFO, "sending when %s is master again",
-			    global_options.interface_name);
-			break;
+	/*
+	 * As master, tell the backups now rather than at the next resend.
+	 * Changing the addresses of a carp(4) interface usually sends it
+	 * through INIT, and it cannot send until it is master again;
+	 * RTM_IFINFO for that follows, and we send then.  So ask the kernel
+	 * rather than trusting our state, which the queued RTM_IFINFO has
+	 * not updated yet.
+	 */
+	if (current_carp_state != CARP_STATE_MASTER)
+		return;
+	if (get_carp_interface_state(global_options.interface_name) !=
+	    CARP_STATE_MASTER) {
+		log_message(LOG_INFO, "sending when %s is master again",
+		    global_options.interface_name);
+		return;
+	}
+	distribute_ip_addresses();
+}
+
+/*
+ * Catch up with the kernel, after routing messages were lost or in case
+ * they were: its carp state, then the addresses.  Returns 1 if the state
+ * changed.
+ */
+int resync(void) {
+	int state, changed = 0;
+
+	/* Destroyed, or made anew with another index, unseen */
+	if (if_nametoindex(global_options.interface_name) != carp_ifindex) {
+		log_message(LOG_ERR, "%s was destroyed: exiting",
+		    global_options.interface_name);
+		exit(EXIT_FAILURE);
+	}
+	if (if_nametoindex(global_options.sync_interface) != sync_ifindex) {
+		log_message(LOG_ERR, "%s was destroyed: exiting",
+		    global_options.sync_interface);
+		exit(EXIT_FAILURE);
+	}
+	state = get_carp_interface_state(global_options.interface_name);
+	if (state >= CARP_STATE_INIT && state <= CARP_STATE_MASTER &&
+	    state != current_carp_state) {
+		log_message(LOG_NOTICE, "%s is %s, not %s as last reported",
+		    global_options.interface_name, carp_state_name(state),
+		    carp_state_name(current_carp_state));
+		update_carp_state(state);
+		changed = 1;
+	}
+	address_changed(0);
+	return (changed);
+}
+
+/* The routing domain of our routing table, or -1 */
+int our_rdomain(void) {
+	int mib[6] = { CTL_NET, PF_ROUTE, 0, 0, NET_RT_TABLE, 0 };
+	struct rt_tableinfo info;
+	size_t len = sizeof(info);
+
+	mib[5] = getrtable();
+	if (sysctl(mib, 6, &info, &len, NULL, 0) == -1) {
+		log_perror("sysctl NET_RT_TABLE");
+		return (-1);
+	}
+	return (info.rti_domainid);
+}
+
+/* The routing domain of an interface, or -1 */
+int interface_rdomain(const char *ifname) {
+	struct ifreq ifr;
+	int sockfd, rv = -1;
+
+	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+		log_perror("socket");
+		return (-1);
+	}
+	memset(&ifr, 0, sizeof(ifr));
+	strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+	if (ioctl(sockfd, SIOCGIFRDOMAIN, &ifr) == 0)
+		rv = ifr.ifr_rdomainid;
+	else
+		log_perror(ifname);
+	close(sockfd);
+	return (rv);
+}
+
+/* The carpdev of a carp interface, else the interface itself */
+static void link_of(const char *ifname, char *link, size_t len) {
+	struct carpreq carpr;
+	struct ifreq ifr;
+	int sockfd;
+
+	strlcpy(link, ifname, len);
+	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
+		return;
+	memset(&ifr, 0, sizeof(ifr));
+	memset(&carpr, 0, sizeof(carpr));
+	strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+	ifr.ifr_data = (caddr_t)&carpr;
+	if (ioctl(sockfd, SIOCGVH, &ifr) == 0 && carpr.carpr_carpdev[0] != '\0')
+		strlcpy(link, carpr.carpr_carpdev, len);
+	close(sockfd);
+}
+
+/* Whether two interfaces are on the same link, e.g. carp ones on one carpdev */
+int same_link(const char *a, const char *b) {
+	char la[IFNAMSIZ], lb[IFNAMSIZ];
+
+	link_of(a, la, sizeof(la));
+	link_of(b, lb, sizeof(lb));
+	return (strcmp(la, lb) == 0);
+}
+
+// Callback function for routing messages
+/*
+ * Read the routing socket empty, or nearly: after an overflow the kernel
+ * drops every message until it is empty.
+ */
+void routing_callback(int fd, short event, void *arg) {
+	char msg[2048];
+	ssize_t n;
+	int i;
+
+	for (i = 0; i < DCARP_ROUTE_BURST; i++) {
+		if ((n = read(fd, msg, sizeof(msg))) == -1) {
+			if (errno != EINTR && errno != EAGAIN)
+				log_perror("read routing socket");
+			return;
 		}
-		distribute_ip_addresses();
+		if (n == 0) {
+			log_message(LOG_ERR, "routing socket closed");
+			exit(EXIT_FAILURE);
+		}
+		routing_message(msg, n);
+	}
+}
+
+void routing_message(char *msg, size_t n) {
+	struct rt_msghdr *rtm = (struct rt_msghdr *)msg;
+	int state;
+
+	/* Length, version and type are where every routing message has them */
+	if (n < offsetof(struct rt_msghdr, rtm_hdrlen) || n < rtm->rtm_msglen ||
+	    rtm->rtm_version != RTM_VERSION)
+		return;
+
+	switch (rtm->rtm_type) {
+	case RTM_NEWADDR:
+	case RTM_DELADDR: {
+		struct ifa_msghdr *ifam = (struct ifa_msghdr *)msg;
+
+		if (n < sizeof(*ifam) || ifam->ifam_index != carp_ifindex)
+			return;
+		log_message(LOG_DEBUG, "Received %s for %s",
+		    rtm->rtm_type == RTM_NEWADDR ? "RTM_NEWADDR" : "RTM_DELADDR",
+		    global_options.interface_name);
+		address_changed(rtm->rtm_type == RTM_DELADDR);
 		break;
 	}
 	case RTM_IFINFO: {
 		struct if_msghdr *ifm = (struct if_msghdr *)msg;
 
-		if (n < sizeof(*ifm)) {
-			log_perror("read");
+		if (n < sizeof(*ifm))
 			return;
-		}
 
 		/* Only our own carp interface, not every carp(4) on the host */
 		if (ifm->ifm_data.ifi_type != IFT_CARP ||
 		    ifm->ifm_index != carp_ifindex) {
 			return;
 		}
-                int new_state = determine_carp_state(ifm);
-		update_carp_state(new_state);
-		
-		
+		/*
+		 * A sign of a change: the state it tells is of when the
+		 * kernel wrote it, maybe older than what resync() read
+		 * since, so ask the kernel.
+		 */
+		state = get_carp_interface_state(global_options.interface_name);
+		update_carp_state(state >= CARP_STATE_INIT &&
+		    state <= CARP_STATE_MASTER ? state :
+		    determine_carp_state(ifm));
 		break;
 	}
+	case RTM_IFANNOUNCE: {
+		struct if_announcemsghdr *ifan = (struct if_announcemsghdr *)msg;
+
+		/*
+		 * A new interface of the same name gets another index, of
+		 * which we would never hear.
+		 */
+		if (n < sizeof(*ifan) || ifan->ifan_what != IFAN_DEPARTURE ||
+		    (ifan->ifan_index != carp_ifindex &&
+		    ifan->ifan_index != sync_ifindex))
+			return;
+		log_message(LOG_ERR, "%.*s was destroyed: exiting",
+		    (int)sizeof(ifan->ifan_name), ifan->ifan_name);
+		exit(EXIT_FAILURE);
+	}
+	case RTM_DESYNC:
+		/* The socket overflowed: messages are lost */
+		log_message(LOG_WARNING, "routing messages lost: catching up "
+		    "with %s", global_options.interface_name);
+		resync();
+		break;
 	default:
 		log_message(LOG_ERR, "Received unexpected routing message type %d", rtm->rtm_type);
 		break;
@@ -1798,27 +1932,41 @@ int determine_carp_state(struct if_msghdr *ifm) {
 	case LINK_STATE_DOWN:
 		log_message(LOG_DEBUG, "Carp interface is in BACKUP state");
 		return (CARP_STATE_BACKUP);
+	case LINK_STATE_INVALID:
+		/* carp(4) reports INIT so, e.g. without an address */
+		log_message(LOG_DEBUG, "Carp interface is in INIT state");
+		return (CARP_STATE_INIT);
 	default:
-		log_message(LOG_ERR, "Carp interface is in UNKNOWN state");
+		log_message(LOG_WARNING, "Carp interface in unexpected link "
+		    "state %d, taken for INIT", ifm->ifm_data.ifi_link_state);
 		return (CARP_STATE_INIT);
 	}
 }
 
 void setup_routing_socket(void)
 {
-	int rtfilter;
+	int rtfilter, rcvbuf;
 	int sockfd;
     
-	// Open the socket
-	sockfd = socket(PF_ROUTE, SOCK_RAW | SOCK_CLOEXEC, AF_UNSPEC);
+	/* Not blocking: routing_callback() reads it empty */
+	sockfd = socket(PF_ROUTE, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
+	    AF_UNSPEC);
 	if (sockfd == -1) {
 		log_perror("socket");
 		log_close();
 		exit(EXIT_FAILURE);
 	}
+	/* Room for bursts, e.g. of many interfaces changing at once */
+	for (rcvbuf = DCARP_ROUTE_RCVBUF; rcvbuf > 8192; rcvbuf /= 2)
+		if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf,
+		    sizeof(rcvbuf)) == 0)
+			break;
+	if (rcvbuf <= 8192)
+		log_message(LOG_WARNING, "routing socket: SO_RCVBUF not raised");
 
 	// Set the message type filter
-	rtfilter = ROUTE_FILTER(RTM_IFINFO) | ROUTE_FILTER(RTM_NEWADDR) | ROUTE_FILTER(RTM_DELADDR);
+	rtfilter = ROUTE_FILTER(RTM_IFINFO) | ROUTE_FILTER(RTM_NEWADDR) |
+	    ROUTE_FILTER(RTM_DELADDR) | ROUTE_FILTER(RTM_IFANNOUNCE);
 	if (setsockopt(sockfd, PF_ROUTE, ROUTE_MSGFILTER, &rtfilter, sizeof(rtfilter)) == -1) {
 		log_perror("setsockopt(ROUTE_MSGFILTER)");
 		log_close();
@@ -1835,7 +1983,18 @@ void multicast_callback(int fd, short event, void *arg) {
 
 int main(int argc, char *argv[]) {
 	in_addr_t ip, netmask, held;
-	int ch;
+	int ch, fd, i, rdomain;
+
+	/* Lest a socket be fd 0, 1 or 2, which daemon(3) points to null */
+	do {
+		if ((fd = open(_PATH_DEVNULL, O_RDWR)) == -1) {
+			perror(_PATH_DEVNULL);
+			return (EXIT_FAILURE);
+		}
+	} while (fd <= 2);
+	close(fd);
+	/* Not fatal before libevent handles it; INT and TERM may well be */
+	signal(SIGHUP, SIG_IGN);
 
 	while ((ch = getopt(argc, argv, "c:dnvf:i:g:k:s:x:")) != -1) {
 		switch (ch) {
@@ -1918,12 +2077,28 @@ int main(int argc, char *argv[]) {
 		    global_options.interface_name);
 		goto err;
 	}
+	if (get_carp_interface_state(global_options.interface_name) < 0) {
+		log_message(LOG_ERR, "%s: not a carp(4) interface with one vhid",
+		    global_options.interface_name);
+		goto err;
+	}
 	if (global_options.sync_interface == NULL)
 		global_options.sync_interface = global_options.interface_name;
 	sync_ifindex = if_nametoindex(global_options.sync_interface);
 	if (sync_ifindex == 0) {
 		log_message(LOG_ERR, "%s: no such interface",
 		    global_options.sync_interface);
+		goto err;
+	}
+	/* We hear the routing messages of our own routing domain only */
+	if ((rdomain = our_rdomain()) == -1)
+		goto err;
+	if ((i = interface_rdomain(global_options.interface_name)) != rdomain ||
+	    (i = interface_rdomain(global_options.sync_interface)) != rdomain) {
+		log_message(LOG_ERR, "%s is in rdomain %d, dcarpd in %d",
+		    interface_rdomain(global_options.interface_name) != rdomain ?
+		    global_options.interface_name :
+		    global_options.sync_interface, i, rdomain);
 		goto err;
 	}
 	arc4random_buf(&my_sender, sizeof(my_sender));
@@ -1943,13 +2118,20 @@ int main(int argc, char *argv[]) {
 	learned_gw = read_state_address("DCARP_GATEWAY");
 	learned_backup_gw = read_state_address("DCARP_BACKUP_GATEWAY");
 
-	if (!global_options.foreground) {
-		daemonize();
-	}
-
+	/* Before daemon(3), so that errors reach the terminal */
 	aead_ctx = read_keyfile(global_options.keyfile_path);
 	if (aead_ctx == NULL)
 		goto err;
+
+	/* dhcpleased may go away while we ask it */
+	signal(SIGPIPE, SIG_IGN);
+
+	setup_multicast_socket();
+	setup_routing_socket();
+
+	if (!global_options.foreground) {
+		daemonize();
+	}
 
 	/*
 	 * Start with the configuration held before, from the state file: its
@@ -1977,21 +2159,18 @@ int main(int argc, char *argv[]) {
 		log_message(LOG_INFO, "generation 0: %s holds no configuration "
 		    "of the address of %s", global_options.state_file,
 		    global_options.interface_name);
-    
-	signal(SIGINT, handle_signal);
-	signal(SIGHUP, handle_signal);
-	signal(SIGTERM, handle_signal);
-	/* dhcpleased may go away while we ask it */
-	signal(SIGPIPE, SIG_IGN);
-
-	setup_multicast_socket();
-	setup_routing_socket();
 
 	event_init();
 
 	/* Before the first message sent, which may start the hook */
 	signal_set(&sigchld_event, SIGCHLD, sigchld_callback, NULL);
 	signal_add(&sigchld_event, NULL);
+	signal_set(&sigterm_event, SIGTERM, signal_callback, NULL);
+	signal_add(&sigterm_event, NULL);
+	signal_set(&sigint_event, SIGINT, signal_callback, NULL);
+	signal_add(&sigint_event, NULL);
+	signal_set(&sighup_event, SIGHUP, signal_callback, NULL);
+	signal_add(&sighup_event, NULL);
 
 	current_carp_state = get_carp_interface_state(global_options.interface_name);
 	evtimer_set(&restore_timer, restore_timer_callback, NULL);
@@ -1999,7 +2178,6 @@ int main(int argc, char *argv[]) {
 	/* As backup, put back the address held if it is gone */
 	if (current_carp_state == CARP_STATE_BACKUP)
 		restore_address();
-	update_demote();
 
 	if (current_carp_state == CARP_STATE_MASTER) {
 		log_message(LOG_NOTICE, "%s is in MASTER state.", global_options.interface_name);
@@ -2036,8 +2214,10 @@ int main(int argc, char *argv[]) {
 	// Start the event loop
 	event_dispatch();
 
+	/* It returns only on an error */
+	log_perror("event_dispatch");
 	log_close();
-	return (EXIT_SUCCESS);
+	return (EXIT_FAILURE);
 
 err:
 	log_close();
@@ -2055,40 +2235,57 @@ EVP_AEAD_CTX *read_keyfile(const char *filename) {
 	unsigned char fp[SHA256_DIGEST_LENGTH];
 	EVP_AEAD_CTX *ctx;
 	struct stat st;
-	size_t n;
-	FILE *f;
+	size_t n = 0;
+	ssize_t r;
+	int fd;
 
-	// Perform checks on the key file
-	if (stat(filename, &st) < 0) {
-		log_perror("stat");
+	/* Check the file we read, not the name: no FIFO, no swap between */
+	if ((fd = open(filename, O_RDONLY | O_NONBLOCK | O_CLOEXEC)) == -1) {
+		log_perror(filename);
 		return (NULL);
 	}
-
-	if (st.st_mode & (S_IRGRP | S_IROTH)) {
-		log_message(LOG_ERR, "Keyfile should not be readable by others");
+	if (fstat(fd, &st) == -1) {
+		log_perror(filename);
+		close(fd);
 		return (NULL);
 	}
-
-	if (st.st_uid != 0 && !global_options.dry_run) {
-		log_message(LOG_ERR, "Keyfile should be owned by root");
+	if (!S_ISREG(st.st_mode)) {
+		log_message(LOG_ERR, "%s: not a regular file", filename);
+		close(fd);
 		return (NULL);
 	}
-
-	// Open and read key file
-	f = fopen(filename, "r");
-	if (!f) {
-		log_perror("fopen");
-		return (NULL);
-	}
-	n = fread(buf, 1, sizeof(buf), f);
-	if (ferror(f) || n == 0) {
-		log_message(LOG_ERR, "Keyfile %s: read error, or empty",
+	/* Who can change the key can make us take any configuration */
+	if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+		log_message(LOG_ERR, "%s: accessible by group or others",
 		    filename);
-		fclose(f);
-		explicit_bzero(buf, sizeof(buf));
+		close(fd);
 		return (NULL);
 	}
-	fclose(f);
+	if (st.st_uid != 0 && !global_options.dry_run) {
+		log_message(LOG_ERR, "%s: not owned by root", filename);
+		close(fd);
+		return (NULL);
+	}
+
+	/* With read(2), not stdio, whose buffer would keep a copy */
+	while (n < sizeof(buf)) {
+		if ((r = read(fd, buf + n, sizeof(buf) - n)) == -1) {
+			if (errno == EINTR)
+				continue;
+			log_perror(filename);
+			close(fd);
+			explicit_bzero(buf, sizeof(buf));
+			return (NULL);
+		}
+		if (r == 0)
+			break;
+		n += r;
+	}
+	close(fd);
+	if (n == 0) {
+		log_message(LOG_ERR, "%s: empty", filename);
+		return (NULL);
+	}
 
 	SHA256(buf, n, key);
 	explicit_bzero(buf, sizeof(buf));
@@ -2116,23 +2313,25 @@ void daemonize() {
 		log_close();
 		exit(EXIT_FAILURE);
 	}
+	daemonized = 1;
 }
 
-void handle_signal(int signal)
+/* From the event loop, not the signal handler: any code may run */
+void signal_callback(int signal, short event, void *arg)
 {
+	EVP_AEAD_CTX *new_ctx;
+
 	switch (signal) {
-        case SIGTERM:
-		lift_demote();
-		close_multicast_socket();
-		log_message(LOG_NOTICE, "terminated by SIGTERM");
-		log_close();
+	case SIGTERM:
+	case SIGINT:
+		log_message(LOG_NOTICE, "terminated by %s",
+		    signal == SIGTERM ? "SIGTERM" : "SIGINT");
 		exit(EXIT_SUCCESS);
-		break;
-        case SIGHUP: {
+	case SIGHUP:
 		/* Ask dhcpleased again, after a wrong answer or none */
 		lease_asking = 1;
 		// Reread keyfile
-		EVP_AEAD_CTX *new_ctx = read_keyfile(global_options.keyfile_path);
+		new_ctx = read_keyfile(global_options.keyfile_path);
 		if (new_ctx) {
 			EVP_AEAD_CTX_free(aead_ctx);
 			aead_ctx = new_ctx;
@@ -2140,10 +2339,6 @@ void handle_signal(int signal)
 		} else {
 			log_message(LOG_WARNING, "Failed to reload keyfile. Using old key.");
 		}
-		break;
-	}
-        default:
-		log_message(LOG_INFO, "Unhandled signal (%d) %s", signal, strsignal(signal));
 		break;
 	}
 }
@@ -2162,7 +2357,11 @@ void setup_multicast_socket() {
 		exit(EXIT_FAILURE);
 	}
 
-	/* Allow multiple sockets to use the same port number */
+	/*
+	 * Shares the port with sockets bound to an address of their own, but
+	 * not with a second dcarpd binding *:3522 in the routing domain: one
+	 * per routing domain, which also keeps two from serving an interface.
+	 */
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
 		log_perror("setsockopt(SO_REUSEADDR)");
 		close(sock);

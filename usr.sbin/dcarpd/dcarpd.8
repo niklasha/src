@@ -81,9 +81,17 @@ master.
 .It Fl i Ar interface
 The
 .Xr carp 4
-interface whose IPv4 address the hosts share.
-It must have exactly one
-.Cm vhid .
+interface whose IPv4 address the hosts share, in the routing domain
+.Nm
+runs in.
+It must have one
+.Cm vhid
+and one IPv4 address; as master,
+.Nm
+sends nothing while it has more.
+It also needs an IPv6 link-local address, as
+.Cm inet6 eui64
+gives it, so that it stays up when it loses its IPv4 address.
 .It Fl k Ar key_file
 Read the shared key from
 .Ar key_file
@@ -93,13 +101,12 @@ The key is the SHA-256 hash of the first 4096 bytes of the file and
 must be the same on all hosts;
 .Nm
 logs a fingerprint of it when it reads the file.
-The file must not be readable by group or others, and must be owned by
-root unless
+It must be a regular file without any permissions for group or others,
+owned by root unless
 .Fl n
 is given.
 .It Fl n
-Do not change the addresses of the interface or any carp demote
-counter, and do not require root.
+Do not change the addresses of the interface, and do not require root.
 .Nm
 still sends messages as master, writes the state file and runs
 .Ar program .
@@ -108,7 +115,10 @@ Send and receive the messages on
 .Ar sync_interface
 instead of on
 .Ar interface .
-All hosts must use the same network for them.
+All hosts must use the same network for them, and it must be in the
+routing domain
+.Nm
+runs in.
 .It Fl v
 Also log messages of priority debug.
 .It Fl x Ar program
@@ -175,14 +185,22 @@ sender with a better priority: a lower demote count, or else a lower
 .Cm advbase ,
 or else a lower
 .Cm advskew ,
-with ties broken by a random sender id.
+with ties broken by a random sender id;
+or while its interface has no IPv4 address:
+.Xr carp 4
+authenticates its advertisements over the addresses.
 A host that is not master takes it from any sender.
 To take a configuration,
 .Nm
 makes its address the only IPv4 address of the interface and writes the
 state file.
 Rejected messages are logged with their source address, at most one
-every 10 seconds.
+every 10 seconds, and the same rejection of the same sender at most
+every 10 minutes.
+Copies of a message that
+.Xr carp 4
+delivers again through another carp interface on the same carpdev are
+dropped without logging.
 .Pp
 As backup,
 .Nm
@@ -191,18 +209,6 @@ example after
 .Xr dhcpleased 8
 removed it at the expiry of a lease obtained while the host was master.
 It never does so as master.
-.Pp
-While the interface has no IPv4 address,
-.Nm
-increases the carp demote counter of every group of the interface by
-one, among them
-.Ql carp
-and
-.Ql all ,
-which demotes every
-.Xr carp 4
-interface of the host.
-It decreases them again when the interface has an address.
 .Pp
 The state file holds
 .Xr sh 1
@@ -243,8 +249,15 @@ reading the lease from
 if it had stopped; see
 .Sx CAVEATS .
 Upon receiving
+.Dv SIGINT
+or
 .Dv SIGTERM ,
-it lifts any demotion it holds and exits.
+it exits.
+It also exits when
+.Ar interface
+or
+.Ar sync_interface
+is destroyed.
 .Sh FILES
 .Bl -tag -width "/etc/examples/ifstated-dcarpd.conf" -compact
 .It Pa /dev/dhcpleased.sock
@@ -337,15 +350,6 @@ this and does not read the lease again until
 renewals then start no new generations and do not update the lease
 times in the state files.
 .Pp
-If
+Only one
 .Nm
-exits other than on
-.Dv SIGTERM
-while it holds a demotion, the demotion remains; lift it with
-.Ic ifconfig Fl g Ar group Cm -carpdemote
-for each group of the interface, including
-.Ql all .
-.Sh BUGS
-.Nm
-ignores
-.Dv SIGINT .
+can run in a routing domain, as each listens on UDP port 3522.
