@@ -70,7 +70,7 @@ Table of Contents
      1.1.  Requirements Language . . . . . . . . . . . . . . . . . .   3
      1.2.  Terminology . . . . . . . . . . . . . . . . . . . . . . .   3
    2.  Protocol Overview . . . . . . . . . . . . . . . . . . . . . .   4
-   3.  Message Format  . . . . . . . . . . . . . . . . . . . . . . .   4
+   3.  Message Format  . . . . . . . . . . . . . . . . . . . . . . .   5
      3.1.  Wire Format . . . . . . . . . . . . . . . . . . . . . . .   5
      3.2.  Plaintext . . . . . . . . . . . . . . . . . . . . . . . .   5
    4.  Encryption and Authentication . . . . . . . . . . . . . . . .   7
@@ -90,7 +90,7 @@ Table of Contents
      14.1.  Normative References . . . . . . . . . . . . . . . . . .  14
      14.2.  Informative References . . . . . . . . . . . . . . . . .  15
    Appendix A.  Reference Implementation . . . . . . . . . . . . . .  16
-   Acknowledgments . . . . . . . . . . . . . . . . . . . . . . . . .  16
+   Acknowledgments . . . . . . . . . . . . . . . . . . . . . . . . .  17
    Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .  17
 
 1.  Introduction
@@ -205,16 +205,16 @@ Internet-Draft                    DCARP                    November 2026
    advertisements still takes the new address.  Of the same Generation,
    a member that is not Master takes it from any sender, since CARP has
    elected the sender; a Master takes it only if the sender has a better
-   Priority.  Taking a Configuration makes its address the only IPv4
-   address of the CARP interface, which restarts CARP on that interface;
-   with the same addresses as the Master, the member then accepts the
-   Master's advertisements and returns to Backup.
+   Priority, or if its CARP interface has no IPv4 address.  Taking a
+   Configuration makes its address the only IPv4 address of the CARP
+   interface, which restarts CARP on that interface; with the same
+   addresses as the Master, the member then accepts the Master's
+   advertisements and returns to Backup.
 
    DCARP does not change routes.  It makes the Configuration available
    to the local system, which uses the gateway when the member becomes
    Master (Section 10).
 
-3.  Message Format
 
 
 
@@ -225,6 +225,8 @@ Hallqvist                  Expires 26 May 2027                  [Page 4]
 
 Internet-Draft                    DCARP                    November 2026
 
+
+3.  Message Format
 
 3.1.  Wire Format
 
@@ -257,8 +259,6 @@ Internet-Draft                    DCARP                    November 2026
 
    All integers are unsigned and in network byte order unless stated
    otherwise.
-
-
 
 
 
@@ -527,6 +527,11 @@ Internet-Draft                    DCARP                    November 2026
        group has members and at least eight; a restarted member is a new
        Sender.
 
+   A copy of a message that the system delivers again through another
+   CARP interface on the link of the Sync interface, as some CARP
+   implementations do with multicast, is no error: the member discards
+   it without logging.
+
    A member ignores its own messages, whose Sender is its own, and
    discards messages of an unknown Message Type.
 
@@ -549,11 +554,6 @@ Internet-Draft                    DCARP                    November 2026
       a lower Demote, or an equal Demote and a lower Advbase, or equal
       values of both and a lower Advskew, which is the order in which
       CARP compares advertisements; or an equal Priority and a lower
-      Sender, compared as unsigned 64-bit integers.
-
-   It MUST discard, and SHOULD log, any other.  The Generation comes
-   first because after a failover the member with the worse Priority may
-   hold the newer lease; the Priority decides only between
 
 
 
@@ -562,6 +562,13 @@ Hallqvist                  Expires 26 May 2027                 [Page 10]
 Internet-Draft                    DCARP                    November 2026
 
 
+      Sender, compared as unsigned 64-bit integers; or whatever the
+      Priority, if the member's CARP interface has no IPv4 address: CARP
+      authenticates its advertisements over the addresses.
+
+   It MUST discard, and SHOULD log, any other.  The Generation comes
+   first because after a failover the member with the worse Priority may
+   hold the newer lease; the Priority decides only between
    Configurations of the same Generation, and there only for members
    that are Master at the same time and receive each other's messages
    but not each other's advertisements, for example over a separate Sync
@@ -604,19 +611,17 @@ Internet-Draft                    DCARP                    November 2026
    other things, the sorted set of IPv4 addresses of the CARP interface
    [CARP].  When the Master's address changes:
 
-   1.  CARP on the Master restarts: the interface passes through Init
-       and Backup and becomes Master again after about three
-       advertisement intervals.  Meanwhile it neither sends
-       advertisements nor, on the CARP interface, DCARP messages.
-
-
-
 
 
 Hallqvist                  Expires 26 May 2027                 [Page 11]
 
 Internet-Draft                    DCARP                    November 2026
 
+
+   1.  CARP on the Master restarts: the interface passes through Init
+       and Backup and becomes Master again after about three
+       advertisement intervals.  Meanwhile it neither sends
+       advertisements nor, on the CARP interface, DCARP messages.
 
    2.  The Backups reject the Master's advertisements, whose
        authentication now covers a different set of addresses.  A Backup
@@ -655,6 +660,20 @@ Internet-Draft                    DCARP                    November 2026
    it becomes Backup, via the Backup Gateway.  Appendix A describes how
    the reference implementation does this.
 
+
+
+
+
+
+
+
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 12]
+
+Internet-Draft                    DCARP                    November 2026
+
+
    The Backup Gateway a member makes available is that of the member it
    last took a Configuration from, also while it is Master itself, and
    across restarts; its own is of no use to it.  When it falls back to
@@ -666,14 +685,6 @@ Internet-Draft                    DCARP                    November 2026
    With more than two members, the Master can change while a member
    stays Backup: its own CARP state does not change, but its Backup
    Gateway does.  Tools that act only on the member's CARP state changes
-
-
-
-Hallqvist                  Expires 26 May 2027                 [Page 12]
-
-Internet-Draft                    DCARP                    November 2026
-
-
    miss this.  A member SHOULD therefore notify the tools whenever the
    Configuration it holds changes, as well as when its CARP state
    changes.
@@ -711,17 +722,6 @@ Internet-Draft                    DCARP                    November 2026
    one member therefore compromises the group, and the key needs the
    same protection as the members' administrative credentials.
 
-   The Timestamp and Sequence stop replays.  A member discards a message
-   older than 30 seconds, and a message whose Sequence it has already
-   seen from the same Sender.  Within 30 seconds, a recorded message can
-   be replayed to a member that does not remember its Sender, for
-   example after a restart; such a message carries a Configuration that
-   was current 30 seconds earlier, and is discarded anyway if the member
-   holds a newer Generation.
-
-
-
-
 
 
 
@@ -729,6 +729,14 @@ Hallqvist                  Expires 26 May 2027                 [Page 13]
 
 Internet-Draft                    DCARP                    November 2026
 
+
+   The Timestamp and Sequence stop replays.  A member discards a message
+   older than 30 seconds, and a message whose Sequence it has already
+   seen from the same Sender.  Within 30 seconds, a recorded message can
+   be replayed to a member that does not remember its Sender, for
+   example after a restart; such a message carries a Configuration that
+   was current 30 seconds earlier, and is discarded anyway if the member
+   holds a newer Generation.
 
    DCARP depends on synchronized clocks.  An attacker who can move a
    member's clock, for example by attacking its time synchronization,
@@ -769,14 +777,6 @@ Internet-Draft                    DCARP                    November 2026
 
 14.1.  Normative References
 
-   [I-D.irtf-cfrg-xchacha]
-              Arciszewski, S., "XChaCha: eXtended-nonce ChaCha and
-              AEAD_XChaCha20_Poly1305", Work in Progress, Internet-
-              Draft, draft-irtf-cfrg-xchacha-03, January 2020,
-              <https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-
-              xchacha-03>.
-
-
 
 
 
@@ -785,6 +785,13 @@ Hallqvist                  Expires 26 May 2027                 [Page 14]
 
 Internet-Draft                    DCARP                    November 2026
 
+
+   [I-D.irtf-cfrg-xchacha]
+              Arciszewski, S., "XChaCha: eXtended-nonce ChaCha and
+              AEAD_XChaCha20_Poly1305", Work in Progress, Internet-
+              Draft, draft-irtf-cfrg-xchacha-03, January 2020,
+              <https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-
+              xchacha-03>.
 
    [RFC768]   Postel, J., "User Datagram Protocol", STD 6, RFC 768,
               DOI 10.17487/RFC0768, August 1980,
@@ -823,6 +830,18 @@ Internet-Draft                    DCARP                    November 2026
               DOI 10.17487/RFC5771, March 2010,
               <https://www.rfc-editor.org/info/rfc5771>.
 
+
+
+
+
+
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 15]
+
+Internet-Draft                    DCARP                    November 2026
+
+
    [RFC6335]  Cotton, M., Eggert, L., Touch, J., Westerlund, M., and S.
               Cheshire, "Internet Assigned Numbers Authority (IANA)
               Procedures for the Management of the Service Name and
@@ -834,13 +853,6 @@ Internet-Draft                    DCARP                    November 2026
               Protocol (VRRP) Version 3 for IPv4 and IPv6", RFC 9568,
               DOI 10.17487/RFC9568, April 2024,
               <https://www.rfc-editor.org/info/rfc9568>.
-
-
-
-Hallqvist                  Expires 26 May 2027                 [Page 15]
-
-Internet-Draft                    DCARP                    November 2026
-
 
 Appendix A.  Reference Implementation
 
@@ -879,6 +891,13 @@ Appendix A.  Reference Implementation
    it writes the state file and whenever the CARP state changes, one run
    at a time; the program sets the routes.
 
+
+
+Hallqvist                  Expires 26 May 2027                 [Page 16]
+
+Internet-Draft                    DCARP                    November 2026
+
+
    The implementation comes with regression tests that run two or three
    members in separate routing domains of one host, including the split
    of Section 9, failovers among three members, a member returning
@@ -890,30 +909,11 @@ Acknowledgments
 
    DCARP builds on CARP, written for OpenBSD.
 
-
-
-
-Hallqvist                  Expires 26 May 2027                 [Page 16]
-
-Internet-Draft                    DCARP                    November 2026
-
-
 Author's Address
 
    Niklas Hallqvist
    Appli
    Email: niklas+dcarp@appli.se
-
-
-
-
-
-
-
-
-
-
-
 
 
 
