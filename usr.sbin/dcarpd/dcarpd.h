@@ -34,6 +34,7 @@ struct options {
 				   and we are master */
 	char *state_file;	/* -f, the configuration for ifstated(8) */
 	char *hook;		/* -x, run when it or the carp state changes */
+	char *control_socket;	/* -c, dhcpleased(8)'s, for the DHCP lease */
 	int foreground;
 	int verbose;
 	int dry_run;
@@ -56,7 +57,9 @@ struct dcarp_message {
 	in_addr_t gateway_ip;	/* the carp network's gateway, from the ISP */
 	in_addr_t backup_gateway; /* the sender's -g: the others' gateway
 				   while they are backup */
-	uint32_t reserved32;
+	uint32_t lease_time;	/* seconds the DHCP lease of the address lasts
+				   from the generation on, 0 if unknown;
+				   reserved before, 0 from older senders */
 	uint64_t sender;	/* random, chosen when the sender starts */
 	uint64_t sequence;	/* per sender, starts at 1 */
 	int64_t timestamp;	/* seconds since the epoch */
@@ -69,9 +72,6 @@ struct dcarp_message {
 	// Future fields (e.g., DNS servers) can be noted here for later implementation
 };
 
-/* The DHCP lease of the carp interface, whose time is the generation */
-#define DCARP_LEASE_DIR		"/var/db/dhcpleased"
-
 /* Where the configuration held is written, per carp interface */
 #define DCARP_STATE_DIR		"/var/db/dcarpd"
 
@@ -83,6 +83,7 @@ struct dcarp_config {
 	in_addr_t gateway_ip;
 	in_addr_t backup_gateway;
 	int64_t generation;
+	uint32_t lease_time;
 };
 
 #define DCARP_KEY_LEN		32	/* XChaCha20-Poly1305 key */
@@ -99,24 +100,37 @@ struct dcarp_config {
 #define DCARP_SENDERS		64	/* senders remembered against replay,
 					   at least the members of a group */
 #define DCARP_REJECT_LOG_INTERVAL 10	/* seconds between logged rejects */
+#define DCARP_LEASE_WAIT	1	/* seconds to wait for dhcpleased(8) */
+#define DCARP_RESTORE_DELAY	200	/* ms after the address was removed as
+					   backup to put it back: a replacement
+					   adds another one sooner */
+
+struct ctl_engine_info;
+struct timespec;
 
 const char *carp_state_name(int);
 void close_multicast_socket(void);
 int get_default_gateway(in_addr_t *);
 int write_state_file(const struct dcarp_message *, in_addr_t);
 in_addr_t read_state_address(const char *);
+long long read_state_number(const char *, long long);
 void run_hook(void);
 void start_hook(void);
 int configure_interface(const char *, in_addr_t, in_addr_t);
+int add_address(const char *, in_addr_t, in_addr_t);
 void daemonize(void);
 int determine_carp_state(struct if_msghdr *);
+int get_carp_interface_state(const char *);
 int get_carp_priority(const char *, uint32_t *, uint8_t *, uint8_t *);
 int demote_groups(void);
 int undemote_groups(void);
 void update_demote(void);
 void lift_demote(void);
+void restore_address(void);
 int interface_has_address(const char *, in_addr_t);
-int64_t lease_generation(void);
+int64_t mono_to_wall(const struct timespec *);
+int query_lease(struct ctl_engine_info *, char *, size_t);
+void lease_update(in_addr_t);
 uint32_t priority_key(uint32_t, uint8_t, uint8_t);
 int distribute_ip_addresses(void);
 int get_interface_ip_and_netmask(const char *, in_addr_t *, in_addr_t *);

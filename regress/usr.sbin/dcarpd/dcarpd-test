@@ -31,15 +31,23 @@
 # The three-members test adds a second backup:
 #	rdomain 75  third	carp75 on vport75 on veb77, vport85 on veb79
 #
+# fake-dhcpleased plays dhcpleased(8)'s control socket for the tests of
+# the DHCP lease.
+#
 # The Makefile skips the test when any of these interfaces exist.
 #
 # usage: dcarpd-test state-file | gateway-from-route | other-carp | log-live |
 #	 replay | tampered | wrong-key | encrypted | sync-interface |
 #	 periodic | address-change | split-brain | address-follow |
 #	 older-generation | lower-priority | equal-priority | init-takes |
-#	 no-address | demote-lifted | backup-follows-master | three-members | backup-gateway-kept | stale
+#	 no-address | demote-lifted | backup-follows-master | three-members |
+#	 backup-gateway-kept | stale | restore-address | restore-on-start |
+#	 state-generation | address-generation | renew | lease-time |
+#	 lease-size | lease-silent | lease-future | renew-ahead |
+#	 restore-address-v4 | restore-master | lease-other | restore-on-up |
+#	 replace-on-backup
 
-: ${OBJDIR?} ${DCARPD?} ${REPLAY?}
+: ${OBJDIR?} ${DCARPD?} ${REPLAY?} ${LEASED?}
 
 RA=76			# attacker rdomain
 RB=77			# backup rdomain
@@ -61,9 +69,12 @@ BSTATE=$OBJDIR/dcarpd-$1-backup.state
 MSTATE=$OBJDIR/dcarpd-$1-master.state
 TSTATE=$OBJDIR/dcarpd-$1-third.state
 MSG=$OBJDIR/dcarpd-$1.msg
+CTL=$OBJDIR/dcarpd-$1.sock		# fake-dhcpleased's control socket
+LEASE=$OBJDIR/dcarpd-$1.lease		# the lease it reports
+FLOG=$OBJDIR/dcarpd-$1-dhcpleased.log	# the requests it got
 
 cleanup() {
-	for p in $bpid $cpid $mpid $tpid; do
+	for p in $bpid $cpid $mpid $tpid $fpid; do
 		kill $p 2>/dev/null
 		wait $p 2>/dev/null
 	done
@@ -71,6 +82,10 @@ cleanup() {
 	cpid=
 	mpid=
 	tpid=
+	fpid=
+	rm -f $CTL
+	[ -z "$leasefile" ] || rm -f $leasefile
+	leasefile=
 	for i in $INTERFACES; do
 		ifconfig $i destroy 2>/dev/null
 	done
@@ -178,11 +193,6 @@ mkcarp() {	# $1 = if, $2 = rdomain, $3 = carpdev, $4 = vhid, $5 = advskew,
 }
 
 setup() {	# $1 = "default" to give the backup an internal default route
-	# A DHCP lease of the carp interfaces would set their generation
-	for i in carp$RB carp$RM; do
-		[ ! -e /var/db/dhcpleased/$i ] ||
-		    fail "/var/db/dhcpleased/$i exists, generations would differ"
-	done
 	run ifconfig veb77 create
 	run ifconfig veb77 up
 	run ifconfig veb79 create
@@ -222,30 +232,31 @@ setup() {	# $1 = "default" to give the backup an internal default route
 	: > $BLOG
 	: > $MLOG
 	: > $TLOG
+	: > $FLOG
 	rm -f $MSG $BSTATE* $MSTATE* $TSTATE* ${BSTATE%.state}.hook \
-	    ${MSTATE%.state}.hook ${TSTATE%.state}.hook
+	    ${MSTATE%.state}.hook ${TSTATE%.state}.hook $CTL $LEASE*
 }
 
 # A third member, a backup with a worse priority than the backup.
 setup_third() {
-	[ ! -e /var/db/dhcpleased/carp$RT ] ||
-	    fail "/var/db/dhcpleased/carp$RT exists, generations would differ"
 	vport vport$RT $RT veb77 ""
 	vport vport85 $RT veb79 $INTERNAL.3/24
 	mkcarp carp$RT $RT vport$RT $VHID 150 $PREFIX.77/24
 	retry carp_is carp$RT BACKUP || fail "carp$RT did not become BACKUP"
 }
 
+# Every dcarpd asks fake-dhcpleased, if it runs, for the DHCP lease, not
+# the host's dhcpleased(8).
 start_third() {		# extra dcarpd arguments
 	route -T $RT exec $DCARPD -d -v -i carp$RT -g $INTERNAL.3 -k $KEY \
-	    -f $TSTATE "$@" > $TLOG 2>&1 &
+	    -f $TSTATE -c $CTL "$@" > $TLOG 2>&1 &
 	tpid=$!
 	retry listening $tpid || fail "third dcarpd did not start"
 }
 
 start_backup() {	# extra dcarpd arguments
 	route -T $RB exec $DCARPD -d -v -i carp$RB -g $PREFIX.250 -k $KEY \
-	    -f $BSTATE "$@" > $BLOG 2>&1 &
+	    -f $BSTATE -c $CTL "$@" > $BLOG 2>&1 &
 	bpid=$!
 	retry listening $bpid || fail "backup dcarpd did not start"
 }
@@ -266,7 +277,7 @@ master() {	# $1 = -g, then extra dcarpd arguments
 	shift
 	echo "--- master -g $gw $*" >> $MLOG
 	route -T $RM exec $DCARPD -d -v -i carp$RM -g $gw -k $KEY -f $MSTATE \
-	    "$@" >> $MLOG 2>&1 &
+	    -c $CTL "$@" >> $MLOG 2>&1 &
 	mpid=$!
 	retry gateway_is $gw
 	ok=$?
@@ -282,7 +293,7 @@ start_master() {	# $1 = gateway, then extra dcarpd arguments
 	shift
 	echo "--- master -g $gw $*" >> $MLOG
 	route -T $RM exec $DCARPD -d -v -i carp$RM -g $gw -k $KEY -f $MSTATE \
-	    "$@" >> $MLOG 2>&1 &
+	    -c $CTL "$@" >> $MLOG 2>&1 &
 	mpid=$!
 	retry listening $mpid || fail "master dcarpd did not start"
 }
@@ -314,6 +325,48 @@ rejected() {	# $1 = source address, $2 = reason (regular expression),
 		# $3 = log, the backup's by default
 	grep -q "rejected message from $1: $2" ${3:-$BLOG}
 }
+
+# Whether a log has more lines matching than it had.  Not in $n, which
+# retry_for changes.
+logged_more() {	# $1 = regular expression, $2 = log, $3 = lines before
+	[ $(grep -c "$1" $2) -gt $3 ]
+}
+
+generation_is() {	# $1 = generation, $2 = state file, the backup's by default
+	[ "$(state DCARP_GENERATION $2)" = "$1" ]
+}
+
+# A state file held from before, as dcarpd writes it
+statefile() {	# $1 = state file, $2 = address, $3 = generation
+	printf '%s\n' "# $1, written by dcarpd-test" "DCARP_INTERFACE=" \
+	    "DCARP_ADDRESS=$2" "DCARP_NETMASK=255.255.255.0" "DCARP_GATEWAY=" \
+	    "DCARP_BACKUP_GATEWAY=" "DCARP_GENERATION=$3" > $1 ||
+	    fail "cannot write $1"
+}
+
+# The DHCP lease fake-dhcpleased reports, replaced atomically
+lease() {	# $1 = state, $2 = address, $3 = netmask, $4 = lease time,
+		# $5 = when acknowledged, seconds since the epoch
+	printf 'state %s\naddress %s\nnetmask %s\nlease %s\nacked %s\n' \
+	    "$@" > $LEASE.new && mv $LEASE.new $LEASE ||
+	    fail "cannot write $LEASE"
+}
+
+start_dhcpleased() {
+	$LEASED -f $LEASE -l $FLOG -s $CTL &
+	fpid=$!
+	retry test -S $CTL || fail "fake-dhcpleased did not start"
+}
+
+stop_dhcpleased() {
+	kill $fpid 2>/dev/null || fail "fake-dhcpleased died"
+	wait $fpid 2>/dev/null
+	fpid=
+	rm -f $CTL
+}
+
+# Leave no interfaces, processes or files behind when interrupted
+trap 'cleanup; exit 1' HUP INT TERM
 
 case $1 in
 state-file)
@@ -536,10 +589,10 @@ address-follow)
 	;;
 older-generation)
 	# A configuration older than the one held is rejected.  Here a
-	# master restarted without a DHCP lease, generation 0, sends another
-	# gateway after the backup took a new address of a later generation.
-	# The same rule keeps a backup that has briefly become master from
-	# giving the old address back to the master.
+	# master restarted without its state file, generation 0, sends
+	# another gateway after the backup took a new address of a later
+	# generation.  The same rule keeps a backup that has briefly become
+	# master from giving the old address back to the master.
 	setup default
 	start_backup
 	start_master $PREFIX.254
@@ -549,10 +602,14 @@ older-generation)
 	retry_for 15 only_address carp$RB $PREFIX.78 ||
 	    fail "carp$RB has $(addresses carp$RB), not only $PREFIX.78"
 	stop_master
+	rm -f $MSTATE
 	start_master $PREFIX.253
 	sleep 3
 	gateway_is $PREFIX.254 ||
 	    fail "older configuration changed the gateway to $(state DCARP_BACKUP_GATEWAY)"
+	sed -n "/^--- master -g $PREFIX.253/,\$p" $MLOG |
+	    grep -q "^generation 0: " ||
+	    fail "master restarted without its state file not at generation 0"
 	stop_backup
 	stop_master
 	rejected $PREFIX.78 "older configuration" ||
@@ -656,10 +713,16 @@ no-address)
 	    fail "carp$RB did not take $PREFIX.77: $(addresses carp$RB)"
 	retry demote_is carp $before ||
 	    fail "demotion not lifted with the address: $(demote carp)"
-	# A backup with its address taken away is demoted again
+	# A member that is not backup, here taken down, and loses its
+	# address is demoted again: only a backup puts its address back
+	seen=$(grep -c "CARP state changed to INIT" $BLOG)
+	run ifconfig carp$RB down
+	retry logged_more "CARP state changed to INIT" $BLOG $seen ||
+	    fail "backup dcarpd did not see carp$RB in INIT"
 	run ifconfig carp$RB $PREFIX.77 delete
 	retry demote_is carp $((before + 1)) ||
 	    fail "group carp not demoted again: $(demote carp)"
+	! grep -q "restoring" $BLOG || fail "member in INIT put its address back"
 	# Exiting lifts the demotion
 	kill $bpid 2>/dev/null || fail "backup dcarpd died"
 	wait $bpid 2>/dev/null
@@ -802,15 +865,390 @@ stale)
 	rejected $PREFIX.$RA "timestamp [0-9]* seconds old" ||
 	    fail "stale message not logged"
 	;;
+restore-address)
+	# A backup puts back the address it holds when something else
+	# removes it, as dhcpleased(8) does at the expiry of a lease that it
+	# bound as master.  carp(4) authenticates its advertisements over the
+	# addresses: without it the backup becomes master beside the master
+	# after master-down, here 3 x (1 + 100/256) seconds.  With an IPv6
+	# link-local address, as "inet6 eui64" gives, the interface stays up
+	# and backup without its IPv4 address.
+	setup default
+	run ifconfig carp$RB inet6 eui64
+	run ifconfig carp$RM inet6 eui64
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	retry carp_is carp$RB BACKUP || fail "carp$RB is not BACKUP"
+	run ifconfig carp$RB $PREFIX.77 delete
+	sleep 6
+	only_address carp$RB $PREFIX.77 ||
+	    fail "carp$RB has $(addresses carp$RB), not $PREFIX.77"
+	carp_is carp$RB BACKUP || fail "carp$RB is not BACKUP"
+	stop_backup
+	stop_master
+	! grep -q "CARP state changed to MASTER" $BLOG ||
+	    fail "backup became MASTER without its address"
+	grep -q "restoring $PREFIX.77" $BLOG ||
+	    fail "putting the address back not logged"
+	;;
+restore-on-start)
+	# A backup's dcarpd that starts while the carp interface has lost
+	# its address puts back the one its state file holds.  An advbase of
+	# 10 gives the backup a master-down time of half a minute to start in.
+	setup default
+	run ifconfig carp$RB inet6 eui64 advbase 10
+	run ifconfig carp$RM inet6 eui64
+	start_backup
+	master $PREFIX.254 || fail "gateway not changed to $PREFIX.254"
+	stop_backup
+	retry carp_is carp$RB BACKUP || fail "carp$RB is not BACKUP"
+	run ifconfig carp$RB $PREFIX.77 delete
+	carp_is carp$RB BACKUP || fail "carp$RB without its address not BACKUP"
+	start_backup
+	retry_for 3 only_address carp$RB $PREFIX.77 ||
+	    fail "carp$RB has $(addresses carp$RB), not $PREFIX.77"
+	sleep 2
+	carp_is carp$RB BACKUP || fail "carp$RB is not BACKUP"
+	stop_backup
+	grep -q "restoring $PREFIX.77" $BLOG ||
+	    fail "putting the address back not logged"
+	# At start, before the state is logged, not by the check every 10 s
+	sed -n '/restoring/,$p' $BLOG | grep -q "carp$RB is in BACKUP state" ||
+	    fail "address not put back at start"
+	;;
+restore-address-v4)
+	# As restore-address, without an IPv6 address: losing its last
+	# address takes the interface down, to INIT, where the backup would
+	# stay without an address, receiving no messages from the master.
+	setup default
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	retry carp_is carp$RB BACKUP || fail "carp$RB is not BACKUP"
+	run ifconfig carp$RB $PREFIX.77 delete
+	retry_for 3 only_address carp$RB $PREFIX.77 ||
+	    fail "carp$RB has $(addresses carp$RB), not $PREFIX.77"
+	retry carp_is carp$RB BACKUP || fail "carp$RB is not BACKUP"
+	stop_backup
+	stop_master
+	grep -q "restoring $PREFIX.77" $BLOG ||
+	    fail "putting the address back not logged"
+	;;
+restore-on-up)
+	# A backup that comes back up without its address, e.g. after
+	# dhcpleased(8) removed it while the interface was down, puts it
+	# back as it becomes backup again, before carp(4) makes it master
+	# beside the master.  With an IPv6 link-local address carp takes it
+	# up without its IPv4 address.
+	setup default
+	run ifconfig carp$RB inet6 eui64
+	run ifconfig carp$RM inet6 eui64
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	retry carp_is carp$RB BACKUP || fail "carp$RB is not BACKUP"
+	seen=$(grep -c "CARP state changed to INIT" $BLOG)
+	run ifconfig carp$RB down
+	retry logged_more "CARP state changed to INIT" $BLOG $seen ||
+	    fail "backup dcarpd did not see carp$RB in INIT"
+	run ifconfig carp$RB $PREFIX.77 delete
+	sleep 1
+	[ -z "$(addresses carp$RB)" ] ||
+	    fail "carp$RB in INIT got $(addresses carp$RB) back"
+	run ifconfig carp$RB up
+	retry_for 3 only_address carp$RB $PREFIX.77 ||
+	    fail "carp$RB has $(addresses carp$RB), not $PREFIX.77"
+	sleep 5
+	carp_is carp$RB BACKUP || fail "carp$RB is not BACKUP"
+	stop_backup
+	stop_master
+	! grep -q "CARP state changed to MASTER" $BLOG ||
+	    fail "backup became MASTER without its address"
+	;;
+replace-on-backup)
+	# A backup's address replaced from outside, removed and followed by
+	# another address in a moment, is a new address from outside, not one
+	# to put back: a new generation, which wins everywhere.
+	setup default
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	retry carp_is carp$RB BACKUP || fail "carp$RB is not BACKUP"
+	run ifconfig carp$RB $PREFIX.77 delete
+	sleep 0.05
+	run ifconfig carp$RB inet $PREFIX.88/24 alias
+	sleep 1
+	only_address carp$RB $PREFIX.88 ||
+	    fail "carp$RB has $(addresses carp$RB), not only $PREFIX.88"
+	retry_for 15 only_address carp$RM $PREFIX.88 ||
+	    fail "carp$RM has $(addresses carp$RM), not only $PREFIX.88"
+	stop_backup
+	stop_master
+	! grep -q "restoring" $BLOG || fail "replaced address put back"
+	grep -q "address of carp$RB changed to $PREFIX.88" $BLOG ||
+	    fail "new address from outside not logged"
+	;;
+restore-master)
+	# The master never puts its address back: there it follows the DHCP
+	# lease.  With an IPv6 link-local address the interface stays master
+	# without its IPv4 address.
+	setup default
+	run ifconfig carp$RM inet6 eui64
+	start_master $PREFIX.254
+	retry grep -q "^sent " $MLOG || fail "master did not send"
+	run ifconfig carp$RM $PREFIX.77 delete
+	sleep 3
+	carp_is carp$RM MASTER || fail "carp$RM without its address not MASTER"
+	[ -z "$(addresses carp$RM)" ] || fail "carp$RM has $(addresses carp$RM)"
+	stop_master
+	! grep -q "restoring" $MLOG || fail "master put its address back"
+	;;
+state-generation)
+	# A member starts with the generation of the configuration its state
+	# file holds, not with the time of the DHCP lease file of its carp
+	# interface: dhcpleased(8) writes that file when it binds a lease,
+	# not when it renews it, so a backup's, e.g. one left by a blink, can
+	# be newer than the master's generation, and the backup rejected the
+	# master.
+	setup default
+	[ -d /var/db/dhcpleased ] || { echo "no /var/db/dhcpleased"; \
+	    echo SKIPPED; cleanup; exit 0; }
+	[ ! -e /var/db/dhcpleased/carp$RB ] ||
+	    fail "/var/db/dhcpleased/carp$RB exists"
+	leasefile=/var/db/dhcpleased/carp$RB
+	run touch $leasefile
+	gen=$(($(date +%s) - 3600))
+	statefile $BSTATE $PREFIX.77 $gen
+	statefile $MSTATE $PREFIX.77 $((gen + 100))
+	start_backup
+	master $PREFIX.254 ||
+	    fail "backup did not take the master's newer generation"
+	generation_is $((gen + 100)) || fail "state file: $(cat $BSTATE)"
+	stop_backup
+	grep -q "generation $gen from $BSTATE" $BLOG ||
+	    fail "generation from the state file not logged"
+	# A master of an older generation than the one held is rejected
+	statefile $MSTATE $PREFIX.77 $gen
+	start_backup
+	! master $PREFIX.253 || fail "backup took an older generation"
+	stop_backup
+	rejected $PREFIX.77 "older configuration" ||
+	    fail "older configuration not logged"
+	;;
+address-generation)
+	# A new address from outside is a new generation, later than the
+	# one held even if that is ahead of the clock, e.g. taken from a
+	# member whose clock is ahead: it must win everywhere.
+	setup default
+	gen=$(($(date +%s) + 3600))
+	statefile $BSTATE $PREFIX.77 $gen
+	statefile $MSTATE $PREFIX.77 $gen
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	run ifconfig carp$RM inet $PREFIX.78/24
+	retry_for 15 only_address carp$RB $PREFIX.78 ||
+	    fail "carp$RB has $(addresses carp$RB), not only $PREFIX.78"
+	[ "$(state DCARP_GENERATION)" -gt $gen ] ||
+	    fail "generation $(state DCARP_GENERATION), not after $gen"
+	stop_backup
+	stop_master
+	;;
+renew)
+	# As master, dcarpd reads the DHCP lease of its carp interface from
+	# dhcpleased(8)'s control socket, as "dhcpleasectl -l" does, and
+	# never asks it for a new lease.  When the lease was acknowledged is
+	# the generation, so a renewal, which keeps the address, is a new
+	# generation, which the master sends within a resend interval.
+	setup default
+	now=$(date +%s)
+	lease Bound $PREFIX.77 255.255.255.0 86400 $((now - 600))
+	start_dhcpleased
+	start_backup
+	start_master $PREFIX.254
+	retry generation_is $((now - 600)) ||
+	    fail "generation $(state DCARP_GENERATION), not the lease's $((now - 600))"
+	lease Bound $PREFIX.77 255.255.255.0 86400 $((now - 60))
+	retry_for 15 generation_is $((now - 60)) ||
+	    fail "renewal not sent: generation $(state DCARP_GENERATION), not $((now - 60))"
+	stop_backup
+	stop_master
+	stop_dhcpleased
+	grep -q "^IMSG_CTL_SHOW_INTERFACE_INFO len 4\$" $FLOG ||
+	    fail "dhcpleased not asked for the lease"
+	! grep -v "^IMSG_CTL_SHOW_INTERFACE_INFO len 4\$" $FLOG ||
+	    fail "dhcpleased asked for more: $(grep -v '^IMSG_CTL_SHOW_INTERFACE_INFO len 4$' $FLOG)"
+	;;
+lease-time)
+	# The master sends how long its DHCP lease lasts with the
+	# configuration, and the members write that, and when the lease runs
+	# out, to their state files: empty without a lease.
+	setup default
+	now=$(date +%s)
+	lease Bound $PREFIX.77 255.255.255.0 86400 $((now - 600))
+	start_dhcpleased
+	start_backup
+	master $PREFIX.254 || fail "gateway not changed to $PREFIX.254"
+	stop_backup
+	[ "$(state DCARP_LEASE_TIME)" = 86400 ] || fail "state file: $(cat $BSTATE)"
+	[ "$(state DCARP_LEASE_EXPIRES)" = $((now - 600 + 86400)) ] ||
+	    fail "state file: $(cat $BSTATE)"
+	[ "$(state DCARP_LEASE_TIME $MSTATE)" = 86400 ] ||
+	    fail "master's state file: $(cat $MSTATE)"
+	# A master that has no lease, from dhcpleased or held, sends none
+	stop_dhcpleased
+	rm -f $BSTATE $MSTATE
+	start_backup
+	master $PREFIX.253 || fail "gateway not changed to $PREFIX.253"
+	stop_backup
+	grep -q "^DCARP_LEASE_TIME=\$" $BSTATE &&
+	    grep -q "^DCARP_LEASE_EXPIRES=\$" $BSTATE ||
+	    fail "lease without a lease: $(cat $BSTATE)"
+	;;
+lease-size)
+	# dhcpleased(8)'s control messages are internal to it, and change
+	# with it: dcarpd takes an answer only of the size of the one it was
+	# built with, and for its interface, and does not ask a dhcpleased
+	# that answered otherwise again, which might take its request for
+	# another.
+	setup default
+	now=$(date +%s)
+	for wrong in "short 4" "long 4" "index 9999"; do
+		lease Bound $PREFIX.77 255.255.255.0 86400 $((now - 600))
+		echo "$wrong" >> $LEASE
+		: > $FLOG
+		seen=$(grep -c "not asking dhcpleased again" $MLOG)
+		start_dhcpleased
+		start_master $PREFIX.254
+		retry logged_more "not asking dhcpleased again" $MLOG $seen ||
+		    fail "$wrong: wrong answer not logged"
+		sleep 11	# a resend
+		stop_master
+		stop_dhcpleased
+		[ $(grep -c . $FLOG) -eq 1 ] ||
+		    fail "$wrong: dhcpleased asked again: $(cat $FLOG)"
+	done
+	generation_is 0 $MSTATE ||
+	    fail "generation from a wrong answer: $(cat $MSTATE)"
+	grep -q "^DCARP_LEASE_TIME=\$" $MSTATE ||
+	    fail "lease time from a wrong answer: $(cat $MSTATE)"
+	[ $(grep -c "answer of [0-9]* bytes, expected" $MLOG) -eq 2 ] ||
+	    fail "answers of the wrong size not logged"
+	grep -q "answer for interface index 9999" $MLOG ||
+	    fail "answer for another interface not logged"
+	;;
+lease-other)
+	# A lease is the carp address's only if dhcpleased(8) has it bound,
+	# or is renewing or rebinding it, for that address.
+	setup default
+	now=$(date +%s)
+	lease Init $PREFIX.77 255.255.255.0 86400 $((now - 600))
+	start_dhcpleased
+	start_master $PREFIX.254
+	retry grep -q "no DHCP lease: dhcpleased has $PREFIX.77 for carp$RM, Init" $MLOG ||
+	    fail "lease in Init not refused"
+	lease Bound $PREFIX.99 255.255.255.0 86400 $((now - 600))
+	retry_for 15 grep -q "no DHCP lease: dhcpleased has $PREFIX.99 for carp$RM, Bound" $MLOG ||
+	    fail "lease of another address not refused"
+	printf 'end\n' > $LEASE.new && mv $LEASE.new $LEASE
+	retry_for 15 grep -q "no DHCP lease: dhcpleased does not handle carp$RM" $MLOG ||
+	    fail "interface dhcpleased does not handle not logged"
+	generation_is 0 $MSTATE || fail "generation without a lease: $(cat $MSTATE)"
+	lease Rebinding $PREFIX.77 255.255.255.0 86400 $((now - 600))
+	retry_for 15 generation_is $((now - 600)) $MSTATE ||
+	    fail "lease being rebound not taken: $(cat $MSTATE)"
+	stop_master
+	stop_dhcpleased
+	;;
+lease-silent)
+	# A dhcpleased(8) that does not answer, e.g. one that takes the
+	# request for another, is not asked again until SIGHUP.
+	setup default
+	now=$(date +%s)
+	lease Bound $PREFIX.77 255.255.255.0 86400 $((now - 600))
+	echo silent >> $LEASE
+	start_dhcpleased
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	sleep 12	# a resend
+	[ $(grep -c . $FLOG) -eq 1 ] ||
+	    fail "dhcpleased asked again without an answer: $(cat $FLOG)"
+	kill -HUP $mpid
+	retry_for 15 logged_more . $FLOG 1 ||
+	    fail "dhcpleased not asked again after SIGHUP"
+	stop_backup
+	stop_master
+	stop_dhcpleased
+	grep -q "no answer" $MLOG || fail "no answer not logged"
+	generation_is 0 || fail "generation without an answer: $(cat $BSTATE)"
+	;;
+lease-future)
+	# A lease that dhcpleased(8) reports acknowledged later than now
+	# would give a generation that no later one could beat: dcarpd
+	# rejects such an answer.
+	setup default
+	now=$(date +%s)
+	lease Bound $PREFIX.77 255.255.255.0 86400 $((now + 3600))
+	start_dhcpleased
+	start_backup
+	master $PREFIX.254 || fail "gateway not changed to $PREFIX.254"
+	stop_backup
+	stop_dhcpleased
+	generation_is 0 || fail "generation from the future: $(cat $BSTATE)"
+	grep -q "acknowledged in the future" $MLOG ||
+	    fail "lease from the future not logged"
+	;;
+renew-ahead)
+	# Each acknowledgement of the lease is a new generation, later than
+	# the one held even if that is ahead of the clock, e.g. taken from a
+	# member whose clock is ahead, and the lease time sent is that from
+	# the generation on, so that the members know when the lease runs
+	# out.
+	setup default
+	now=$(date +%s)
+	gen=$((now + 3600))
+	statefile $BSTATE $PREFIX.77 $gen
+	statefile $MSTATE $PREFIX.77 $gen
+	lease Bound $PREFIX.77 255.255.255.0 86400 $((now - 600))
+	start_dhcpleased
+	start_backup
+	start_master $PREFIX.254
+	retry gateway_is $PREFIX.254 ||
+	    fail "gateway not changed to $PREFIX.254"
+	generation_is $gen || fail "generation $(state DCARP_GENERATION), not $gen"
+	[ "$(state DCARP_LEASE_EXPIRES)" = $((now - 600 + 86400)) ] ||
+	    fail "lease runs out at $(state DCARP_LEASE_EXPIRES), not $((now - 600 + 86400))"
+	lease Bound $PREFIX.77 255.255.255.0 86400 $((now - 60))
+	retry_for 15 generation_is $((gen + 1)) ||
+	    fail "renewal not a new generation: $(state DCARP_GENERATION)"
+	[ "$(state DCARP_LEASE_EXPIRES)" = $((now - 60 + 86400)) ] ||
+	    fail "renewed lease runs out at $(state DCARP_LEASE_EXPIRES), not $((now - 60 + 86400))"
+	[ "$(state DCARP_LEASE_TIME)" = $((now - 60 + 86400 - gen - 1)) ] ||
+	    fail "lease time $(state DCARP_LEASE_TIME) from generation $((gen + 1))"
+	stop_backup
+	stop_master
+	stop_dhcpleased
+	;;
 *)
 	echo "usage: dcarpd-test state-file | gateway-from-route | other-carp |" \
 	    "log-live | replay | tampered | wrong-key | encrypted |" \
 	    "sync-interface | periodic | address-change | split-brain |" \
 	    "address-follow | older-generation | lower-priority |" \
 	    "equal-priority | init-takes | no-address | demote-lifted |" \
-	    "backup-follows-master |" \
-	    "three-members |" \
-	    "backup-gateway-kept | stale" >&2
+	    "backup-follows-master | three-members | backup-gateway-kept |" \
+	    "stale | restore-address | restore-on-start | state-generation |" \
+	    "address-generation | renew | lease-time | lease-size |" \
+	    "lease-silent | lease-future | renew-ahead | restore-address-v4 |" \
+	    "restore-master | lease-other | restore-on-up |" \
+	    "replace-on-backup" >&2
 	exit 2
 	;;
 esac
