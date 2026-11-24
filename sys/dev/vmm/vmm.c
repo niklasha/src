@@ -672,6 +672,7 @@ vm_request_stop(struct vm *vm)
  * Returns 0 if successful, or various error codes on failure:
  *  ENOENT if vrp describes an unknown vcpu for this VM
  *  EBUSY if the indicated VCPU is not stopped
+ *  EOPNOTSUPP if the host CPU cannot start a VCPU in the requested mode
  *  EIO if the indicated VCPU failed to reset
  */
 int
@@ -693,7 +694,8 @@ vm_resetcpu(struct vm *vm, struct vm_resetcpu_params *vrp)
 	if (atomic_load_int(&vcpu->vc_state) != VCPU_STATE_STOPPED)
 		ret = EBUSY;
 	else {
-		if (vcpu_reset_regs(vcpu, &vrp->vrp_init_state)) {
+		ret = vcpu_reset_regs(vcpu, &vrp->vrp_init_state);
+		if (ret != 0 && ret != EOPNOTSUPP) {
 			printf("%s: failed\n", __func__);
 #ifdef VMM_DEBUG
 			dump_vcpu(vcpu);

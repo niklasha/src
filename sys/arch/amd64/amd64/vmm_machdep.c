@@ -281,6 +281,25 @@ vmm_probe_machdep(struct device *parent, void *match, void *aux)
 	return vmm_enabled();
 }
 
+/*
+ * vmx_has_unrestricted_guest
+ *
+ * Tell whether the cpu we run on can enter a guest that has protected mode
+ * or paging disabled.  Only for a cpu with EPT, on which the secondary
+ * processor-based controls are known to exist.
+ */
+static int
+vmx_has_unrestricted_guest(void)
+{
+	uint64_t msr;
+
+	msr = rdmsr(IA32_VMX_PROCBASED_CTLS);
+	if (!(msr & (IA32_VMX_ACTIVATE_SECONDARY_CONTROLS) << 32))
+		return (0);
+	msr = rdmsr(IA32_VMX_PROCBASED2_CTLS);
+	return ((msr & (IA32_VMX_UNRESTRICTED_GUEST) << 32) != 0);
+}
+
 void
 vmm_attach_machdep(struct device *parent, struct device *self, void *aux)
 {
@@ -306,6 +325,9 @@ vmm_attach_machdep(struct device *parent, struct device *self, void *aux)
 
 	if (sc->sc_md.nr_ept_cpus) {
 		printf(": VMX/EPT");
+		if ((curcpu()->ci_vmm_flags & CI_VMM_EPT) &&
+		    !vmx_has_unrestricted_guest())
+			printf(" (no unrestricted guest)");
 		sc->mode = VMM_MODE_EPT;
 	} else if (sc->sc_md.nr_rvi_cpus) {
 		printf(": SVM/RVI");
@@ -2314,6 +2336,16 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	if (ug) {
 		want1 &= ~(CR0_PG | CR0_PE);
 		want0 &= ~(CR0_PG | CR0_PE);
+	}
+
+	/*
+	 * Without unrestricted guest the vcpu can only start in
+	 * protected mode with paging enabled.  Tell the caller so
+	 * that it can retry with such a state.
+	 */
+	if (!ug && (cr0 & (CR0_PE | CR0_PG)) != (CR0_PE | CR0_PG)) {
+		ret = EOPNOTSUPP;
+		goto exit;
 	}
 
 	/*
