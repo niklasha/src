@@ -287,6 +287,7 @@ vmm_attach_machdep(struct device *parent, struct device *self, void *aux)
 	struct vmm_softc *sc = (struct vmm_softc *)self;
 	struct cpu_info *ci;
 	CPU_INFO_ITERATOR cii;
+	int slow_l1tf;
 
 	sc->sc_md.nr_rvi_cpus = 0;
 	sc->sc_md.nr_ept_cpus = 0;
@@ -315,7 +316,17 @@ vmm_attach_machdep(struct device *parent, struct device *self, void *aux)
 	}
 
 	if (sc->mode == VMM_MODE_EPT) {
-		if (!(curcpu()->ci_vmm_cap.vcc_vmx.vmx_has_l1_flush_msr)) {
+		/*
+		 * vmx_enter_guest() takes the slow L1TF path on every cpu
+		 * without the L1D_FLUSH MSR, so the flush region is needed
+		 * as soon as one cpu lacks it, not only the one we attach on.
+		 */
+		slow_l1tf = 0;
+		CPU_INFO_FOREACH(cii, ci) {
+			if (ci->ci_vmm_cap.vcc_vmx.vmx_has_l1_flush_msr == 0)
+				slow_l1tf = 1;
+		}
+		if (slow_l1tf) {
 			l1tf_flush_region = km_alloc(VMX_L1D_FLUSH_SIZE,
 			    &kv_any, &vmm_kp_contig, &kd_waitok);
 			if (!l1tf_flush_region) {
