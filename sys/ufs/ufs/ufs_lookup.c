@@ -596,7 +596,7 @@ ufs_dirbad(struct inode *ip, doff_t offset, char *how)
 	mp = ITOV(ip)->v_mount;
 	(void)printf("%s: bad dir ino %u at offset %d: %s\n",
 	    mp->mnt_stat.f_mntonname, ip->i_number, offset, how);
-	if ((mp->mnt_stat.f_flags & MNT_RDONLY) == 0)
+	if ((mp->mnt_flag & MNT_RDONLY) == 0)
 		panic("bad dir");
 }
 
