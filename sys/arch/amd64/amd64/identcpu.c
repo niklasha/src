@@ -1001,9 +1001,14 @@ cpu_check_vmm_cap(struct cpu_info *ci)
 		msr = rdmsr(IA32_VMX_PROCBASED_CTLS);
 		if (msr & (IA32_VMX_ACTIVATE_SECONDARY_CONTROLS) << 32) {
 			msr = rdmsr(IA32_VMX_PROCBASED2_CTLS);
-			/* EPT and UG available? */
-			if ((msr & (IA32_VMX_ENABLE_EPT) << 32) &&
-			    (msr & (IA32_VMX_UNRESTRICTED_GUEST) << 32))
+			/*
+			 * EPT available?  Unrestricted guest is optional:
+			 * without it vcpu_reset_regs_vmx() refuses a vcpu
+			 * state that lacks CR0_PE or CR0_PG, which limits
+			 * vmd(8) to single-cpu VMs that boot an amd64 kernel
+			 * directly.
+			 */
+			if (msr & (IA32_VMX_ENABLE_EPT) << 32)
 				ci->ci_vmm_flags |= CI_VMM_EPT;
 		}
 	}
