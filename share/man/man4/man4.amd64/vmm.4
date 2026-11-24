@@ -14,7 +14,7 @@
 .\"ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\"OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: September 19 2026 $
+.Dd $Mdocdate: November 24 2026 $
 .Dt VMM 4 amd64
 .Os
 .Sh NAME
@@ -70,6 +70,21 @@ capabilities and nested or extended paging capabilities to be
 present on the host.
 For more information, consult the CPU vendor's documentation.
 .Pp
+Intel CPUs that have extended page tables but lack the
+.Dq unrestricted guest
+capability (the first generation of Nehalem CPUs) are supported with
+restrictions;
+.Nm
+then reports
+.Dq no unrestricted guest
+when it attaches.
+On such a host a VCPU can only be started in protected mode with paging
+enabled, which limits
+.Xr vmd 8
+to VMs with a single CPU that boot an amd64
+.Ox
+kernel directly.
+.Pp
 The following
 .Xr ioctl 2
 commands are provided through two interfaces:
@@ -105,6 +120,9 @@ The following ioctl calls apply to the VM file descriptor returned by
 Run a VCPU and return on VM-exit, when the VCPU stopped, or on error.
 .It Dv VMM_IOC_RESETCPU Fa "struct vm_resetcpu_params *"
 Reset a VCPU to power-on-init state using the provided register state.
+Fails with
+.Er EOPNOTSUPP
+if the host CPU cannot start a VCPU in the requested mode.
 .It Dv VMM_IOC_INTR Fa "struct vm_intr_params *"
 Signal a pending interrupt for a VCPU.
 .It Dv VMM_IOC_READREGS Fa "struct vm_rwregs_params *"

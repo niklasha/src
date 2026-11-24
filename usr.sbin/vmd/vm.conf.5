@@ -15,7 +15,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: September 18 2026 $
+.Dd $Mdocdate: November 24 2026 $
 .Dt VM.CONF 5
 .Os
 .Sh NAME
@@ -177,6 +177,22 @@ The default is 1 and the maximum is 64.
 Kernel or BIOS image to load when booting the VM.
 If not specified, the default is to boot using the BIOS image in
 .Pa /etc/firmware/vmm-bios .
+On a host where
+.Xr vmm 4
+reports
+.Dq no unrestricted guest ,
+.Ic boot
+must name an amd64
+.Ox
+kernel and
+.Ic cpus
+must be 1.
+Such a host cannot run the BIOS image, so a VM started there with
+.Xr vmctl 8
+.Cm start Fl b
+instead of a
+.Ic boot
+line stops when its guest reboots.
 .It Ic boot Cm device Ar device
 Force VM to boot from
 .Ar device .

@@ -80,6 +80,7 @@
 
 int	loadfile_elf(gzFile, struct vmd_vm *, struct vcpu_reg_state *,
 	    unsigned int);
+int	loadfile_elf_paged(struct vcpu_reg_state *);
 
 size_t mread(gzFile, paddr_t, size_t);
 

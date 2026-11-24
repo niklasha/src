@@ -120,11 +120,14 @@ static size_t create_bios_memmap(struct vmop_create_params *, bios_memmap_t *);
 static uint32_t push_bootargs(bios_memmap_t *, size_t, bios_bootmac_t *);
 static size_t push_stack(uint32_t, uint32_t);
 static void push_gdt(void);
+static void push_pt_64(void);
 static void marc4random_buf(paddr_t, int);
 static void mbzero(paddr_t, int);
 static void mbcopy(void *, paddr_t, int);
 
 extern int vm_id;
+
+static int elf64_loaded;	/* loadfile_elf() loaded an amd64 kernel */
 
 /*
  * setsegment
@@ -237,12 +240,14 @@ loadfile_elf(gzFile fp, struct vmd_vm *vm, struct vcpu_reg_state *vrs,
 	if (r)
 		return (r);
 
+	elf64_loaded = (hdr.elf64.e_ident[EI_CLASS] == ELFCLASS64);
+
 	push_gdt();
 
 	/*
 	 * As both amd64 and i386 kernels are launched in 32 bit
 	 * protected mode with paging disabled reconfigure the default
-	 * flat 64 bit register set.
+	 * flat 64 bit register set (but see loadfile_elf_paged()).
 	 */
 	vrs->vrs_crs[VCPU_REGS_CR3] = 0ULL;
 	vrs->vrs_crs[VCPU_REGS_CR4] = 0ULL;
@@ -262,6 +267,71 @@ loadfile_elf(gzFile fp, struct vmd_vm *vm, struct vcpu_reg_state *vrs,
 	vrs->vrs_gdtr.vsi_base = GDT_PAGE;
 
 	log_debug("%s: loaded ELF kernel", __func__);
+
+	return (0);
+}
+
+/*
+ * push_pt_64
+ *
+ * Create an identity-mapped page directory hierarchy mapping the first
+ * 1GB of physical memory. This is used during bootstrapping 64 bit VMs on
+ * CPUs without unrestricted guest capability.
+ */
+static void
+push_pt_64(void)
+{
+	uint64_t ptes[512], i;
+
+	/* PDPDE0 - first 1GB */
+	memset(ptes, 0, sizeof(ptes));
+	ptes[0] = PG_V | PML3_PAGE;
+	write_mem(PML4_PAGE, ptes, PAGE_SIZE);
+
+	/* PDE0 - first 1GB */
+	memset(ptes, 0, sizeof(ptes));
+	ptes[0] = PG_V | PG_RW | PG_u | PML2_PAGE;
+	write_mem(PML3_PAGE, ptes, PAGE_SIZE);
+
+	/* First 1GB (in 2MB pages) */
+	memset(ptes, 0, sizeof(ptes));
+	for (i = 0 ; i < 512; i++) {
+		ptes[i] = PG_V | PG_RW | PG_u | PG_PS |
+		    ((2048 * 1024) * i);
+	}
+	write_mem(PML2_PAGE, ptes, PAGE_SIZE);
+}
+
+/*
+ * loadfile_elf_paged
+ *
+ * Reconfigure the register set made by loadfile_elf() for a host CPU
+ * without unrestricted guest capability, which only runs a guest that
+ * has protected mode and paging enabled.  The amd64 kernel then starts
+ * in the compatibility mode of long mode: CR0, CR3, CR4 and EFER as in
+ * vcpu_init_flat64, the 32 bit code segment of push_gdt(), and an
+ * identity map of the first 1GB at PML4_PAGE, PML3_PAGE and PML2_PAGE.
+ * Only call this after loadfile_elf() succeeded.
+ *
+ * Parameters:
+ *  (in/out) vrs: register state made by loadfile_elf()
+ *
+ * Return values:
+ *  0 if the register set was reconfigured
+ *  -1 if loadfile_elf() has not loaded an amd64 kernel
+ */
+int
+loadfile_elf_paged(struct vcpu_reg_state *vrs)
+{
+	if (!elf64_loaded)
+		return (-1);
+
+	push_pt_64();
+
+	vrs->vrs_crs[VCPU_REGS_CR0] = CR0_ET | CR0_PE | CR0_PG;
+	vrs->vrs_crs[VCPU_REGS_CR3] = PML4_PAGE;
+	vrs->vrs_crs[VCPU_REGS_CR4] = CR4_PAE | CR4_PSE;
+	vrs->vrs_msrs[VCPU_REGS_EFER] = EFER_LME | EFER_LMA;
 
 	return (0);
 }
