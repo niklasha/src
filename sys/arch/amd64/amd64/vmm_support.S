@@ -253,12 +253,14 @@ skip_init:
 	jmp	done_flush
 
 no_l1df_msr:
+	/* %r10 is free here: reloaded with the guest's value below */
+	movq	l1tf_flush_region(%rip), %r10
 	xorq	%r9, %r9
 l1df_tlb_loop:
 	/* XXX get the right L1 size from cpuid */
 	cmpq	$VMX_L1D_FLUSH_SIZE, %r9
 	je	l1df_tlb_done
-	movb	l1tf_flush_region(%r9), %al
+	movb	(%r10,%r9), %al
 	addq	$PAGE_SIZE, %r9
 	jmp	l1df_tlb_loop
 
@@ -272,7 +274,7 @@ l1df_tlb_done:
 
 	xorq	%r9, %r9
 l1df_load_cache:
-	movb	l1tf_flush_region(%r9), %al
+	movb	(%r10,%r9), %al
 	/* XXX get the right cacheline size from cpuid */
 	addq	$0x40, %r9
 	cmpq	$VMX_L1D_FLUSH_SIZE, %r9
