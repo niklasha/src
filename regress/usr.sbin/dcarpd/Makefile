@@ -82,7 +82,6 @@ fake-dhcpleased: fake-dhcpleased.c
 
 CLEANFILES +=	dcarp-replay fake-dhcpleased dcarp.key dcarp.key.other \
 		dcarpd-hook dcarpd-*.hook dcarpd-*.lease dcarpd-*.lease.new \
-		dcarpd-*.log dcarpd-*.msg dcarpd-*.sock dcarpd-*.sock.new \
-		dcarpd-*.state
+		dcarpd-*.log dcarpd-*.msg dcarpd-*.state
 
 .include <bsd.regress.mk>

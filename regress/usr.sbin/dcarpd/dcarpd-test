@@ -72,7 +72,11 @@ MSTATE=$OBJDIR/dcarpd-$1-master.state
 TSTATE=$OBJDIR/dcarpd-$1-third.state
 MSG=$OBJDIR/dcarpd-$1.msg
 DIR=$OBJDIR/dcarpd-$1.dir		# a directory of the test's own
-CTL=$OBJDIR/dcarpd-$1.sock		# fake-dhcpleased's control socket
+# fake-dhcpleased's control socket.  Not in OBJDIR: sun_path holds 104
+# bytes, too few for a deep obj directory and a long test name.
+SOCKDIR=$(mktemp -d /tmp/dcarpd-test.XXXXXXXXXX) || exit 1
+trap 'rm -rf $SOCKDIR' EXIT
+CTL=$SOCKDIR/control.sock
 LEASE=$OBJDIR/dcarpd-$1.lease		# the lease it reports
 FLOG=$OBJDIR/dcarpd-$1-dhcpleased.log	# the requests it got
 
