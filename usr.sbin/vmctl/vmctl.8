@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: September 18 2026 $
+.Dd $Mdocdate: November 24 2026 $
 .Dt VMCTL 8
 .Os
 .Sh NAME
@@ -184,6 +184,21 @@ kernel or custom BIOS image.
 If not specified, the default is to boot using the BIOS image in
 .Pa /etc/firmware/vmm-bios .
 If the VM is an existing VM, use the provided image for only the next boot.
+On a host where
+.Xr vmm 4
+reports
+.Dq no unrestricted guest ,
+this option is required and
+.Ar path
+must be an amd64
+.Ox
+kernel; the VM must not have more than one CPU.
+The kernel given here is not loaded again when the guest reboots,
+so on such a host the VM stops at its first reboot; use the
+.Ic boot
+option in
+.Xr vm.conf 5
+for a VM that has to survive reboots.
 .It Fl c
 Automatically connect to the VM console.
 .It Fl d Ar disk

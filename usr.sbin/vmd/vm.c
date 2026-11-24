@@ -41,6 +41,7 @@
 #ifdef __amd64__
 #include "acpi.h"
 #include "lapic.h"
+#include "loadfile.h"
 #endif
 #include "pci.h"
 #include "virtio.h"
@@ -705,6 +706,18 @@ run_vm(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 #ifdef __amd64__
 		if (i == 0) {
 			ret = vcpu_reset(vm->vm_fd, i, vrs);
+			/*
+			 * vmm(4) on a CPU without unrestricted guest
+			 * capability only starts a vcpu in protected mode
+			 * with paging enabled.
+			 */
+			if (ret == EOPNOTSUPP && loadfile_elf_paged(vrs) == 0) {
+				ret = vcpu_reset(vm->vm_fd, i, vrs);
+				if (ret == 0 && vmc->vmc_ncpus == 1)
+					log_info("%s: no unrestricted guest, "
+					    "starting the kernel with paging "
+					    "enabled", vmc->vmc_name);
+			}
 			vcpu_runstate[i] = VCPU_RUNSTATE_RUNNING;
 		} else {
 			struct vcpu_reg_state ap_vrs;
@@ -718,6 +731,10 @@ run_vm(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 		vcpu_runstate[i] = VCPU_RUNSTATE_RUNNING;
 #endif
 		if (ret) {
+			if (ret == EOPNOTSUPP)
+				log_warnx("%s: this CPU lacks unrestricted guest "
+				    "support: only a single-cpu VM booting an amd64 "
+				    "kernel can be started", vmc->vmc_name);
 			log_warnx("cannot reset vcpu %zu", i);
 			return (EIO);
 		}
