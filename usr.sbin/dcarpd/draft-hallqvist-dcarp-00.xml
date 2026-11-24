@@ -1,0 +1,823 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE rfc [
+  <!ENTITY nbsp "&#160;">
+]>
+<rfc xmlns:xi="http://www.w3.org/2001/XInclude"
+     category="exp"
+     docName="draft-hallqvist-dcarp-00"
+     ipr="trust200902"
+     submissionType="independent"
+     version="3"
+     tocInclude="true"
+     sortRefs="true"
+     symRefs="true">
+
+  <front>
+    <title abbrev="DCARP">DCARP: Distributing Dynamic Addresses to CARP Redundancy Groups</title>
+    <seriesInfo name="Internet-Draft" value="draft-hallqvist-dcarp-00"/>
+    <author fullname="Niklas Hallqvist" initials="N." surname="Hallqvist">
+      <organization>Appli</organization>
+      <address>
+        <email>niklas+dcarp@appli.se</email>
+      </address>
+    </author>
+    <date year="2026" month="November" day="22"/>
+    <keyword>CARP</keyword>
+    <keyword>DHCP</keyword>
+    <keyword>redundancy</keyword>
+    <keyword>failover</keyword>
+
+    <abstract>
+      <t>The Common Address Redundancy Protocol (CARP) lets a group of
+      hosts share IP addresses, but every member must be configured with
+      the shared addresses in advance.  When the shared address is
+      assigned dynamically, for example by DHCP to the current master,
+      the backups do not know it, and since CARP authenticates its
+      advertisements over the shared addresses, a change of the address
+      splits the group into several masters.  The Distributed Common
+      Address Redundancy Protocol (DCARP) lets the master distribute the
+      shared IPv4 address, its netmask and the gateway of its network,
+      together with the master's address on another network the members
+      share, which they route through while they are backups, to the
+      other members, encrypted and authenticated, and resolves the split
+      that follows an address change.</t>
+    </abstract>
+  </front>
+
+  <middle>
+
+    <section anchor="intro">
+      <name>Introduction</name>
+      <t>CARP <xref target="CARP"/>, like VRRP <xref target="RFC9568"/>,
+      makes a group of hosts share one or more virtual addresses on a
+      network.  One member, the Master, owns the addresses and answers for
+      them; the others, the Backups, take over when the Master stops
+      sending advertisements.  CARP requires that all members are
+      configured with the same virtual addresses.</t>
+      <t>That requirement cannot be met when the shared address is
+      assigned dynamically.  A typical case is a pair of firewalls whose
+      external address is assigned by an Internet service provider with
+      DHCP <xref target="RFC2131"/>: the DHCP client runs on the CARP
+      interface of the Master, which shares a virtual MAC address with
+      the Backups, and only the Master learns the address.  Two problems
+      follow:</t>
+      <ol>
+        <li>A Backup that becomes Master does not know the address, its
+        netmask or the gateway of that network, and cannot use them
+        until it completes a DHCP exchange of its own.</li>
+        <li>CARP authenticates its advertisements over the set of
+        virtual addresses.  When the Master's address changes, the
+        Backups reject its advertisements, conclude that the Master is
+        gone, and become Masters themselves.  The group stays split until
+        an operator intervenes.</li>
+      </ol>
+      <t>A Backup cannot use the provider's gateway either: its CARP
+      interface passes no traffic.  It routes through the Master over
+      another network the members share, typically an internal one, and
+      needs the Master's address there.</t>
+      <t>DCARP solves these problems.  The Master sends the address, its
+      netmask, the gateway of its network and its own address on the
+      shared network to the group, encrypted and authenticated with a
+      shared key; every member applies the newest configuration it
+      receives, whatever its CARP state.  DCARP does not replace CARP:
+      CARP still elects the Master, and DCARP only distributes what CARP
+      needs to be configured with, and what the members need to route
+      in either state.</t>
+      <t>This version of DCARP handles IPv4 only.</t>
+
+      <section anchor="reqlang">
+        <name>Requirements Language</name>
+        <t>The key words "<bcp14>MUST</bcp14>", "<bcp14>MUST NOT</bcp14>",
+        "<bcp14>REQUIRED</bcp14>", "<bcp14>SHALL</bcp14>",
+        "<bcp14>SHALL NOT</bcp14>", "<bcp14>SHOULD</bcp14>",
+        "<bcp14>SHOULD NOT</bcp14>", "<bcp14>RECOMMENDED</bcp14>",
+        "<bcp14>NOT RECOMMENDED</bcp14>", "<bcp14>MAY</bcp14>", and
+        "<bcp14>OPTIONAL</bcp14>" in this document are to be interpreted
+        as described in BCP&nbsp;14 <xref target="RFC2119"/>
+        <xref target="RFC8174"/> when, and only when, they appear in all
+        capitals, as shown here.</t>
+      </section>
+
+      <section anchor="terms">
+        <name>Terminology</name>
+        <dl newline="false" spacing="normal">
+          <dt>CARP interface:</dt>
+          <dd>The interface of a member that carries the virtual address
+          managed by DCARP.</dd>
+          <dt>Master, Backup, Init:</dt>
+          <dd>The CARP states of a member's CARP interface.  A CARP
+          interface without any address does not take part in the
+          election and stays in Init.</dd>
+          <dt>Configuration:</dt>
+          <dd>The virtual address, its netmask, the gateway on its
+          network and a Backup Gateway, together with a Generation.</dd>
+          <dt>Backup Gateway:</dt>
+          <dd>The address of the Master on another network that the
+          members share, through which the other members route while they
+          are Backups.</dd>
+          <dt>Generation:</dt>
+          <dd>The time at which the address of a Configuration was
+          obtained, used to decide which Configuration is the newest
+          (<xref target="generations"/>).</dd>
+          <dt>Priority:</dt>
+          <dd>The CARP demote count, advertisement base and advertisement
+          skew of a member, which CARP uses to elect the Master.  Lower
+          values are better.</dd>
+          <dt>Sync interface:</dt>
+          <dd>The interface on which a member sends and receives DCARP
+          messages: the CARP interface unless configured otherwise
+          (<xref target="transport"/>).</dd>
+        </dl>
+      </section>
+    </section>
+
+    <section anchor="overview">
+      <name>Protocol Overview</name>
+      <t>All members of a CARP group run DCARP and share a 256-bit key.
+      The Master sends a DCARP message to an IPv4 multicast group on the
+      Sync interface when it becomes Master, when the address of its CARP
+      interface changes, and periodically.  The message carries the
+      Master's Configuration, its Priority, and fields that let receivers
+      detect replays.  It is encrypted and authenticated with
+      XChaCha20-Poly1305.</t>
+      <t>A member that receives a valid message takes the Configuration
+      if its Generation is newer than its own, in every CARP state, so a
+      Backup that has become Master because it rejected the Master's
+      advertisements still takes the new address.  Of the same
+      Generation, a member that is not Master takes it from any sender,
+      since CARP has elected the sender; a Master takes it only if the
+      sender has a better Priority, or if its CARP interface has no
+      IPv4 address.
+      Taking a Configuration makes its address the only IPv4 address of
+      the CARP interface, which restarts CARP on that interface; with the
+      same addresses as the Master, the member then accepts the Master's
+      advertisements and returns to Backup.</t>
+      <t>DCARP does not change routes.  It makes the Configuration
+      available to the local system, which uses the gateway when the
+      member becomes Master (<xref target="local"/>).</t>
+    </section>
+
+    <section anchor="format">
+      <name>Message Format</name>
+
+      <section anchor="wire">
+        <name>Wire Format</name>
+        <t>A DCARP message is the payload of a UDP datagram
+        <xref target="RFC768"/> and is exactly 104 octets long:</t>
+        <figure anchor="fig-wire">
+          <name>Wire Format</name>
+          <artwork type="ascii-art"><![CDATA[
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                         Nonce (24 octets)                     +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                       Ciphertext (64 octets)                  +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                  Authentication Tag (16 octets)               +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+]]></artwork>
+        </figure>
+        <t>The Ciphertext and Authentication Tag are the output of
+        AEAD_XChaCha20_Poly1305 over the 64-octet plaintext of
+        <xref target="plaintext"/>, as described in
+        <xref target="crypto"/>.</t>
+      </section>
+
+      <section anchor="plaintext">
+        <name>Plaintext</name>
+        <t>All integers are unsigned and in network byte order unless
+        stated otherwise.</t>
+        <figure anchor="fig-plaintext">
+          <name>Plaintext</name>
+          <artwork type="ascii-art"><![CDATA[
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Message Type                          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                            Address                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                            Netmask                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                            Gateway                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Backup Gateway                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          Lease Time                           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                            Sender                             +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                           Sequence                            +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                           Timestamp                           +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                          Generation                           +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                            Demote                             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|    Advbase    |    Advskew    |           Reserved            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+]]></artwork>
+        </figure>
+        <dl newline="false" spacing="normal">
+          <dt>Message Type (4 octets):</dt>
+          <dd>1, Configuration.  No other type is defined.</dd>
+          <dt>Address (4 octets):</dt>
+          <dd>The IPv4 address of the sender's CARP interface.</dd>
+          <dt>Netmask (4 octets):</dt>
+          <dd>Its netmask.</dd>
+          <dt>Gateway (4 octets):</dt>
+          <dd>The IPv4 address of the gateway on the network of the
+          Address that a member is to use as Master, or 0.0.0.0 if the
+          sender knows none (<xref target="sending"/>).</dd>
+          <dt>Backup Gateway (4 octets):</dt>
+          <dd>The sender's IPv4 address on another network that the
+          members share, which the other members are to use as gateway
+          while they are Backups, or 0.0.0.0 if there is none.</dd>
+          <dt>Lease Time (4 octets):</dt>
+          <dd>The number of seconds the DHCP lease of the Address lasts
+          from the Generation on, or 0 if the sender knows of no lease.
+          Receivers <bcp14>MAY</bcp14> use it, for example to tell when
+          the lease runs out.  The field was reserved before, so that
+          earlier senders set it to zero and earlier receivers ignore
+          it.</dd>
+          <dt>Sender (8 octets):</dt>
+          <dd>A random value the sender chooses when it starts, which
+          identifies it for replay detection.</dd>
+          <dt>Sequence (8 octets):</dt>
+          <dd>A counter of the sender, 1 in its first message and
+          incremented by one in each message it sends.</dd>
+          <dt>Timestamp (8 octets):</dt>
+          <dd>The time the message was sent, as a signed number of
+          seconds since 1970-01-01T00:00:00Z.</dd>
+          <dt>Generation (8 octets):</dt>
+          <dd>The Generation of the Configuration, a signed number of
+          seconds since 1970-01-01T00:00:00Z, or 0
+          (<xref target="generations"/>).</dd>
+          <dt>Demote (4 octets), Advbase (1 octet), Advskew (1 octet):</dt>
+          <dd>The sender's CARP demote count, advertisement base and
+          advertisement skew: its Priority.</dd>
+          <dt>Reserved (2 octets):</dt>
+          <dd>Senders <bcp14>MUST</bcp14> set it to zero; receivers
+          <bcp14>MUST</bcp14> ignore it.</dd>
+        </dl>
+      </section>
+    </section>
+
+    <section anchor="crypto">
+      <name>Encryption and Authentication</name>
+      <t>All members of a group share a 256-bit key.  How the key is
+      generated and distributed is outside the scope of this document; it
+      <bcp14>MUST</bcp14> have at least 256 bits of entropy
+      <xref target="RFC4086"/>.</t>
+      <t>A sender encrypts and authenticates each plaintext with
+      AEAD_XChaCha20_Poly1305 <xref target="I-D.irtf-cfrg-xchacha"/>,
+      which extends the AEAD construction of <xref target="RFC8439"/> to
+      a 192-bit nonce.  The inputs are:</t>
+      <dl newline="false" spacing="normal">
+        <dt>Key:</dt>
+        <dd>The shared key.</dd>
+        <dt>Nonce:</dt>
+        <dd>24 octets the sender <bcp14>MUST</bcp14> choose at random for
+        each message.  With 192 bits, random nonces do not repeat in
+        practice, and no state is needed to keep them unique.</dd>
+        <dt>Additional data:</dt>
+        <dd>The 8 octets of the ASCII string "DCARP 1" followed by a zero
+        octet, which binds the key to this protocol and version.</dd>
+        <dt>Plaintext:</dt>
+        <dd>The 64 octets of <xref target="plaintext"/>.</dd>
+      </dl>
+      <t>The message is the nonce, followed by the ciphertext and the
+      16-octet authentication tag.  A receiver <bcp14>MUST</bcp14>
+      authenticate a message before it uses any of its contents, and
+      <bcp14>MUST</bcp14> discard messages that fail.</t>
+    </section>
+
+    <section anchor="transport">
+      <name>Transport</name>
+      <t>Messages are sent as UDP datagrams to the IPv4 multicast group
+      224.0.0.18, destination port 3522, with a time to live of 1
+      (<xref target="iana"/> discusses these values).  An implementation
+      <bcp14>SHOULD</bcp14> allow both to be configured.</t>
+      <t>By default the Sync interface is the CARP interface.  An
+      implementation <bcp14>MAY</bcp14> allow another interface to be
+      configured, for example a dedicated link between the members.  A
+      member <bcp14>MUST</bcp14> join the group on its Sync interface, and
+      <bcp14>MUST</bcp14> select the interface explicitly rather than by
+      address: the address of the CARP interface changes, and may be
+      missing.  It <bcp14>MUST</bcp14> discard messages received on any
+      other interface, and messages whose payload is not exactly 104
+      octets.</t>
+      <t>A Master whose CARP interface is the Sync interface cannot send
+      while CARP restarts after an address change
+      (<xref target="carp"/>); it sends once it is Master again.</t>
+    </section>
+
+    <section anchor="generations">
+      <name>Generations</name>
+      <t>Every Configuration has a Generation: the time its address was
+      obtained or its DHCP lease last renewed.  Comparing Generations
+      tells which of two Configurations
+      is newer.  A member keeps the Generation of the Configuration it
+      holds:</t>
+      <ul>
+        <li>When it starts, the Generation is that of the Configuration
+        it held before for the address its CARP interface has, which it
+        keeps in stable storage, or 0 if there is none.</li>
+        <li>When the address of its CARP interface changes other than by
+        DCARP, for example when the DHCP client obtains a new address,
+        the Generation becomes the current time, or one more than the
+        Generation it held if that is not earlier.</li>
+        <li>When it takes a Configuration (<xref target="receiving"/>),
+        it adopts the Configuration's Generation.</li>
+        <li>As Master, before sending, it learns from its DHCP client
+        when the client last obtained or renewed the lease of the
+        address.  Each such time is a new Generation: that time, or one
+        more than the Generation it held if that is not earlier.  A
+        renewal does not change the address, but is a new Generation, so
+        that the other members learn of it.</li>
+      </ul>
+      <t>While a member runs, its Generation never decreases.  A member
+      <bcp14>MUST NOT</bcp14> take the time at which a lease was stored,
+      for example
+      the modification time of a lease file, for the time of its latest
+      renewal: DHCP clients commonly store a lease when they obtain it,
+      but not when they renew it, so that a Backup's stored lease can be
+      newer than the Master's Generation.</t>
+      <t>Generations use wall-clock time, so the members' clocks
+      <bcp14>MUST</bcp14> be synchronized, for example with NTP; see also
+      <xref target="security"/>.</t>
+    </section>
+
+    <section anchor="sending">
+      <name>Sending</name>
+      <t>A member whose CARP interface is Master and has an IPv4 address
+      sends a message with its Configuration:</t>
+      <ul>
+        <li>when it becomes Master;</li>
+        <li>when the address of its CARP interface changes, as soon as
+        the interface is Master again (<xref target="transport"/>);
+        and</li>
+        <li>every Interval seconds otherwise.</li>
+      </ul>
+      <t>The periodic messages let members that start later, or that
+      missed a message, learn the Configuration.  The Interval
+      <bcp14>MUST</bcp14> be shorter than the maximum age of
+      <xref target="validation"/>; the RECOMMENDED value is 10
+      seconds.</t>
+      <t>The Address and Netmask are those of the CARP interface; if it
+      has several IPv4 addresses, the sender uses one of them
+      consistently.  The Gateway is the one the provider of the address
+      gives: the gateway of the member's default route if that route goes
+      through the CARP interface, as a DHCP client adds from the lease.
+      A member that has become Master may still route via the previous
+      Master, through another interface; it then sends the Gateway of
+      the Configuration it last took or sent, if that is on the network
+      of the Address, and otherwise 0.0.0.0.  The Gateway is not
+      configured by the operator.  The Backup
+      Gateway is the sender's own address on another network the members
+      share, which the operator configures, or 0.0.0.0.  Demote, Advbase
+      and Advskew are the sender's current CARP values; the demote count
+      is the sum over the groups the CARP interface belongs to, as CARP
+      computes it.</t>
+    </section>
+
+    <section anchor="receiving">
+      <name>Receiving</name>
+
+      <section anchor="validation">
+        <name>Validation</name>
+        <t>A member discards a message, and <bcp14>SHOULD</bcp14> log
+        its source address and the reason at a limited rate, if:</t>
+        <ol>
+          <li>it was received on another interface than the Sync
+          interface, or is not 104 octets long
+          (<xref target="transport"/>);</li>
+          <li>it does not authenticate (<xref target="crypto"/>);</li>
+          <li>its Timestamp differs from the member's clock by more than
+          the maximum age, 30 seconds; or</li>
+          <li>its Sequence is not higher than the highest Sequence
+          accepted from the same Sender.  A member
+          <bcp14>MUST</bcp14> remember the Sequence of the Senders it
+          heard from most recently, at least as many as the group has
+          members and at least eight; a restarted member is a new
+          Sender.</li>
+        </ol>
+        <t>A copy of a message that the system delivers again through
+        another CARP interface on the link of the Sync interface, as
+        some CARP implementations do with multicast, is no error: the
+        member discards it without logging.</t>
+        <t>A member ignores its own messages, whose Sender is its own,
+        and discards messages of an unknown Message Type.</t>
+      </section>
+
+      <section anchor="acceptance">
+        <name>Acceptance</name>
+        <t>A member takes the Configuration of a valid message if:</t>
+        <ul>
+          <li>its Generation is greater than the member's Generation, in
+          any CARP state, Master, Backup or Init;</li>
+          <li>its Generation equals the member's Generation and the
+          member is Backup or Init.  Only a Master sends, and CARP has
+          elected it, possibly with a worse Priority than the member's,
+          as when a member returns without preemption.  A member in Init
+          sends nothing, and one whose CARP interface has no address
+          yet gets it this way (<xref target="carp"/>); or</li>
+          <li>its Generation equals the member's Generation, the member
+          is Master, and the sender's Priority is better than the
+          member's own: a lower Demote, or an equal Demote and a lower
+          Advbase, or equal values of both and a lower Advskew, which is
+          the order in which CARP compares advertisements; or an equal
+          Priority and a lower Sender, compared as unsigned 64-bit
+          integers; or whatever the Priority, if the member's CARP
+          interface has no IPv4 address: CARP authenticates its
+          advertisements over the addresses.</li>
+        </ul>
+        <t>It <bcp14>MUST</bcp14> discard, and <bcp14>SHOULD</bcp14>
+        log, any other.  The Generation comes first because after a
+        failover the member with the worse Priority may hold the newer
+        lease; the Priority decides only between Configurations of the
+        same Generation, and there only for members that are Master at
+        the same time and receive each other's messages but not each
+        other's advertisements, for example over a separate Sync
+        interface while the network of the CARP interface is split:
+        exactly one of them takes the other's Configuration.</t>
+      </section>
+
+      <section anchor="applying">
+        <name>Taking a Configuration</name>
+        <t>To take a Configuration, a member adopts its Generation and
+        makes its Address, with its Netmask, the only IPv4 address of the
+        CARP interface: it adds the address if it is missing and then
+        removes all other IPv4 addresses of the interface.  It
+        <bcp14>MUST NOT</bcp14> keep an old address, since CARP
+        authenticates over all addresses
+        (<xref target="carp"/>), and it <bcp14>SHOULD</bcp14> add the new
+        address before removing the old ones, since a CARP interface
+        without an address leaves the election.</t>
+        <t>A member that is Backup <bcp14>SHOULD</bcp14> put the address
+        of the Configuration it holds back when its CARP interface has no
+        IPv4 address: shortly after something else removed it, such as
+        its DHCP client at the expiry of a lease that it obtained while
+        the member was Master, unless another address has turned up
+        meanwhile; and when the interface becomes Backup without it.
+        Without the address, CARP rejects the Master's advertisements: an
+        interface that keeps another address, such as an IPv6 link-local
+        one, makes the member Master beside the Master, and one without
+        any leaves the election.  A Master <bcp14>MUST NOT</bcp14> do so,
+        since its address follows its DHCP lease.</t>
+        <t>Each change of the addresses restarts CARP on the interface,
+        so a member <bcp14>MUST NOT</bcp14> change them when the address
+        is already the only one, and <bcp14>SHOULD</bcp14> do nothing
+        when the Configuration equals the one it took last.  Periodic
+        messages thus cause no changes.</t>
+        <t>A member <bcp14>MUST NOT</bcp14> change its routes because of
+        a Configuration.  It makes the Configuration available locally,
+        including the sender's Backup Gateway (<xref target="local"/>).</t>
+      </section>
+    </section>
+
+    <section anchor="carp">
+      <name>Interaction with CARP</name>
+      <t>CARP computes the authentication of its advertisements over,
+      among other things, the sorted set of IPv4 addresses of the CARP
+      interface <xref target="CARP"/>.  When the Master's address
+      changes:</t>
+      <ol>
+        <li>CARP on the Master restarts: the interface passes through
+        Init and Backup and becomes Master again after about three
+        advertisement intervals.  Meanwhile it neither sends
+        advertisements nor, on the CARP interface, DCARP messages.</li>
+        <li>The Backups reject the Master's advertisements, whose
+        authentication now covers a different set of addresses.  A Backup
+        whose master-down timer expires before it has the new address
+        becomes Master as well.</li>
+        <li>When the Master is Master again, it sends its Configuration,
+        whose Generation is newer.  Every other member takes it, in its
+        current state, and changes its address, which restarts CARP on
+        its interface.  With the same addresses as the Master it accepts
+        the Master's advertisements and becomes Backup again.</li>
+        <li>A member that became Master in step 2 sends its own, older
+        Configuration.  The Master, and any member that already holds
+        the new Configuration, discards it as older.</li>
+      </ol>
+      <t>If the new Configuration reaches a Backup before its master-down
+      timer expires, the Backup takes it as Backup and step 2 does not
+      occur.  If the message is lost, the periodic messages repeat it.
+      The interruption of the Master's own service while CARP restarts is
+      not avoided by DCARP.</t>
+      <t>A member whose CARP interface has no address stays in Init.
+      Since a member takes Configurations in Init as well, such a member
+      obtains its address from the Master and then joins the
+      election.</t>
+    </section>
+
+    <section anchor="local">
+      <name>Local Use of the Configuration</name>
+      <t>DCARP does not set routes, so that it does not compete with the
+      tools that already follow CARP state changes on a member, such as a
+      daemon that changes the default route when the CARP interface
+      becomes Master or Backup.  A member <bcp14>SHOULD</bcp14> make the
+      Configuration it holds, as Master or Backup, available to such
+      tools, for example in a file.  When the member becomes Master, they
+      can then route via the Gateway at once, before any DHCP exchange of
+      the new Master completes; when it becomes Backup, via the Backup
+      Gateway.  <xref target="impl"/> describes how the reference
+      implementation does this.</t>
+      <t>The Backup Gateway a member makes available is that of the
+      member it last took a Configuration from, also while it is Master
+      itself, and across restarts; its own is of no use to it.  When it
+      falls back to Backup, the tools route at once, before a message
+      from the new Master arrives, and the members' addresses on the
+      shared network do not change.  A member that has never taken a
+      Configuration has no Backup Gateway, and the tools need another
+      default.</t>
+      <t>With more than two members, the Master can change while a
+      member stays Backup: its own CARP state does not change, but its
+      Backup Gateway does.  Tools that act only on the member's CARP
+      state changes miss this.  A member <bcp14>SHOULD</bcp14> therefore
+      notify the tools whenever the Configuration it holds changes, as
+      well as when its CARP state changes.</t>
+    </section>
+
+    <section anchor="ops">
+      <name>Operational Considerations</name>
+      <ul>
+        <li>All members <bcp14>MUST</bcp14> use the same key, group and
+        port, and Sync interfaces on the same network.  Implementations
+        <bcp14>SHOULD</bcp14> log a fingerprint of the key, such as the
+        first octets of a hash of it, so that operators can compare the
+        keys without revealing them.</li>
+        <li>The members' clocks <bcp14>MUST</bcp14> agree within the
+        maximum age of 30 seconds, and closely enough that Generations
+        compare correctly.</li>
+        <li>The DHCP client of the shared address runs on the CARP
+        interface and gets no lease on Backups, whose CARP interface does
+        not pass traffic.  A DHCP client left running on a Backup removes
+        the address when the lease it obtained as Master expires
+        (<xref target="applying"/>).  On some systems the DHCP client
+        also changes the local resolver configuration; operators may want
+        to prevent that on the CARP interface.</li>
+        <li>A member restarted without the Configuration it held has
+        Generation 0.  Until its address changes or it learns of its
+        DHCP lease, the other members discard the Configuration it sends
+        as Master if they hold a newer one.</li>
+      </ul>
+    </section>
+
+    <section anchor="security">
+      <name>Security Considerations</name>
+      <t>The shared key protects the confidentiality, integrity and
+      authenticity of the Configurations.  Every holder of the key is
+      trusted: a holder can make the other members take any address and
+      gateway by sending a Configuration with a later Generation, and
+      the Backups by sending one with the same Generation.  The
+      compromise of one member therefore compromises the group, and the
+      key needs the same protection as the members' administrative
+      credentials.</t>
+      <t>The Timestamp and Sequence stop replays.  A member discards a
+      message older than 30 seconds, and a message whose Sequence it has
+      already seen from the same Sender.  Within 30 seconds, a recorded
+      message can be replayed to a member that does not remember its
+      Sender, for example after a restart; such a message carries a
+      Configuration that was current 30 seconds earlier, and is discarded
+      anyway if the member holds a newer Generation.</t>
+      <t>DCARP depends on synchronized clocks.  An attacker who can move a
+      member's clock, for example by attacking its time synchronization,
+      can make it discard valid messages, accept older ones, or give its
+      own Configurations Generations that win over newer ones.</t>
+      <t>The encryption hides the Configuration, the Sender, Sequence and
+      Priority, but not the existence, size and timing of the messages
+      or the source address of the sender, which is visible to anyone on
+      the network of the Sync interface.  With the default Sync
+      interface that is the network of the shared address, often a
+      provider's network.  A separate Sync interface on a trusted network
+      hides even that.</t>
+      <t>Anyone on that network can send datagrams to the group.  Each
+      costs the receiver one authentication attempt; implementations
+      <bcp14>SHOULD</bcp14> limit the rate at which they log discarded
+      messages.  The time to live of 1 and the link-local multicast group
+      keep the messages on the local network.</t>
+      <t>Nonces are random and 192 bits long, so their reuse under one key
+      is negligibly likely.</t>
+      <t>Tools that set routes from a Configuration act on data that is
+      authenticated, but chosen by another member.</t>
+    </section>
+
+    <section anchor="iana">
+      <name>IANA Considerations</name>
+      <t>This document makes no requests of IANA.  The reference
+      implementation uses the multicast group 224.0.0.18, which is
+      assigned to VRRP <xref target="RFC9568"/> and also used by CARP, and
+      UDP port 3522, which is not registered for DCARP.  A version of this
+      document intended for wider deployment would need a port assignment
+      from the Service Name and Transport Protocol Port Number Registry
+      <xref target="RFC6335"/>, and either a multicast group assignment
+      <xref target="RFC5771"/> or a justification for sharing the VRRP
+      group.</t>
+    </section>
+
+  </middle>
+
+  <back>
+    <references>
+      <name>References</name>
+      <references>
+        <name>Normative References</name>
+
+        <reference anchor="RFC2119" target="https://www.rfc-editor.org/info/rfc2119">
+          <front>
+            <title>Key words for use in RFCs to Indicate Requirement Levels</title>
+            <author fullname="S. Bradner" initials="S." surname="Bradner"/>
+            <date year="1997" month="March"/>
+          </front>
+          <seriesInfo name="BCP" value="14"/>
+          <seriesInfo name="RFC" value="2119"/>
+          <seriesInfo name="DOI" value="10.17487/RFC2119"/>
+        </reference>
+
+        <reference anchor="RFC8174" target="https://www.rfc-editor.org/info/rfc8174">
+          <front>
+            <title>Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words</title>
+            <author fullname="B. Leiba" initials="B." surname="Leiba"/>
+            <date year="2017" month="May"/>
+          </front>
+          <seriesInfo name="BCP" value="14"/>
+          <seriesInfo name="RFC" value="8174"/>
+          <seriesInfo name="DOI" value="10.17487/RFC8174"/>
+        </reference>
+
+        <reference anchor="RFC768" target="https://www.rfc-editor.org/info/rfc768">
+          <front>
+            <title>User Datagram Protocol</title>
+            <author fullname="J. Postel" initials="J." surname="Postel"/>
+            <date year="1980" month="August"/>
+          </front>
+          <seriesInfo name="STD" value="6"/>
+          <seriesInfo name="RFC" value="768"/>
+          <seriesInfo name="DOI" value="10.17487/RFC0768"/>
+        </reference>
+
+        <reference anchor="RFC8439" target="https://www.rfc-editor.org/info/rfc8439">
+          <front>
+            <title>ChaCha20 and Poly1305 for IETF Protocols</title>
+            <author fullname="Y. Nir" initials="Y." surname="Nir"/>
+            <author fullname="A. Langley" initials="A." surname="Langley"/>
+            <date year="2018" month="June"/>
+          </front>
+          <seriesInfo name="RFC" value="8439"/>
+          <seriesInfo name="DOI" value="10.17487/RFC8439"/>
+        </reference>
+
+        <reference anchor="I-D.irtf-cfrg-xchacha" target="https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha-03">
+          <front>
+            <title>XChaCha: eXtended-nonce ChaCha and AEAD_XChaCha20_Poly1305</title>
+            <author fullname="S. Arciszewski" initials="S." surname="Arciszewski"/>
+            <date year="2020" month="January"/>
+          </front>
+          <seriesInfo name="Internet-Draft" value="draft-irtf-cfrg-xchacha-03"/>
+          <refcontent>Work in Progress</refcontent>
+        </reference>
+
+        <reference anchor="RFC4086" target="https://www.rfc-editor.org/info/rfc4086">
+          <front>
+            <title>Randomness Requirements for Security</title>
+            <author fullname="D. Eastlake 3rd" initials="D." surname="Eastlake 3rd"/>
+            <author fullname="J. Schiller" initials="J." surname="Schiller"/>
+            <author fullname="S. Crocker" initials="S." surname="Crocker"/>
+            <date year="2005" month="June"/>
+          </front>
+          <seriesInfo name="BCP" value="106"/>
+          <seriesInfo name="RFC" value="4086"/>
+          <seriesInfo name="DOI" value="10.17487/RFC4086"/>
+        </reference>
+      </references>
+
+      <references>
+        <name>Informative References</name>
+
+        <reference anchor="CARP" target="https://man.openbsd.org/carp.4">
+          <front>
+            <title>carp(4): Common Address Redundancy Protocol</title>
+            <author>
+              <organization>The OpenBSD Project</organization>
+            </author>
+          </front>
+          <refcontent>OpenBSD manual page</refcontent>
+        </reference>
+
+        <reference anchor="RFC9568" target="https://www.rfc-editor.org/info/rfc9568">
+          <front>
+            <title>Virtual Router Redundancy Protocol (VRRP) Version 3 for IPv4 and IPv6</title>
+            <author fullname="A. Lindem" initials="A." surname="Lindem"/>
+            <author fullname="A. Dogra" initials="A." surname="Dogra"/>
+            <date year="2024" month="April"/>
+          </front>
+          <seriesInfo name="RFC" value="9568"/>
+          <seriesInfo name="DOI" value="10.17487/RFC9568"/>
+        </reference>
+
+        <reference anchor="RFC2131" target="https://www.rfc-editor.org/info/rfc2131">
+          <front>
+            <title>Dynamic Host Configuration Protocol</title>
+            <author fullname="R. Droms" initials="R." surname="Droms"/>
+            <date year="1997" month="March"/>
+          </front>
+          <seriesInfo name="RFC" value="2131"/>
+          <seriesInfo name="DOI" value="10.17487/RFC2131"/>
+        </reference>
+
+        <reference anchor="RFC5771" target="https://www.rfc-editor.org/info/rfc5771">
+          <front>
+            <title>IANA Guidelines for IPv4 Multicast Address Assignments</title>
+            <author fullname="M. Cotton" initials="M." surname="Cotton"/>
+            <author fullname="L. Vegoda" initials="L." surname="Vegoda"/>
+            <author fullname="D. Meyer" initials="D." surname="Meyer"/>
+            <date year="2010" month="March"/>
+          </front>
+          <seriesInfo name="BCP" value="51"/>
+          <seriesInfo name="RFC" value="5771"/>
+          <seriesInfo name="DOI" value="10.17487/RFC5771"/>
+        </reference>
+
+        <reference anchor="RFC6335" target="https://www.rfc-editor.org/info/rfc6335">
+          <front>
+            <title>Internet Assigned Numbers Authority (IANA) Procedures for the Management of the Service Name and Transport Protocol Port Number Registry</title>
+            <author fullname="M. Cotton" initials="M." surname="Cotton"/>
+            <author fullname="L. Eggert" initials="L." surname="Eggert"/>
+            <author fullname="J. Touch" initials="J." surname="Touch"/>
+            <author fullname="M. Westerlund" initials="M." surname="Westerlund"/>
+            <author fullname="S. Cheshire" initials="S." surname="Cheshire"/>
+            <date year="2011" month="August"/>
+          </front>
+          <seriesInfo name="BCP" value="165"/>
+          <seriesInfo name="RFC" value="6335"/>
+          <seriesInfo name="DOI" value="10.17487/RFC6335"/>
+        </reference>
+      </references>
+    </references>
+
+    <section anchor="impl">
+      <name>Reference Implementation</name>
+      <t>dcarpd(8) implements DCARP on OpenBSD.  It derives the 256-bit key
+      as the SHA-256 hash of a key file, sends every 10 seconds, and
+      remembers 64 Senders.  As Master it asks dhcpleased(8) over its
+      control socket, read-only as "dhcpleasectl -l" does, when the
+      lease of the address was last acknowledged and how long it lasts;
+      after a malformed answer or none, it does not ask again until it
+      is told to, lest a dhcpleased whose messages differ take the
+      question for a request for a new lease.</t>
+      <t>It writes the Configuration it holds to a state file of shell
+      variable assignments, which it replaces atomically:</t>
+      <sourcecode type="sh"><![CDATA[
+DCARP_INTERFACE=carp0
+DCARP_ADDRESS=192.0.2.10
+DCARP_NETMASK=255.255.255.0
+DCARP_GATEWAY=192.0.2.1
+DCARP_BACKUP_GATEWAY=192.168.1.2
+DCARP_GENERATION=1793625676
+DCARP_LEASE_TIME=86400
+DCARP_LEASE_EXPIRES=1793712076
+]]></sourcecode>
+      <t>It starts with the Generation of the state file, and as Backup
+      puts the address back as <xref target="applying"/> describes.</t>
+      <t>ifstated(8) sources the file and routes via DCARP_GATEWAY when
+      the CARP interface becomes Master, and via DCARP_BACKUP_GATEWAY
+      when it becomes Backup, so that its configuration is the same on
+      every member.  A complete ifstated configuration is distributed
+      with the implementation.  The Backup Gateway is the -g option of
+      dcarpd.</t>
+      <t>With more than two members, dcarpd runs the program given with
+      its -x option, with the state file and the CARP state as
+      arguments, whenever it writes the state file and whenever the CARP
+      state changes, one run at a time; the program sets the
+      routes.</t>
+      <t>The implementation comes with regression tests that run two or
+      three members in separate routing domains of one host, including
+      the split of <xref target="carp"/>, failovers among three members,
+      a member returning without preemption, Masters of equal Priority,
+      replays, tampered and stale messages, messages with another key,
+      a Backup that loses its address, and renewals of the lease.</t>
+    </section>
+
+    <section anchor="ack" numbered="false">
+      <name>Acknowledgments</name>
+      <t>DCARP builds on CARP, written for OpenBSD.</t>
+    </section>
+  </back>
+</rfc>
