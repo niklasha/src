@@ -954,10 +954,14 @@ rtm_output(struct rt_msghdr *rtm, struct rtentry **prt,
 			break;
 		}
 		error = rtrequest(RTM_ADD, info, prio, &rt, tableid);
-		NET_UNLOCK();
-		if (error == 0)
+		if (error == 0) {
 			rtm_setmetrics(rtm->rtm_inits, &rtm->rtm_rmx,
 			    &rt->rt_rmx);
+			rt->rt_locks &= ~(rtm->rtm_inits);
+			rt->rt_locks |=
+			    (rtm->rtm_inits & rtm->rtm_rmx.rmx_locks);
+		}
+		NET_UNLOCK();
 		break;
 	case RTM_DELETE:
 		rt = rtable_lookup(tableid, info->rti_info[RTAX_DST],
