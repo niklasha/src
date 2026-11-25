@@ -65,6 +65,7 @@ int calcsb(char *, int, struct fs *, struct disklabel *, uint32_t);
 static struct disklabel *getdisklabel(char *, int);
 static int readsb(int);
 static int cmpsb(struct fs *, struct fs *);
+static int checkgeom(int);
 static char rdevname[PATH_MAX];
 
 long numdirs, listmax, inplast;
@@ -584,6 +585,8 @@ out:
 		sblock.fs_cstotal.cs_nifree = sblock.fs_ffs1_cstotal.cs_nifree;
 		sblock.fs_cstotal.cs_nffree = sblock.fs_ffs1_cstotal.cs_nffree;
 	}
+	if (checkgeom(listerr) == 0)
+		return (0);
 	havesb = 1;
 	return (1);
 }
@@ -706,4 +709,58 @@ cmpsb(struct fs *sb, struct fs *asb)
 		    return (1);
 	/* they're the same */
 	return (0);
+}
+
+/*
+ * Check that the cylinder group layout described by the super block
+ * fits inside the file system.  pass1() marks every cylinder group's
+ * super block, cg block and inode table in blockmap, which only has
+ * fs_size bits, and reads the inode tables from disk; a layout that
+ * runs past fs_size overflows blockmap and makes fsck read (and, with
+ * -y, write) past the end of the file system.
+ */
+static int
+checkgeom(int listerr)
+{
+	struct fs *fs = &sblock;
+	daddr_t cgend;
+	u_int32_t c;
+
+	if (fs->fs_fpg <= 0 || fs->fs_ipg <= 0) {
+		badsb(listerr, "FPG/IPG OUT OF RANGE");
+		return (0);
+	}
+	if (fs->fs_size <= (int64_t)(fs->fs_ncg - 1) * fs->fs_fpg ||
+	    fs->fs_size > (int64_t)fs->fs_ncg * fs->fs_fpg) {
+		badsb(listerr, "SIZE INCONSISTENT WITH NCG AND FPG");
+		return (0);
+	}
+	if (fs->fs_sblkno < 0 || fs->fs_cblkno <= fs->fs_sblkno ||
+	    fs->fs_iblkno <= fs->fs_cblkno || fs->fs_dblkno <= fs->fs_iblkno) {
+		badsb(listerr, "CYLINDER GROUP LAYOUT OUT OF ORDER");
+		return (0);
+	}
+	for (c = 0; c < fs->fs_ncg; c++) {
+		cgend = (c == fs->fs_ncg - 1) ? fs->fs_size :
+		    cgbase(fs, c + 1);
+		if (cgdmin(fs, c) > cgend) {
+			if (listerr)
+				pwarn("CG %u: INODE TABLE ENDS AT %lld, "
+				    "BEYOND %s %lld\n", c,
+				    (long long)cgdmin(fs, c),
+				    (c == fs->fs_ncg - 1) ?
+				    "FILE SYSTEM SIZE" : "START OF NEXT CG AT",
+				    (long long)cgend);
+			badsb(listerr,
+			    "CYLINDER GROUP METADATA BEYOND END OF FILE SYSTEM");
+			return (0);
+		}
+	}
+	if (fs->fs_cssize < fs->fs_ncg * (int64_t)sizeof(struct csum) ||
+	    fs->fs_csaddr < 0 || fs->fs_csaddr +
+	    howmany(fs->fs_cssize, fs->fs_fsize) > fs->fs_size) {
+		badsb(listerr, "CYLINDER GROUP SUMMARY AREA OUT OF RANGE");
+		return (0);
+	}
+	return (1);
 }

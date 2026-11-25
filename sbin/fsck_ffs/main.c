@@ -180,7 +180,7 @@ main(int argc, char *argv[])
 		(void)signal(SIGQUIT, catchquit);
 	catchinfo(0);
 
-	(void)checkfilesys(blockcheck(*argv), 0, 0L, 0);
+	ret = checkfilesys(blockcheck(*argv), 0, 0L, 0);
 
 	if (returntosingle)
 		ret = 2;
@@ -210,6 +210,7 @@ checkfilesys(char *filesys, char *mntpt, long auxdata, int child)
 	struct dups *dp;
 	struct zlncnt *zlnp;
 	int cylno;
+	int r;
 
 	if (preen && child)
 		(void)signal(SIGQUIT, voidquit);
@@ -217,7 +218,7 @@ checkfilesys(char *filesys, char *mntpt, long auxdata, int child)
 	if (debug && preen)
 		pwarn("starting\n");
 
-	switch (setup(filesys, 0)) {
+	switch ((r = setup(filesys, 0))) {
 	case 0:
 		if (preen)
 			pfatal("CAN'T CHECK FILE SYSTEM.");
@@ -231,7 +232,7 @@ checkfilesys(char *filesys, char *mntpt, long auxdata, int child)
 			(void)close(fswritefd);
 			fswritefd = -1;
 		}
-		return (0);
+		return (r == 0 ? 8 : 0);
 	}
 	info_filesys = filesys;
 

@@ -236,8 +236,8 @@ chkrange(daddr_t blk, int cnt)
 {
 	int c;
 
-	if (cnt <= 0 || blk <= 0 || blk > maxfsblock ||
-	    cnt - 1 > maxfsblock - blk)
+	if (cnt <= 0 || blk <= 0 || blk >= maxfsblock ||
+	    cnt > maxfsblock - blk)
 		return (1);
 	if (cnt > sblock.fs_frag ||
 	    fragnum(&sblock, blk) + cnt > sblock.fs_frag) {
