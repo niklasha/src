@@ -824,6 +824,14 @@ merge_ra_interface(char *if_name, char *conf_name, struct ifaddrs *ifap)
 	ifrdomain = get_ifrdomain(if_name);
 
 	if ((ra_iface = find_ra_iface_by_name(if_name)) != NULL) {
+		/*
+		 * The interface may have moved to another block (interface
+		 * <-> group) since it was added.  The first block that
+		 * matches it in this merge wins, as for a new interface.
+		 */
+		if (ra_iface->removed)
+			strlcpy(ra_iface->conf_name, conf_name,
+			    sizeof(ra_iface->conf_name));
 		ra_iface->link_state = link_state;
 		if (!LINK_STATE_IS_UP(link_state)) {
 			log_debug("%s down, removing", if_name);
@@ -962,6 +970,7 @@ merge_ra_interfaces(void)
 			free(ra_prefix_conf);
 		}
 		ra_iface->prefix_count = 0;
+		ra_iface->has_autoconf_prefix = 0;
 
 		if (ra_iface->removed) {
 			log_debug("iface removed: %s", ra_iface->name);
@@ -1207,6 +1216,11 @@ build_packet(struct ra_iface *ra_iface)
 
 	ra_iface_conf = find_ra_iface_conf(&frontend_conf->ra_iface_list,
 	    ra_iface->conf_name);
+	if (ra_iface_conf == NULL) {
+		log_warnx("%s: no configuration for %s (%s)", __func__,
+		    ra_iface->name, ra_iface->conf_name);
+		return 0;
+	}
 	ra_options_conf = &ra_iface_conf->ra_options;
 	t = time(NULL);
 	len = sizeof(*ra);
@@ -1430,7 +1444,7 @@ ra_output(struct ra_iface *ra_iface, struct sockaddr_in6 *to)
 	if (!LINK_STATE_IS_UP(ra_iface->link_state))
 		return;
 
-	if (ra_iface->has_autoconf_prefix)
+	if (!ra_iface->removed && ra_iface->has_autoconf_prefix)
 		/* update vltime & pltime */
 		build_packet(ra_iface);
 
