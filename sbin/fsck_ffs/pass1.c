@@ -81,12 +81,12 @@ pass1(void)
 			i = cgbase(&sblock, c);
 		else
 			i = cgsblock(&sblock, c);
-		for (; i < cgd; i++)
+		for (; i < cgd && i < maxfsblock; i++)
 			setbmap(i);
 	}
 	i = sblock.fs_csaddr;
 	cgd = i + howmany(sblock.fs_cssize, sblock.fs_fsize);
-	for (; i < cgd; i++)
+	for (; i < cgd && i < maxfsblock; i++)
 		setbmap(i);
 	/*
 	 * Find all allocated blocks.
