@@ -1,0 +1,195 @@
+#!/bin/ksh
+#	$OpenBSD$
+#
+# Regress tests for fsck_ffs: super blocks whose cylinder group layout
+# does not fit in fs_size, the exit status when the check cannot run,
+# block numbers at fs_size, and clean file systems of several shapes.
+#
+# usage: checkfsck ffsedit [fsck_ffs]
+
+FFSEDIT=${1:?usage: checkfsck ffsedit [fsck_ffs]}
+FSCK=${2:-/sbin/fsck_ffs}
+# Catch heap overflows that do not reach an unmapped page.
+export MALLOC_OPTIONS=S
+
+T=$(mktemp -d /tmp/checkfsck.XXXXXXXXXX) || exit 1
+vnd=
+mnt=
+ret=0
+
+cleanup() {
+	[ -z "$mnt" ] || umount "$mnt" 2>/dev/null
+	[ -z "$vnd" ] || vnconfig -u "$vnd"
+	vnd=
+	mnt=
+	rm -rf "${T:?}"
+}
+trap 'cleanup; exit 1' INT TERM
+
+attach() {
+	vnd=$(vnconfig "$1") || { echo "vnconfig $1 failed"; cleanup; exit 1; }
+}
+
+detach() {
+	vnconfig -u "$vnd"
+	vnd=
+}
+
+fail() {
+	echo "FAIL: $*"
+	sed 's/^/	/' $T/out
+	ret=$((ret + 1))
+}
+
+# mkfs name sectors newfs-args...
+mkfs() {
+	img=$T/$1.img
+	dd if=/dev/zero of=$img bs=512 count=0 seek=$2 2>/dev/null
+	shift 2
+	attach $img
+	newfs "$@" /dev/r${vnd}c >/dev/null 2>&1 ||
+	    { echo "newfs $* failed"; detach; cleanup; exit 1; }
+	detach
+}
+
+# info image: set ncg fpg frag fsize size base imin dmin
+info() {
+	set -- $($FFSEDIT $1 info)
+	magic=$2 ncg=$4 fpg=$6 frag=$8 fsize=${10} size=${12}
+	base=${14} imin=${16} dmin=${18}
+}
+
+# check name image want-exit pattern fsck-flags...
+# Run fsck_ffs on image, require exit status want-exit and, unless
+# pattern is empty, a line matching pattern.
+check() {
+	name=$1 image=$2 want=$3 pat=$4
+	shift 4
+	attach $image
+	$FSCK "$@" /dev/r${vnd}c >$T/out 2>&1 </dev/null
+	got=$?
+	detach
+	if [ $got -ne $want ]; then
+		fail "$name: fsck_ffs $*: exit $got, want $want"
+	elif [ -n "$pat" ] && ! grep -Eq "$pat" $T/out; then
+		fail "$name: fsck_ffs $*: no line matching /$pat/"
+	else
+		echo "ok $name: fsck_ffs $*: exit $got"
+	fi
+}
+
+# quiet name image: a clean file system gives no messages besides the
+# phase headers and the summary, and fsck -p skips it.
+quiet() {
+	check "$1" $2 0 '^[0-9]+ files, ' -n -f
+	if grep -Ev '^\*\* |^[0-9]+ files, ' $T/out | grep -q .; then
+		fail "$1: unexpected messages from fsck_ffs -n -f"
+	fi
+	check "$1" $2 0 'clean; not checking' -p
+}
+
+geom='CG [0-9]+: INODE TABLE ENDS AT [0-9]+, BEYOND FILE SYSTEM SIZE'
+
+# Shrink fs_size so that the last cylinder group's inode table lies
+# partly or wholly past it, as resize_ffs used to leave it.
+badgeom() {
+	o=$1
+	shift
+	mkfs $o "$@"
+	info $T/$o.img
+	if [ $ncg -lt 2 ]; then
+		echo "$o: need at least 2 cylinder groups, got $ncg"
+		ret=$((ret + 1))
+		return
+	fi
+	echo "== $o: $magic ncg $ncg fpg $fpg size $size" \
+	    "last cg $base/$imin/$dmin"
+
+	# Only the cg header fits: the whole inode table is past fs_size.
+	# Unfixed fsck_ffs overflows blockmap in pass1 here.
+	cp $T/$o.img $T/hdr.img
+	$FFSEDIT $T/hdr.img tail $((imin - base))
+	check $o-hdr $T/hdr.img 8 "$geom" -n -f
+	check $o-hdr $T/hdr.img 8 "$geom" -p
+	check $o-hdr $T/hdr.img 8 "$geom" -p -f
+
+	# The same, with the device ending at fs_size: -y must neither
+	# salvage nor write past the end.
+	cp $T/hdr.img $T/hdrend.img
+	dd if=/dev/null of=$T/hdrend.img bs=$fsize \
+	    seek=$imin 2>/dev/null
+	sum=$(sha256 -q $T/hdrend.img)
+	check $o-hdrend $T/hdrend.img 8 "$geom" -n -f
+	check $o-hdrend $T/hdrend.img 8 "$geom" -y -f
+	[ "$sum" = "$(sha256 -q $T/hdrend.img)" ] ||
+	    fail "$o-hdrend: fsck_ffs -y changed the image"
+
+	# Part of the inode table fits.
+	cp $T/$o.img $T/part.img
+	$FFSEDIT $T/part.img tail $((imin - base + frag))
+	check $o-part $T/part.img 8 "$geom" -n -f
+
+	# All but the last fragment of the inode table fits.
+	cp $T/$o.img $T/dmin1.img
+	$FFSEDIT $T/dmin1.img tail $((dmin - base - 1))
+	check $o-dmin1 $T/dmin1.img 8 "$geom" -n -f
+
+	# fs_size not in ((ncg - 1) * fpg, ncg * fpg].
+	cp $T/$o.img $T/size.img
+	$FFSEDIT $T/size.img size $((base))
+	check $o-size-low $T/size.img 8 'SIZE INCONSISTENT WITH NCG AND FPG' \
+	    -n -f
+	$FFSEDIT $T/size.img size $((ncg * fpg + 1))
+	check $o-size-high $T/size.img 8 'SIZE INCONSISTENT WITH NCG AND FPG' \
+	    -n -f
+	rm -f $T/hdr.img $T/hdrend.img $T/part.img $T/dmin1.img $T/size.img
+}
+
+# A direct block at fs_size, one past the last fragment, must be
+# reported as BAD; unfixed fsck_ffs accepted it and set a bit past the
+# end of blockmap.
+badblk() {
+	o=$1
+	shift
+	mkfs $o "$@"
+	attach $T/$o.img
+	mnt=$T/mnt
+	mkdir -p $mnt
+	mount /dev/${vnd}c $mnt || { fail "$o: mount"; detach; return; }
+	echo data >$mnt/file
+	ino=$(ls -i $mnt/file | awk '{ print $1 }')
+	umount $mnt
+	mnt=
+	detach
+	info $T/$o.img
+	$FFSEDIT $T/$o.img db $ino $size
+	check $o-blk $T/$o.img 0 "^$size BAD I=$ino\$" -n -f
+}
+
+# No super block at all: the check cannot run, so the exit status is 8.
+dd if=/dev/zero of=$T/zero.img bs=512 count=0 seek=8192 2>/dev/null
+check zero $T/zero.img 8 'BAD SUPER BLOCK|MAGIC NUMBER WRONG' -n
+rm -f $T/zero.img
+
+badgeom ffs1 131072 -O1 -b 16384 -f 2048 -c 4096
+badgeom ffs2 131072 -O2 -b 16384 -f 2048 -c 4096
+badgeom ffs2-big 524288 -O2
+
+badblk ffs1-blk 65536 -O1
+badblk ffs2-blk 65536 -O2
+
+for o in 1 2; do
+	for s in 4096 77777 300001 1048599; do
+		mkfs ffs$o-$s $s -O$o
+		quiet ffs$o-$s $T/ffs$o-$s.img
+		rm -f $T/ffs$o-$s.img
+	done
+done
+mkfs ffs1-small 8192 -O1 -b 8192 -f 1024
+quiet ffs1-small $T/ffs1-small.img
+mkfs ffs2-wide 2000000 -O2 -b 65536 -f 8192
+quiet ffs2-wide $T/ffs2-wide.img
+
+cleanup
+[ $ret -eq 0 ] && echo PASS || echo "$ret test(s) FAILED"
+exit $ret
