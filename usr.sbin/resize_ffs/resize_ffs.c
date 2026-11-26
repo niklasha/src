@@ -36,6 +36,18 @@
 #define RESIZE_JOURNAL_VERSION	1U
 #define RESIZE_REC_MAGIC	0x52454331U
 
+/*
+ * Header flags, kept in reserved[RESIZE_JHDR_FLAGS] (zero in journals
+ * written by older versions).  RESIZE_JF_AUTOPLAN: a truncating shrink
+ * with an automatic plan, so --resume may finish an interrupted
+ * relocation by planning the remaining moves again.
+ * RESIZE_JF_WASCLEAN: see below.
+ */
+#define RESIZE_JHDR_FLAGS	0
+#define RESIZE_JF_AUTOPLAN	0x0000000000000001ULL
+/* The file system was clean when the run started; cleared on reset. */
+#define RESIZE_JF_WASCLEAN	0x0000000000000002ULL
+
 enum resize_jrec_type {
 	RESIZE_REC_PHASE = 1,
 	RESIZE_REC_INTENT = 2,
@@ -148,6 +160,8 @@ struct resize_alloc_map {
 	struct resize_alloc_ent *ents;
 	size_t nent;
 	size_t cap;
+	size_t *htab;		/* open addressing: index + 1, 0 = empty */
+	size_t hcap;		/* power of two, > 2 * nent */
 };
 
 struct resize_runtime {
@@ -172,6 +186,7 @@ struct resize_free_pool {
 	u_int8_t *map;
 	uint64_t nbits;
 	uint64_t cursor;
+	uint64_t frag;		/* frags per block */
 };
 
 struct resize_plan_ctx {
@@ -193,6 +208,7 @@ struct resize_plan_ctx {
 struct resize_inode_view {
 	uint16_t mode;
 	uint64_t size;
+	int has_ext;		/* FFS2 extended attribute data */
 	uint64_t db[NDADDR];
 	uint64_t ib[NIADDR];
 };
@@ -224,6 +240,15 @@ static int resize_shift_rebase_super(struct resize_runtime *,
 static int resize_rt_read_cg(struct resize_runtime *, uint32_t, u_int8_t **,
     struct cg **, uint64_t *);
 static int resize_expected_cg_ncyl(const struct fs *, uint64_t, int16_t *);
+static int resize_plan_check_disk(const struct resize_move_list *,
+    const struct fs *, int, uint64_t, uint64_t);
+static int resize_cg_reserved_range_frag(const struct fs *, uint32_t,
+    uint64_t *, uint64_t *);
+static int resize_super_csaddr_fsb(const struct fs *, uint64_t *);
+static int resize_execute_body(const struct resize_options *,
+    struct resize_runtime *, struct resize_super *, uint64_t,
+    struct resize_move_list *, const struct resize_ino_remap *,
+    const struct resize_ino_remap *, int, uint64_t);
 
 static const char *
 resize_policy_name(enum resize_policy p)
@@ -1001,6 +1026,9 @@ resize_validate_super_at(const struct fs *fs, uint64_t sbloc_rel)
 		return (EINVAL);
 	if (fs->fs_maxsymlinklen <= 0)
 		return (EINVAL);
+	if (fs->fs_maxsymlinklen > (int32_t)(fs->fs_magic == FS_UFS1_MAGIC ?
+	    MAXSYMLINKLEN_UFS1 : MAXSYMLINKLEN_UFS2))
+		return (EINVAL);
 	if (fs->fs_fsize <= 0 || fs->fs_bsize <= 0)
 		return (EINVAL);
 	if (fs->fs_fsize > fs->fs_bsize)
@@ -1205,47 +1233,360 @@ resize_load_moves(const char *path, struct resize_move_list *ml)
 	return (0);
 }
 
-static int
-resize_move_cmp_end(const void *a, const void *b)
-{
-	const struct resize_move *ma = a, *mb = b;
+/*
+ * Plan ordering.
+ *
+ * resize_run_relocation() handles all entries for one source block as a
+ * single group: the block is copied once, every owner slot is repointed
+ * and the old copy is freed once.  The entries of a group must therefore
+ * be adjacent.  A --moves file has one line per owner slot, and the
+ * automatic planner appends a second owner of an already planned block
+ * (a block referenced twice, which only a damaged file system has) at
+ * the end of the list.
+ *
+ * This used to be done by sorting the whole plan by old_fsb.  That also
+ * reordered unrelated blocks: an indirect block usually lies below the
+ * blocks it points to, so the sort moved it before its children, and
+ * their repoints were then written into the stale old copy (D13a).
+ * Ascending old_fsb is also the order that makes a chain of downward
+ * moves work (a destination that is still the source of a later move),
+ * but plans with any source/destination overlap are now refused instead
+ * (resize_plan_validate), so no order is needed for that.
+ *
+ * resize_group_moves() makes the entries of a group adjacent at the
+ * position of its first entry and keeps the plan order otherwise.  The
+ * automatic planner emits children before their parent indirect block
+ * (post-order).  For any other order, resize_plan_redirect_owners()
+ * points each repoint at the current location of the block that holds
+ * the owner slot.
+ */
+struct resize_move_key {
+	uint64_t old_fsb;
+	size_t idx;
+	size_t rank;
+};
 
-	if (ma->old_fsb < mb->old_fsb)
+static int
+resize_move_key_cmp_old(const void *a, const void *b)
+{
+	const struct resize_move_key *ka = a, *kb = b;
+
+	if (ka->old_fsb < kb->old_fsb)
 		return (-1);
-	if (ma->old_fsb > mb->old_fsb)
+	if (ka->old_fsb > kb->old_fsb)
 		return (1);
-	if (ma->new_fsb < mb->new_fsb)
+	if (ka->idx < kb->idx)
 		return (-1);
-	if (ma->new_fsb > mb->new_fsb)
-		return (1);
-	if (ma->owner_abs_offset < mb->owner_abs_offset)
-		return (-1);
-	if (ma->owner_abs_offset > mb->owner_abs_offset)
-		return (1);
-	if (ma->owner_width < mb->owner_width)
-		return (-1);
-	if (ma->owner_width > mb->owner_width)
+	if (ka->idx > kb->idx)
 		return (1);
 	return (0);
 }
 
 static int
-resize_move_cmp_begin(const void *a, const void *b)
+resize_move_key_cmp_rank(const void *a, const void *b)
 {
-	return (resize_move_cmp_end(b, a));
+	const struct resize_move_key *ka = a, *kb = b;
+
+	if (ka->rank < kb->rank)
+		return (-1);
+	if (ka->rank > kb->rank)
+		return (1);
+	if (ka->idx < kb->idx)
+		return (-1);
+	if (ka->idx > kb->idx)
+		return (1);
+	return (0);
 }
 
-static void
-resize_reorder_moves(struct resize_move_list *ml, bool descending)
+static int
+resize_group_moves(struct resize_move_list *ml)
 {
+	struct resize_move_key *keys;
+	struct resize_move *nmoves;
+	size_t i, j, first;
+
 	if (ml->nmoves < 2)
-		return;
-	if (!descending)
-		qsort(ml->moves, ml->nmoves, sizeof(ml->moves[0]),
-		    resize_move_cmp_end);
-	else
-		qsort(ml->moves, ml->nmoves, sizeof(ml->moves[0]),
-		    resize_move_cmp_begin);
+		return (0);
+	keys = calloc(ml->nmoves, sizeof(*keys));
+	if (keys == NULL)
+		return (ENOMEM);
+	nmoves = calloc(ml->nmoves, sizeof(*nmoves));
+	if (nmoves == NULL) {
+		free(keys);
+		return (ENOMEM);
+	}
+	for (i = 0; i < ml->nmoves; i++) {
+		keys[i].old_fsb = ml->moves[i].old_fsb;
+		keys[i].idx = i;
+	}
+	qsort(keys, ml->nmoves, sizeof(*keys), resize_move_key_cmp_old);
+	for (i = 0; i < ml->nmoves; i = j) {
+		first = keys[i].idx;
+		for (j = i; j < ml->nmoves &&
+		    keys[j].old_fsb == keys[i].old_fsb; j++)
+			keys[j].rank = first;
+	}
+	qsort(keys, ml->nmoves, sizeof(*keys), resize_move_key_cmp_rank);
+	for (i = 0; i < ml->nmoves; i++)
+		nmoves[i] = ml->moves[keys[i].idx];
+	memcpy(ml->moves, nmoves, ml->nmoves * sizeof(*nmoves));
+	free(nmoves);
+	free(keys);
+	return (0);
+}
+
+struct resize_extent {
+	uint64_t start;
+	uint64_t end;
+	uint64_t new_start;
+	size_t group;
+	int is_dst;
+};
+
+static int
+resize_extent_cmp(const void *a, const void *b)
+{
+	const struct resize_extent *ea = a, *eb = b;
+
+	if (ea->start < eb->start)
+		return (-1);
+	if (ea->start > eb->start)
+		return (1);
+	if (ea->end < eb->end)
+		return (-1);
+	if (ea->end > eb->end)
+		return (1);
+	return (0);
+}
+
+/*
+ * Check a grouped plan before anything is written: the entries of a
+ * group agree on destination and size, every extent is a valid fragment
+ * run (a partial block never crosses a block boundary), destinations lie
+ * below limit_blocks (when non-zero), and no source or destination
+ * extent overlaps any other.  Without overlaps the order of the groups
+ * cannot make one move overwrite data that another move still needs.
+ */
+static int
+resize_plan_validate(const struct resize_move_list *ml, const struct fs *fs,
+    uint64_t limit_blocks, int verbose)
+{
+	struct resize_extent *ext;
+	const struct resize_move *mv;
+	uint64_t nfrags, max_end, frag;
+	size_t i, j, n, ngroups;
+	int error;
+
+	if (ml->nmoves == 0)
+		return (0);
+	if (fs->fs_fsize <= 0 || fs->fs_frag <= 0 || fs->fs_bsize <= 0)
+		return (EINVAL);
+	frag = (uint64_t)fs->fs_frag;
+	ext = calloc(ml->nmoves, 2 * sizeof(*ext));
+	if (ext == NULL)
+		return (ENOMEM);
+	n = 0;
+	ngroups = 0;
+	error = 0;
+	for (i = 0; i < ml->nmoves; i = j) {
+		mv = &ml->moves[i];
+		for (j = i + 1; j < ml->nmoves &&
+		    ml->moves[j].old_fsb == mv->old_fsb; j++) {
+			if (ml->moves[j].new_fsb != mv->new_fsb ||
+			    ml->moves[j].bytes != mv->bytes) {
+				resize_vlog(verbose, "plan: old_fsb=%" PRIu64
+				    " has conflicting destinations\n",
+				    mv->old_fsb);
+				error = EINVAL;
+				goto out;
+			}
+		}
+		if (mv->bytes == 0 || mv->bytes % (uint32_t)fs->fs_fsize != 0 ||
+		    mv->bytes > (uint32_t)fs->fs_bsize || mv->old_fsb ==
+		    mv->new_fsb) {
+			resize_vlog(verbose, "plan: invalid move %" PRIu64
+			    " -> %" PRIu64 " (%u bytes)\n", mv->old_fsb,
+			    mv->new_fsb, mv->bytes);
+			error = EINVAL;
+			goto out;
+		}
+		nfrags = mv->bytes / (uint32_t)fs->fs_fsize;
+		if (mv->old_fsb > UINT64_MAX - nfrags ||
+		    mv->new_fsb > UINT64_MAX - nfrags) {
+			error = EOVERFLOW;
+			goto out;
+		}
+		if ((mv->old_fsb % frag) + nfrags > frag ||
+		    (mv->new_fsb % frag) + nfrags > frag) {
+			resize_vlog(verbose, "plan: move %" PRIu64 " -> %" PRIu64
+			    " (%u bytes) crosses a block boundary\n",
+			    mv->old_fsb, mv->new_fsb, mv->bytes);
+			error = EINVAL;
+			goto out;
+		}
+		if (limit_blocks != 0 && mv->new_fsb + nfrags > limit_blocks) {
+			resize_vlog(verbose, "plan: destination %" PRIu64
+			    " (%u bytes) lies beyond the new end %" PRIu64 "\n",
+			    mv->new_fsb, mv->bytes, limit_blocks);
+			error = EINVAL;
+			goto out;
+		}
+		ext[n].start = mv->old_fsb;
+		ext[n].end = mv->old_fsb + nfrags;
+		ext[n].group = ngroups;
+		ext[n].is_dst = 0;
+		n++;
+		ext[n].start = mv->new_fsb;
+		ext[n].end = mv->new_fsb + nfrags;
+		ext[n].group = ngroups;
+		ext[n].is_dst = 1;
+		n++;
+		ngroups++;
+	}
+	qsort(ext, n, sizeof(*ext), resize_extent_cmp);
+	max_end = 0;
+	for (i = 0; i < n; i++) {
+		if (i > 0 && ext[i].start < max_end) {
+			resize_vlog(verbose, "plan: %s extent %" PRIu64 "..%"
+			    PRIu64 " overlaps another source or destination\n",
+			    ext[i].is_dst ? "destination" : "source",
+			    ext[i].start, ext[i].end);
+			error = EINVAL;
+			goto out;
+		}
+		if (ext[i].end > max_end)
+			max_end = ext[i].end;
+	}
+out:
+	free(ext);
+	return (error);
+}
+
+/*
+ * Point every repoint at the current location of the block that holds
+ * its owner slot.  A slot inside a block that an earlier group moves is
+ * redirected to the same offset in the new copy; a slot inside a block
+ * that is moved later stays in the old copy, which is then copied with
+ * the update.  The journal records the redirected address, so replay
+ * and revert write the same slot as the original run.  Requires a
+ * grouped plan that passed resize_plan_validate().
+ */
+static int
+resize_plan_redirect_owners(struct resize_move_list *ml, uint64_t fs_offset,
+    uint32_t fs_fsize, int verbose, size_t *nredirectp)
+{
+	struct resize_extent *ext, *e;
+	struct resize_move *mv;
+	uint64_t abs, o, w;
+	size_t i, j, n, lo, hi, mid, group, nredirect;
+	int error;
+
+	*nredirectp = 0;
+	if (ml->nmoves == 0)
+		return (0);
+	ext = calloc(ml->nmoves, sizeof(*ext));
+	if (ext == NULL)
+		return (ENOMEM);
+	n = 0;
+	error = 0;
+	for (i = 0; i < ml->nmoves; i = j) {
+		mv = &ml->moves[i];
+		for (j = i + 1; j < ml->nmoves &&
+		    ml->moves[j].old_fsb == mv->old_fsb; j++)
+			;
+		error = resize_mul_u64(mv->old_fsb, fs_fsize, &abs);
+		if (error == 0)
+			error = resize_add_u64(fs_offset, abs, &ext[n].start);
+		if (error == 0)
+			error = resize_add_u64(ext[n].start, mv->bytes,
+			    &ext[n].end);
+		if (error == 0)
+			error = resize_mul_u64(mv->new_fsb, fs_fsize, &abs);
+		if (error == 0)
+			error = resize_add_u64(fs_offset, abs,
+			    &ext[n].new_start);
+		if (error != 0)
+			goto out;
+		ext[n].group = n;
+		n++;
+	}
+	qsort(ext, n, sizeof(*ext), resize_extent_cmp);
+
+	nredirect = 0;
+	group = 0;
+	for (i = 0; i < ml->nmoves; i++) {
+		mv = &ml->moves[i];
+		if (i > 0 && mv->old_fsb != ml->moves[i - 1].old_fsb)
+			group++;
+		o = mv->owner_abs_offset;
+		w = mv->owner_width;
+		/* Last extent starting at or below o. */
+		lo = 0;
+		hi = n;
+		while (lo < hi) {
+			mid = lo + (hi - lo) / 2;
+			if (ext[mid].start <= o)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		if (lo == 0)
+			continue;
+		e = &ext[lo - 1];
+		if (o >= e->end)
+			continue;
+		if (o > UINT64_MAX - w || o + w > e->end) {
+			error = EINVAL;
+			goto out;
+		}
+		if (e->group == group) {
+			resize_vlog(verbose, "plan: owner slot %" PRIu64
+			    " lies inside its own block %" PRIu64 "\n", o,
+			    mv->old_fsb);
+			error = EINVAL;
+			goto out;
+		}
+		if (e->group > group)
+			continue;
+		mv->owner_abs_offset = e->new_start + (o - e->start);
+		nredirect++;
+	}
+	*nredirectp = nredirect;
+out:
+	free(ext);
+	return (error);
+}
+
+/*
+ * Group, validate, check against the disk and redirect a plan.  Nothing
+ * is written.  limit_blocks is the new size in frags when shrinking,
+ * else 0.
+ */
+static int
+resize_plan_finalize(struct resize_move_list *ml, const struct fs *fs,
+    int tfd, uint64_t container_bytes, uint64_t fs_offset,
+    uint64_t limit_blocks, int verbose)
+{
+	size_t nredirect;
+	int error;
+
+	error = resize_group_moves(ml);
+	if (error != 0)
+		return (error);
+	error = resize_plan_validate(ml, fs, limit_blocks, verbose);
+	if (error != 0)
+		return (error);
+	error = resize_plan_check_disk(ml, fs, tfd, container_bytes, fs_offset);
+	if (error != 0)
+		return (error);
+	error = resize_plan_redirect_owners(ml, fs_offset,
+	    (uint32_t)fs->fs_fsize, verbose, &nredirect);
+	if (error != 0)
+		return (error);
+	if (nredirect != 0)
+		resize_vlog(verbose, "plan: %zu owner slot(s) redirected to "
+		    "blocks moved earlier\n", nredirect);
+	return (0);
 }
 
 static int
@@ -1405,6 +1746,15 @@ resize_lbn_bytes(const struct fs *fs, uint64_t inode_size, uint64_t lbn,
 
 	if (fs->fs_bsize <= 0 || fs->fs_fsize <= 0)
 		return (EINVAL);
+	/*
+	 * Like sblksize(): only a direct block can be a fragment run;
+	 * every block mapped through an indirect block is a full block,
+	 * also the last one of the file.
+	 */
+	if (lbn >= NDADDR) {
+		*bytesp = (uint32_t)fs->fs_bsize;
+		return (0);
+	}
 	error = resize_mul_u64(lbn, (uint64_t)fs->fs_bsize, &block_start);
 	if (error != 0)
 		return (error);
@@ -1621,6 +1971,10 @@ resize_pool_alloc_run(struct resize_free_pool *pool, uint64_t nfrags,
 				i += skip - 1;
 				continue;
 			}
+			/* A fragment run never crosses a block boundary. */
+			if (pool->frag > 1 && nfrags < pool->frag &&
+			    (i % pool->frag) + nfrags > pool->frag)
+				continue;
 			ok = 1;
 			for (j = 0; j < nfrags; j++) {
 				if (!resize_bit_is_set(pool->map, i + j)) {
@@ -1734,6 +2088,314 @@ resize_plan_load_ptr(const void *blk, uint32_t width, uint64_t idx,
 	return (0);
 }
 
+/*
+ * Check a plan against the file system as it is on disk now, before
+ * anything is written.  The executor trusts the plan: a destination
+ * that is in use would be overwritten, and a source that is free would
+ * copy garbage and free a fragment twice.  So every source fragment
+ * must be allocated and every destination fragment free in its cg map,
+ * both must lie in the data area of a cg of the current file system and
+ * outside the csum area, and every owner slot must have the pointer
+ * width of the format, lie in an allocated fragment (an inode block or
+ * an indirect block, never a destination) and hold the source address.
+ * The automatic plan passes by construction; a --moves plan is checked
+ * here.  Costs one read per cg and one per owner slot.
+ */
+struct resize_frag_probe {
+	uint64_t fsb;
+	uint64_t nfrags;
+	int kind;
+#define	RESIZE_PROBE_SRC	0
+#define	RESIZE_PROBE_DST	1
+#define	RESIZE_PROBE_OWNER	2
+};
+
+static int
+resize_frag_probe_cmp(const void *a, const void *b)
+{
+	const struct resize_frag_probe *pa = a, *pb = b;
+
+	if (pa->fsb < pb->fsb)
+		return (-1);
+	if (pa->fsb > pb->fsb)
+		return (1);
+	return (pa->kind - pb->kind);
+}
+
+static int
+resize_plan_check_disk(const struct resize_move_list *ml, const struct fs *fs,
+    int tfd, uint64_t container_bytes, uint64_t fs_offset)
+{
+	static const char *what[] = { "source", "destination", "owner slot" };
+	struct resize_frag_probe *pr, *p;
+	const struct resize_move *mv;
+	u_int8_t *cgbuf;
+	struct cg *cgp;
+	uint64_t fs_blocks, cs_start, cs_end, cg_abs, f, rel, rs, re, v64;
+	uint64_t owner_fsb;
+	uint32_t cgx, cur_cg, width, v32;
+	size_t i, n, cgsize;
+	int error, have_cg, is_free;
+
+	if (ml->nmoves == 0)
+		return (0);
+	error = resize_super_size_blocks(fs, &fs_blocks);
+	if (error != 0)
+		return (error);
+	if (fs->fs_cgsize <= 0 || fs->fs_cgsize > MAXBSIZE ||
+	    fs->fs_fpg <= 0 || fs->fs_fsize <= 0 || fs->fs_cssize < 0)
+		return (EINVAL);
+	cgsize = (size_t)fs->fs_cgsize;
+	width = (fs->fs_magic == FS_UFS1_MAGIC) ? 4 : 8;
+	error = resize_super_csaddr_fsb(fs, &cs_start);
+	if (error != 0)
+		return (error);
+	cs_end = cs_start + howmany((uint64_t)fs->fs_cssize,
+	    (uint64_t)fs->fs_fsize);
+	pr = calloc(ml->nmoves, 3 * sizeof(*pr));
+	cgbuf = malloc(cgsize);
+	if (pr == NULL || cgbuf == NULL) {
+		free(pr);
+		free(cgbuf);
+		return (ENOMEM);
+	}
+	n = 0;
+	error = 0;
+	for (i = 0; i < ml->nmoves; i++) {
+		mv = &ml->moves[i];
+		if (mv->owner_width != width ||
+		    mv->owner_abs_offset < fs_offset ||
+		    (mv->owner_abs_offset - fs_offset) % width != 0) {
+			fprintf(stderr, "plan: owner slot %" PRIu64 " of %" PRIu64
+			    " is not a %u-byte pointer slot of this file system\n",
+			    mv->owner_abs_offset, mv->old_fsb, width);
+			error = EINVAL;
+			goto out;
+		}
+		if (width == 4) {
+			error = resize_read_bytes_any(tfd, container_bytes,
+			    mv->owner_abs_offset, &v32, sizeof(v32));
+			v64 = v32;
+		} else
+			error = resize_read_bytes_any(tfd, container_bytes,
+			    mv->owner_abs_offset, &v64, sizeof(v64));
+		if (error != 0)
+			goto out;
+		if (v64 != mv->old_fsb) {
+			fprintf(stderr, "plan: owner slot %" PRIu64 " holds %"
+			    PRIu64 ", not the source %" PRIu64 "\n",
+			    mv->owner_abs_offset, v64, mv->old_fsb);
+			error = EINVAL;
+			goto out;
+		}
+		owner_fsb = (mv->owner_abs_offset - fs_offset) /
+		    (uint64_t)fs->fs_fsize;
+		pr[n].fsb = owner_fsb;
+		pr[n].nfrags = 1;
+		pr[n].kind = RESIZE_PROBE_OWNER;
+		n++;
+		/* One source/destination pair per group. */
+		if (i > 0 && ml->moves[i - 1].old_fsb == mv->old_fsb)
+			continue;
+		pr[n].fsb = mv->old_fsb;
+		pr[n].nfrags = mv->bytes / (uint32_t)fs->fs_fsize;
+		pr[n].kind = RESIZE_PROBE_SRC;
+		n++;
+		pr[n].fsb = mv->new_fsb;
+		pr[n].nfrags = mv->bytes / (uint32_t)fs->fs_fsize;
+		pr[n].kind = RESIZE_PROBE_DST;
+		n++;
+	}
+	qsort(pr, n, sizeof(*pr), resize_frag_probe_cmp);
+
+	have_cg = 0;
+	cur_cg = 0;
+	cgp = (struct cg *)cgbuf;
+	rs = re = 0;
+	for (i = 0; i < n; i++) {
+		p = &pr[i];
+		for (f = p->fsb; f < p->fsb + p->nfrags; f++) {
+			if (f >= fs_blocks) {
+				fprintf(stderr, "plan: %s fragment %" PRIu64
+				    " lies beyond the file system\n",
+				    what[p->kind], f);
+				error = EINVAL;
+				goto out;
+			}
+			if (p->kind != RESIZE_PROBE_OWNER && f >= cs_start &&
+			    f < cs_end) {
+				fprintf(stderr, "plan: %s fragment %" PRIu64
+				    " lies in the cylinder group summary area\n",
+				    what[p->kind], f);
+				error = EINVAL;
+				goto out;
+			}
+			cgx = (uint32_t)dtog(fs, f);
+			if (!have_cg || cgx != cur_cg) {
+				error = resize_fs_abs_for_fsb(fs_offset,
+				    (uint32_t)fs->fs_fsize, (uint64_t)cgtod(fs, cgx),
+				    cgsize, container_bytes, &cg_abs);
+				if (error == 0)
+					error = resize_read_bytes_any(tfd,
+					    container_bytes, cg_abs, cgbuf, cgsize);
+				if (error == 0 && !cg_chkmagic(cgp))
+					error = EINVAL;
+				if (error == 0)
+					error = resize_cg_reserved_range_frag(fs, cgx,
+					    &rs, &re);
+				if (error != 0)
+					goto out;
+				have_cg = 1;
+				cur_cg = cgx;
+			}
+			rel = (uint64_t)dtogd(fs, f);
+			if (rel >= (uint64_t)cgp->cg_ndblk ||
+			    (p->kind != RESIZE_PROBE_OWNER && rel >= rs &&
+			    rel < re)) {
+				fprintf(stderr, "plan: %s fragment %" PRIu64
+				    " is not in the data area of cg %u\n",
+				    what[p->kind], f, cgx);
+				error = EINVAL;
+				goto out;
+			}
+			is_free = resize_bit_is_set(cg_blksfree(cgp), rel);
+			if (is_free != (p->kind == RESIZE_PROBE_DST)) {
+				fprintf(stderr, "plan: %s fragment %" PRIu64
+				    " is %s\n", what[p->kind], f, is_free ?
+				    "free" : "in use");
+				error = EINVAL;
+				goto out;
+			}
+		}
+	}
+out:
+	free(cgbuf);
+	free(pr);
+	return (error);
+}
+
+static int
+resize_u64_pair_cmp(const void *a, const void *b)
+{
+	const uint64_t *pa = a, *pb = b;
+
+	if (pa[0] < pb[0])
+		return (-1);
+	if (pa[0] > pb[0])
+		return (1);
+	return (0);
+}
+
+/*
+ * A shrink drops everything at or beyond new_blocks.  Before anything
+ * is written, make sure that the plan moves every allocated data
+ * fragment there: a fragment the plan leaves behind would be lost (a
+ * --moves plan that misses a block, or data the planner does not know
+ * about).  The cg metadata of a removed cg is not data; used inodes in
+ * it are remapped or the shrink was already refused.  The csum area
+ * must lie below new_blocks.
+ */
+static int
+resize_plan_check_coverage(const struct resize_move_list *ml,
+    const struct fs *fs, int tfd, uint64_t container_bytes,
+    uint64_t fs_offset, uint64_t new_blocks)
+{
+	u_int8_t *cgbuf, *bfree;
+	struct cg *cgp;
+	uint64_t *src, fs_blocks, cs_start, cs_end, cg_abs, base, f, rel;
+	uint64_t rs, re, nleft;
+	size_t i, n, lo, hi, mid;
+	uint32_t cgx;
+	int error;
+
+	error = resize_super_size_blocks(fs, &fs_blocks);
+	if (error != 0)
+		return (error);
+	if (new_blocks >= fs_blocks)
+		return (0);
+	if (fs->fs_cgsize <= 0 || fs->fs_cgsize > MAXBSIZE ||
+	    fs->fs_fpg <= 0 || fs->fs_fsize <= 0 || fs->fs_cssize < 0)
+		return (EINVAL);
+	error = resize_super_csaddr_fsb(fs, &cs_start);
+	if (error != 0)
+		return (error);
+	cs_end = cs_start + howmany((uint64_t)fs->fs_cssize,
+	    (uint64_t)fs->fs_fsize);
+	if (cs_end > new_blocks) {
+		fprintf(stderr, "the cylinder group summary area (frags %"
+		    PRIu64 "..%" PRIu64 ") does not lie below the new size; "
+		    "relocating it is not supported\n", cs_start, cs_end - 1);
+		return (EINVAL);
+	}
+	src = calloc(ml->nmoves + 1, 2 * sizeof(*src));
+	cgbuf = malloc((size_t)fs->fs_cgsize);
+	if (src == NULL || cgbuf == NULL) {
+		free(src);
+		free(cgbuf);
+		return (ENOMEM);
+	}
+	n = 0;
+	for (i = 0; i < ml->nmoves; i++) {
+		if (i > 0 && ml->moves[i - 1].old_fsb == ml->moves[i].old_fsb)
+			continue;
+		src[2 * n] = ml->moves[i].old_fsb;
+		src[2 * n + 1] = ml->moves[i].old_fsb +
+		    ml->moves[i].bytes / (uint32_t)fs->fs_fsize;
+		n++;
+	}
+	qsort(src, n, 2 * sizeof(*src), resize_u64_pair_cmp);
+	cgp = (struct cg *)cgbuf;
+	nleft = 0;
+	for (cgx = (uint32_t)dtog(fs, new_blocks); cgx < (uint32_t)fs->fs_ncg;
+	    cgx++) {
+		error = resize_fs_abs_for_fsb(fs_offset, (uint32_t)fs->fs_fsize,
+		    (uint64_t)cgtod(fs, cgx), (size_t)fs->fs_cgsize,
+		    container_bytes, &cg_abs);
+		if (error == 0)
+			error = resize_read_bytes_any(tfd, container_bytes,
+			    cg_abs, cgbuf, (size_t)fs->fs_cgsize);
+		if (error == 0 && !cg_chkmagic(cgp))
+			error = EINVAL;
+		if (error == 0)
+			error = resize_cg_reserved_range_frag(fs, cgx, &rs, &re);
+		if (error != 0)
+			goto out;
+		base = (uint64_t)cgbase(fs, cgx);
+		bfree = cg_blksfree(cgp);
+		for (rel = 0; rel < (uint64_t)cgp->cg_ndblk; rel++) {
+			f = base + rel;
+			if (f < new_blocks || (rel >= rs && rel < re) ||
+			    resize_bit_is_set(bfree, rel))
+				continue;
+			/* Last source extent starting at or below f. */
+			lo = 0;
+			hi = n;
+			while (lo < hi) {
+				mid = lo + (hi - lo) / 2;
+				if (src[2 * mid] <= f)
+					lo = mid + 1;
+				else
+					hi = mid;
+			}
+			if (lo > 0 && f < src[2 * (lo - 1) + 1])
+				continue;
+			if (nleft++ < 10)
+				fprintf(stderr, "allocated fragment %" PRIu64
+				    " beyond the new size is not moved by the "
+				    "plan\n", f);
+		}
+	}
+	if (nleft != 0) {
+		fprintf(stderr, "%" PRIu64 " allocated fragment(s) beyond the "
+		    "new size would be lost\n", nleft);
+		error = EINVAL;
+	}
+out:
+	free(cgbuf);
+	free(src);
+	return (error);
+}
+
 static int
 resize_plan_inode_has_blocks(const struct resize_plan_ctx *pc, uint16_t mode,
     uint64_t size)
@@ -1743,7 +2405,12 @@ resize_plan_inode_has_blocks(const struct resize_plan_ctx *pc, uint16_t mode,
 	case IFDIR:
 		return (1);
 	case IFLNK:
-		return (size > pc->maxsymlinklen);
+		/*
+		 * The kernel keeps a symlink in the inode only when it is
+		 * shorter than fs_maxsymlinklen (ufs_symlink), and fsck uses
+		 * the same rule: a link of exactly that length has a block.
+		 */
+		return (size >= pc->maxsymlinklen);
 	default:
 		return (0);
 	}
@@ -1801,6 +2468,7 @@ resize_plan_read_inode(const struct resize_plan_ctx *pc, uint64_t ino,
 		memcpy(&di1, blk + idx_off, sizeof(di1));
 		iv->mode = di1.di_mode;
 		iv->size = di1.di_size;
+		iv->has_ext = 0;
 		if (resize_plan_inode_has_blocks(pc, iv->mode, iv->size)) {
 			for (i = 0; i < NDADDR; i++) {
 				if (di1.di_db[i] < 0) {
@@ -1824,6 +2492,10 @@ resize_plan_read_inode(const struct resize_plan_ctx *pc, uint64_t ino,
 		memcpy(&di2, blk + idx_off, sizeof(di2));
 		iv->mode = di2.di_mode;
 		iv->size = di2.di_size;
+		iv->has_ext = (di2.di_extsize != 0);
+		for (i = 0; i < NXADDR; i++)
+			if (di2.di_extb[i] != 0)
+				iv->has_ext = 1;
 		if (resize_plan_inode_has_blocks(pc, iv->mode, iv->size)) {
 			for (i = 0; i < NDADDR; i++) {
 				if (di2.di_db[i] < 0) {
@@ -2217,13 +2889,20 @@ resize_plan_add_move(struct resize_plan_ctx *pc, struct resize_move_list *ml,
 	size_t i;
 	int error;
 
-	if (old_fsb < pc->new_blocks || old_fsb >= pc->old_blocks)
+	if (old_fsb >= pc->old_blocks)
 		return (0);
 	if (bytes == 0 || bytes % pc->fs_fsize != 0)
 		return (EINVAL);
 	nfrags = (uint64_t)bytes / pc->fs_fsize;
 	if (nfrags == 0)
 		return (EINVAL);
+	/*
+	 * A block or fragment run that ends beyond the new size moves, also
+	 * when it starts below it (the new size need not be a multiple of
+	 * the block size).
+	 */
+	if (old_fsb + nfrags <= pc->new_blocks)
+		return (0);
 	align = (bytes == pc->fs_bsize) ? pc->fs->fs_frag : 1;
 
 	for (i = 0; i < ml->nmoves; i++) {
@@ -2399,6 +3078,16 @@ resize_plan_scan_inode(struct resize_plan_ctx *pc, struct resize_move_list *ml,
 	if (error != 0)
 		return (resize_plan_error(pc, "scan-inode/read-inode", error, ino,
 		    0));
+	if (iv.has_ext) {
+		/*
+		 * OpenBSD never allocates them, but an FFS2 file system made
+		 * elsewhere may have them.  The planner does not follow
+		 * di_extb, so refuse rather than leave them behind.
+		 */
+		fprintf(stderr, "inode %" PRIu64 " has extended attribute "
+		    "data, which resize_ffs cannot relocate\n", ino);
+		return (EOPNOTSUPP);
+	}
 	if (!resize_plan_inode_has_blocks(pc, iv.mode, iv.size))
 		return (0);
 
@@ -2515,6 +3204,7 @@ resize_plan_build_free_pool(struct resize_plan_ctx *pc)
 	error = resize_pool_init(&pc->pool, pc->new_blocks);
 	if (error != 0)
 		return (error);
+	pc->pool.frag = (uint64_t)pc->fs->fs_frag;
 	for (cgx = 0; cgx < pc->fs->fs_ncg; cgx++) {
 		error = resize_plan_read_cg(pc, (uint32_t)cgx, &cgbuf, &cgp);
 		if (error != 0)
@@ -2784,8 +3474,10 @@ resize_rewrite_dirs_for_inode_remap(struct resize_plan_ctx *pc,
 			if (resize_ino_remap_has_old(rm, ino))
 				continue;
 			error = resize_plan_read_inode(pc, ino, &ino_abs, &iv);
-			if (error != 0)
-				continue;
+			if (error != 0) {
+				free(cgbuf);
+				return (error);
+			}
 			if ((iv.mode & IFMT) != IFDIR)
 				continue;
 			dctx.remaining_bytes = iv.size;
@@ -2807,6 +3499,106 @@ resize_rewrite_dirs_for_inode_remap(struct resize_plan_ctx *pc,
 	return (0);
 }
 
+/*
+ * FFS2 initializes inode blocks lazily: inodes at or beyond
+ * cg_initediblk have never been written, fsck_ffs treats them as
+ * unallocated and the kernel zeroes their block the next time it
+ * extends cg_initediblk (ffs_nodealloccg).  Before an inode beyond
+ * cg_initediblk is used, initialize the inode blocks up to and
+ * including the one that holds it the way the kernel does (zeroed, each
+ * dinode with a non-zero di_gen) and raise cg_initediblk.  The blocks
+ * are on disk before the cg says they are initialized.  Idempotent.
+ */
+static int
+resize_inode_ensure_initialized(const struct resize_plan_ctx *pc,
+    ufsino_t ino)
+{
+	u_int8_t *cgbuf, *blk;
+	struct cg *cgp;
+	struct ufs2_dinode *dp2;
+	uint64_t cg_abs, blk_abs, idx, inopb;
+	uint32_t cgx, initedi, niblk, i;
+	int error, changed;
+
+	if (pc->fs->fs_magic != FS_UFS2_MAGIC)
+		return (0);
+	inopb = (uint64_t)INOPB(pc->fs);
+	if (inopb == 0)
+		return (EINVAL);
+	cgx = (uint32_t)ino_to_cg(pc->fs, ino);
+	idx = (uint64_t)(ino % pc->fs->fs_ipg);
+	error = resize_cg_read_abs(pc, cgx, &cgbuf, &cgp, &cg_abs);
+	if (error != 0)
+		return (error);
+	initedi = cgp->cg_initediblk;
+	niblk = cgp->cg_ffs2_niblk;
+	if (idx < initedi) {
+		free(cgbuf);
+		return (0);
+	}
+	if (niblk > (uint32_t)pc->fs->fs_ipg || idx >= niblk ||
+	    initedi % inopb != 0) {
+		free(cgbuf);
+		return (EINVAL);
+	}
+	blk = malloc(pc->fs_bsize);
+	if (blk == NULL) {
+		free(cgbuf);
+		return (ENOMEM);
+	}
+	changed = 0;
+	error = 0;
+	while (idx >= initedi && initedi < niblk) {
+		memset(blk, 0, pc->fs_bsize);
+		dp2 = (struct ufs2_dinode *)blk;
+		for (i = 0; i < inopb; i++, dp2++) {
+			while (dp2->di_gen == 0)
+				dp2->di_gen = arc4random();
+		}
+		error = resize_inode_locate(pc,
+		    (ufsino_t)((uint64_t)cgx * pc->fs->fs_ipg + initedi), NULL,
+		    &blk_abs, NULL, NULL);
+		if (error != 0)
+			break;
+		error = resize_write_bytes_any(pc->tfd, pc->container_bytes,
+		    blk_abs, blk, pc->fs_bsize);
+		if (error != 0)
+			break;
+		initedi += (uint32_t)inopb;
+		changed = 1;
+	}
+	free(blk);
+	if (error == 0 && changed) {
+		if (fsync(pc->tfd) == -1)
+			error = errno;
+	}
+	if (error == 0 && changed) {
+		cgp->cg_initediblk = initedi;
+		error = resize_write_bytes_any(pc->tfd, pc->container_bytes,
+		    cg_abs, cgbuf, (size_t)pc->fs->fs_cgsize);
+	}
+	free(cgbuf);
+	if (error == 0 && idx >= initedi)
+		error = EINVAL;
+	return (error);
+}
+
+/*
+ * Move each inode rm->ents[i].old_ino to rm->ents[i].new_ino:
+ *
+ *  1. copy the dinode to new_ino (initializing its FFS2 inode block
+ *     first) and mark new_ino allocated;
+ *  2. rewrite every directory entry for old_ino to new_ino;
+ *  3. mark old_ino free, then zero it.
+ *
+ * Every step is idempotent and decides from the on-disk state, so a
+ * crash at any point is repaired by running the whole function again
+ * (journal replay of an inode-remap-exec intent).  new_ino is free
+ * before the remap, so "new_ino allocated" means step 1 is done for
+ * that entry.  The inverse map (new_ino -> old_ino) undoes a complete
+ * or partial remap with the same function, which is how --revert
+ * handles it.
+ */
 static int
 resize_apply_inode_remap(struct resize_plan_ctx *pc, struct resize_super *sb,
     const struct resize_ino_remap *rm)
@@ -2826,35 +3618,36 @@ resize_apply_inode_remap(struct resize_plan_ctx *pc, struct resize_super *sb,
 		return (ENOMEM);
 
 	for (i = 0; i < rm->nent; i++) {
-		error = resize_inode_is_allocated(pc, rm->ents[i].old_ino,
-		    &old_alloc);
-		if (error != 0)
-			goto out;
 		error = resize_inode_is_allocated(pc, rm->ents[i].new_ino,
 		    &new_alloc);
 		if (error != 0)
 			goto out;
-		if (!old_alloc && new_alloc)
+		if (new_alloc)
 			continue;
-		if (!old_alloc && !new_alloc) {
+		error = resize_inode_is_allocated(pc, rm->ents[i].old_ino,
+		    &old_alloc);
+		if (error != 0)
+			goto out;
+		if (!old_alloc) {
 			error = EINVAL;
 			goto out;
 		}
-		if (!new_alloc) {
-			error = resize_inode_read_raw(pc, rm->ents[i].old_ino, raw);
-			if (error != 0)
-				goto out;
-			error = resize_inode_raw_is_dir(pc, raw, &is_dir);
-			if (error != 0)
-				goto out;
-			error = resize_inode_write_raw(pc, rm->ents[i].new_ino, raw);
-			if (error != 0)
-				goto out;
-			error = resize_inode_bitmap_flip(pc, rm->ents[i].new_ino, 1,
-			    is_dir);
-			if (error != 0 && error != EEXIST)
-				goto out;
-		}
+		error = resize_inode_read_raw(pc, rm->ents[i].old_ino, raw);
+		if (error != 0)
+			goto out;
+		error = resize_inode_raw_is_dir(pc, raw, &is_dir);
+		if (error != 0)
+			goto out;
+		error = resize_inode_ensure_initialized(pc, rm->ents[i].new_ino);
+		if (error != 0)
+			goto out;
+		error = resize_inode_write_raw(pc, rm->ents[i].new_ino, raw);
+		if (error != 0)
+			goto out;
+		error = resize_inode_bitmap_flip(pc, rm->ents[i].new_ino, 1,
+		    is_dir);
+		if (error != 0)
+			goto out;
 	}
 
 	error = resize_rewrite_dirs_for_inode_remap(pc, rm);
@@ -2862,23 +3655,25 @@ resize_apply_inode_remap(struct resize_plan_ctx *pc, struct resize_super *sb,
 		goto out;
 
 	for (i = 0; i < rm->nent; i++) {
-		error = resize_inode_is_allocated(pc, rm->ents[i].old_ino,
-		    &old_alloc);
-		if (error != 0)
-			goto out;
-		if (!old_alloc)
-			continue;
-		error = resize_inode_read_raw(pc, rm->ents[i].old_ino, raw);
+		/* The copy tells whether the inode is a directory. */
+		error = resize_inode_read_raw(pc, rm->ents[i].new_ino, raw);
 		if (error != 0)
 			goto out;
 		error = resize_inode_raw_is_dir(pc, raw, &is_dir);
 		if (error != 0)
 			goto out;
-		error = resize_inode_zero_raw(pc, rm->ents[i].old_ino);
+		error = resize_inode_is_allocated(pc, rm->ents[i].old_ino,
+		    &old_alloc);
 		if (error != 0)
 			goto out;
-		error = resize_inode_bitmap_flip(pc, rm->ents[i].old_ino, 0, is_dir);
-		if (error != 0 && error != ENOENT)
+		if (old_alloc) {
+			error = resize_inode_bitmap_flip(pc,
+			    rm->ents[i].old_ino, 0, is_dir);
+			if (error != 0)
+				goto out;
+		}
+		error = resize_inode_zero_raw(pc, rm->ents[i].old_ino);
+		if (error != 0)
 			goto out;
 	}
 
@@ -2925,11 +3720,11 @@ resize_plan_ctx_init_from_super(struct resize_plan_ctx *pc, int tfd,
 	if (fs->fs_magic == FS_UFS1_MAGIC) {
 		pc->ptr_width = 4;
 		pc->inode_size = sizeof(struct ufs1_dinode);
-		pc->maxsymlinklen = MAXSYMLINKLEN_UFS1;
+		pc->maxsymlinklen = (uint32_t)fs->fs_maxsymlinklen;
 	} else {
 		pc->ptr_width = 8;
 		pc->inode_size = sizeof(struct ufs2_dinode);
-		pc->maxsymlinklen = MAXSYMLINKLEN_UFS2;
+		pc->maxsymlinklen = (uint32_t)fs->fs_maxsymlinklen;
 	}
 	return (0);
 }
@@ -2963,11 +3758,11 @@ resize_plan_auto_shrink_end(int tfd, uint64_t container_bytes,
 	if (fs->fs_magic == FS_UFS1_MAGIC) {
 		pc.ptr_width = 4;
 		pc.inode_size = sizeof(struct ufs1_dinode);
-		pc.maxsymlinklen = MAXSYMLINKLEN_UFS1;
+		pc.maxsymlinklen = (uint32_t)fs->fs_maxsymlinklen;
 	} else if (fs->fs_magic == FS_UFS2_MAGIC) {
 		pc.ptr_width = 8;
 		pc.inode_size = sizeof(struct ufs2_dinode);
-		pc.maxsymlinklen = MAXSYMLINKLEN_UFS2;
+		pc.maxsymlinklen = (uint32_t)fs->fs_maxsymlinklen;
 	} else {
 		return (EINVAL);
 	}
@@ -3003,7 +3798,7 @@ resize_journal_write_header(struct resize_journal *jr)
 
 static int
 resize_journal_create(const char *path, uint64_t fs_offset, uint64_t old_size,
-    uint64_t new_size, uint64_t sb_rel, uint32_t fs_fsize,
+    uint64_t new_size, uint64_t sb_rel, uint32_t fs_fsize, uint64_t flags,
     struct resize_journal *jr)
 {
 	struct timespec ts;
@@ -3029,6 +3824,7 @@ resize_journal_create(const char *path, uint64_t fs_offset, uint64_t old_size,
 	jr->hdr.fs_fsize = fs_fsize;
 	jr->hdr.phase = RESIZE_PHASE_PLANNED;
 	jr->hdr.next_seq = 1;
+	jr->hdr.reserved[RESIZE_JHDR_FLAGS] = flags;
 
 	error = resize_journal_write_header(jr);
 	if (error != 0) {
@@ -3211,6 +4007,7 @@ resize_journal_reset(struct resize_journal *jr)
 
 	if (ftruncate(jr->fd, (off_t)sizeof(jr->hdr)) == -1)
 		return (errno);
+	jr->hdr.reserved[RESIZE_JHDR_FLAGS] &= ~RESIZE_JF_WASCLEAN;
 	jr->hdr.phase = RESIZE_PHASE_PLANNED;
 	jr->hdr.next_seq = 1;
 	error = resize_journal_write_header(jr);
@@ -3227,18 +4024,52 @@ resize_journal_close(struct resize_journal *jr)
 	jr->fd = -1;
 }
 
+/*
+ * The allocation cache is indexed by a hash table; a linear search made
+ * large relocations quadratic (REVIEW3 m2).
+ */
+static size_t
+resize_alloc_hash(uint64_t fsb, size_t hcap)
+{
+	fsb *= 0x9e3779b97f4a7c15ULL;
+	return ((size_t)(fsb >> 32) & (hcap - 1));
+}
+
 static int
 resize_alloc_find(struct resize_alloc_map *amap, uint64_t fsb, size_t *idxp)
 {
-	size_t i;
+	size_t h, idx;
 
-	for (i = 0; i < amap->nent; i++) {
-		if (amap->ents[i].fsb == fsb) {
-			*idxp = i;
+	if (amap->hcap == 0)
+		return (ENOENT);
+	for (h = resize_alloc_hash(fsb, amap->hcap);
+	    (idx = amap->htab[h]) != 0; h = (h + 1) & (amap->hcap - 1)) {
+		if (amap->ents[idx - 1].fsb == fsb) {
+			*idxp = idx - 1;
 			return (0);
 		}
 	}
 	return (ENOENT);
+}
+
+static int
+resize_alloc_rehash(struct resize_alloc_map *amap, size_t hcap)
+{
+	size_t *htab, i, h;
+
+	htab = calloc(hcap, sizeof(*htab));
+	if (htab == NULL)
+		return (ENOMEM);
+	for (i = 0; i < amap->nent; i++) {
+		for (h = resize_alloc_hash(amap->ents[i].fsb, hcap);
+		    htab[h] != 0; h = (h + 1) & (hcap - 1))
+			;
+		htab[h] = i + 1;
+	}
+	free(amap->htab);
+	amap->htab = htab;
+	amap->hcap = hcap;
+	return (0);
 }
 
 static int
@@ -3261,9 +4092,19 @@ resize_alloc_set(struct resize_alloc_map *amap, uint64_t fsb, int allocated)
 		amap->ents = nents;
 		amap->cap = ncap;
 	}
+	if (2 * (amap->nent + 1) >= amap->hcap) {
+		error = resize_alloc_rehash(amap,
+		    amap->hcap == 0 ? 256 : 2 * amap->hcap);
+		if (error != 0)
+			return (error);
+	}
 	amap->ents[amap->nent].fsb = fsb;
 	amap->ents[amap->nent].allocated = allocated;
 	amap->nent++;
+	for (idx = resize_alloc_hash(fsb, amap->hcap); amap->htab[idx] != 0;
+	    idx = (idx + 1) & (amap->hcap - 1))
+		;
+	amap->htab[idx] = amap->nent;
 	return (0);
 }
 
@@ -3290,6 +4131,7 @@ static void
 resize_alloc_free(struct resize_alloc_map *amap)
 {
 	free(amap->ents);
+	free(amap->htab);
 	memset(amap, 0, sizeof(*amap));
 }
 
@@ -3629,12 +4471,18 @@ resize_cg_rebuild_clusters(const struct fs *fs, struct cg *cgp, uint64_t keep)
 	if (ncluster > (uint64_t)maxcluster)
 		return (EINVAL);
 	clbytes = (size_t)howmany(maxcluster, NBBY);
-	sumbytes = ((size_t)fs->fs_contigsumsize + 1) * sizeof(int32_t);
+	/*
+	 * sump[0] is never used: newfs places cg_clustersumoff one int32_t
+	 * before the rounded-up end of the free-block map, so sump[0]
+	 * aliases the last bytes of cg_blksfree.  Only clear sump[1..n],
+	 * like the kernel and fsck_ffs do.
+	 */
+	sumbytes = (size_t)fs->fs_contigsumsize * sizeof(int32_t);
 	clusters = cg_clustersfree(cgp);
 	sump = cg_clustersum(cgp);
 	bfree = cg_blksfree(cgp);
 	memset(clusters, 0, clbytes);
-	memset(sump, 0, sumbytes);
+	memset(&sump[1], 0, sumbytes);
 
 	for (b = 0, cluster = 0; b < keep && cluster < ncluster;
 	    b += (uint64_t)fs->fs_frag, cluster++) {
@@ -3772,19 +4620,19 @@ resize_rt_init_cg(struct resize_runtime *rt, const struct fs *fs,
 		free(buf);
 		return (error);
 	}
-	if (reserve_start > keep)
-		reserve_start = keep;
-	if (reserve_end > keep)
-		reserve_end = keep;
 	error = resize_cg_inode_range_frag(fs, cgx, &inode_start, &inode_end);
 	if (error != 0) {
 		free(buf);
 		return (error);
 	}
-	if (inode_start > keep)
-		inode_start = keep;
-	if (inode_end > keep)
-		inode_end = keep;
+	/*
+	 * The geometry has been fitted before we get here; a cylinder
+	 * group whose metadata does not fit below fs_size is invalid.
+	 */
+	if (reserve_end > keep || inode_end > keep) {
+		free(buf);
+		return (EINVAL);
+	}
 	if (inode_end > inode_start) {
 		error = resize_add_u64(cg_base, inode_start, &zero_start_fsb);
 		if (error != 0) {
@@ -3930,8 +4778,15 @@ resize_rt_update_frag_alloc(struct resize_runtime *rt, uint64_t fsb,
 	return (error);
 }
 
+/*
+ * Recompute cg and global free summaries for the geometry in *sb.
+ * Cylinder groups with index >= first_new_cg did not exist before this
+ * resize and are always initialized from scratch, even if the area holds
+ * a stale cg header with a valid magic number.
+ */
 static int
-resize_recompute_free_summaries(struct resize_runtime *rt, struct resize_super *sb)
+resize_recompute_free_summaries(struct resize_runtime *rt, struct resize_super *sb,
+    uint64_t first_new_cg)
 {
 	struct fs *fs = (struct fs *)sb->raw;
 	u_int8_t *cgbuf, *bfree;
@@ -3975,10 +4830,15 @@ resize_recompute_free_summaries(struct resize_runtime *rt, struct resize_super *
 	tot_nifree = 0;
 	tot_nffree = 0;
 	for (cgx = 0; cgx < fs->fs_ncg; cgx++) {
-		error = resize_rt_read_cg(rt, (uint32_t)cgx, &cgbuf, &cgp,
-		    &cg_abs);
+		if (cgx != 0 && cgx >= first_new_cg)
+			error = resize_rt_init_cg(rt, fs, &refcg, (uint32_t)cgx,
+			    &cgbuf, &cgp, &cg_abs);
+		else
+			error = resize_rt_read_cg(rt, (uint32_t)cgx, &cgbuf,
+			    &cgp, &cg_abs);
 		if (error != 0) {
-			if (error == EINVAL && have_refcg && cgx != 0) {
+			if (error == EINVAL && have_refcg && cgx != 0 &&
+			    cgx < first_new_cg) {
 				error = resize_rt_init_cg(rt, fs, &refcg, (uint32_t)cgx,
 				    &cgbuf, &cgp, &cg_abs);
 			}
@@ -4037,10 +4897,19 @@ resize_recompute_free_summaries(struct resize_runtime *rt, struct resize_super *
 			free(cgbuf);
 			return (error);
 		}
-		if (inode_start > keep)
-			inode_start = keep;
-		if (inode_end > keep)
-			inode_end = keep;
+		error = resize_cg_reserved_range_frag(fs, (uint32_t)cgx,
+		    &reserve_start, &reserve_end);
+		if (error != 0) {
+			free(cgbuf);
+			return (error);
+		}
+		if (reserve_end > keep || inode_end > keep) {
+			free(cgbuf);
+			fprintf(stderr, "cg %" PRIu64 ": metadata (%" PRIu64
+			    " frags) does not fit in %" PRIu64 " frags\n",
+			    cgx, reserve_end, keep);
+			return (EINVAL);
+		}
 		if (keep > old_ndblk && old_ndblk < inode_end) {
 			zero_rel_start = old_ndblk;
 			if (zero_rel_start < inode_start)
@@ -4072,16 +4941,6 @@ resize_recompute_free_summaries(struct resize_runtime *rt, struct resize_super *
 			for (f = old_ndblk; f < keep; f++)
 				resize_bit_set(bfree, f);
 		}
-		error = resize_cg_reserved_range_frag(fs, (uint32_t)cgx,
-		    &reserve_start, &reserve_end);
-		if (error != 0) {
-			free(cgbuf);
-			return (error);
-		}
-		if (reserve_start > keep)
-			reserve_start = keep;
-		if (reserve_end > keep)
-			reserve_end = keep;
 		for (f = reserve_start; f < reserve_end; f++)
 			resize_bit_clear(bfree, f);
 		error = resize_cg_rebuild_clusters(fs, cgp, keep);
@@ -4204,6 +5063,268 @@ resize_invariant_fail(const char *phase, const char *fmt, ...)
 	return (EINVAL);
 }
 
+/*
+ * Block reference check for --check-invariants: every block and
+ * fragment run that a used inode references (data and indirect blocks)
+ * must lie below fs_size, must not cross a block boundary, must be
+ * allocated in its cg bitmap and must not overlap cg metadata, the
+ * summary area or another reference.  This is what catches a relocation
+ * that left a pointer to an old (freed or dropped) location.
+ */
+struct resize_refcheck {
+	const struct resize_plan_ctx *pc;
+	const char *phase;
+	u_int8_t *freemap;	/* set: free in the cg bitmap */
+	u_int8_t *seen;		/* set: metadata or already referenced */
+	uint64_t size;		/* fs_size in frags */
+	uint64_t frag;
+	ufsino_t ino;
+};
+
+static int
+resize_refcheck_extent(struct resize_refcheck *rc, uint64_t fsb,
+    uint64_t nfrags, const char *what)
+{
+	uint64_t f;
+
+	if (nfrags == 0 || fsb >= rc->size || nfrags > rc->size - fsb)
+		return (resize_invariant_fail(rc->phase,
+		    "inode %u: %s block %" PRIu64 " (%" PRIu64
+		    " frags) beyond fs_size %" PRIu64, rc->ino, what, fsb,
+		    nfrags, rc->size));
+	if ((fsb % rc->frag) + nfrags > rc->frag)
+		return (resize_invariant_fail(rc->phase,
+		    "inode %u: %s block %" PRIu64 " (%" PRIu64
+		    " frags) crosses a block boundary", rc->ino, what, fsb,
+		    nfrags));
+	for (f = fsb; f < fsb + nfrags; f++) {
+		if (resize_bit_is_set(rc->freemap, f))
+			return (resize_invariant_fail(rc->phase,
+			    "inode %u: %s block %" PRIu64 " references free "
+			    "frag %" PRIu64, rc->ino, what, fsb, f));
+		if (resize_bit_is_set(rc->seen, f))
+			return (resize_invariant_fail(rc->phase,
+			    "inode %u: %s block %" PRIu64 " references frag %"
+			    PRIu64 " that is metadata or referenced twice",
+			    rc->ino, what, fsb, f));
+		resize_bit_set(rc->seen, f);
+	}
+	return (0);
+}
+
+static int
+resize_refcheck_indirect(struct resize_refcheck *rc, uint64_t ptr_fsb,
+    int level, uint64_t base_lbn, uint64_t need_data_blks, uint64_t isize)
+{
+	const struct resize_plan_ctx *pc = rc->pc;
+	u_int8_t *blk;
+	uint64_t nindir, subcover, entries, i, child_need, child_ptr, v, abs;
+	uint32_t bytes;
+	int j, error;
+
+	error = resize_refcheck_extent(rc, ptr_fsb, rc->frag, "indirect");
+	if (error != 0)
+		return (error);
+	blk = malloc(pc->fs_bsize);
+	if (blk == NULL)
+		return (ENOMEM);
+	error = resize_fs_abs_for_fsb(pc->fs_offset, pc->fs_fsize, ptr_fsb,
+	    pc->fs_bsize, pc->container_bytes, &abs);
+	if (error == 0)
+		error = resize_read_bytes_any(pc->tfd, pc->container_bytes, abs,
+		    blk, pc->fs_bsize);
+	if (error != 0)
+		goto out;
+	nindir = (uint64_t)NINDIR(pc->fs);
+	subcover = 1;
+	for (j = 1; j < level; j++) {
+		if (subcover > UINT64_MAX / nindir) {
+			subcover = UINT64_MAX;
+			break;
+		}
+		subcover *= nindir;
+	}
+	error = resize_div_round_up_u64(need_data_blks, subcover, &entries);
+	if (error != 0)
+		goto out;
+	entries = resize_u64_min(entries, nindir);
+	for (i = 0; i < entries; i++) {
+		error = resize_plan_load_ptr(blk, pc->ptr_width, i, &child_ptr);
+		if (error != 0) {
+			error = resize_invariant_fail(rc->phase,
+			    "inode %u: negative pointer in indirect block %"
+			    PRIu64, rc->ino, ptr_fsb);
+			goto out;
+		}
+		if (child_ptr == 0)
+			continue;
+		error = resize_mul_u64(i, subcover, &v);
+		if (error != 0)
+			goto out;
+		if (v >= need_data_blks)
+			break;
+		child_need = resize_u64_min(subcover, need_data_blks - v);
+		if (level == 1) {
+			error = resize_lbn_bytes(pc->fs, isize, base_lbn + i,
+			    &bytes);
+			if (error == 0)
+				error = resize_refcheck_extent(rc, child_ptr,
+				    bytes / pc->fs_fsize, "data");
+		} else {
+			error = resize_refcheck_indirect(rc, child_ptr,
+			    level - 1, base_lbn + v, child_need, isize);
+		}
+		if (error != 0)
+			goto out;
+	}
+out:
+	free(blk);
+	return (error);
+}
+
+static int
+resize_refcheck_inode(struct resize_refcheck *rc, ufsino_t ino)
+{
+	const struct resize_plan_ctx *pc = rc->pc;
+	struct resize_inode_view iv;
+	uint64_t inode_abs, nblks, remaining, nindir, cover, need, base_lbn;
+	uint32_t bytes;
+	int level, i, j, error;
+
+	rc->ino = ino;
+	memset(&iv, 0, sizeof(iv));
+	error = resize_plan_read_inode(pc, ino, &inode_abs, &iv);
+	if (error == EINVAL)
+		return (resize_invariant_fail(rc->phase,
+		    "inode %u: negative block pointer", ino));
+	if (error != 0)
+		return (error);
+	if (!resize_plan_inode_has_blocks(pc, iv.mode, iv.size))
+		return (0);
+	error = resize_div_round_up_u64(iv.size, pc->fs_bsize, &nblks);
+	if (error != 0)
+		return (error);
+	for (i = 0; i < NDADDR && (uint64_t)i < nblks; i++) {
+		if (iv.db[i] == 0)
+			continue;
+		error = resize_lbn_bytes(pc->fs, iv.size, (uint64_t)i, &bytes);
+		if (error == 0)
+			error = resize_refcheck_extent(rc, iv.db[i],
+			    bytes / pc->fs_fsize, "data");
+		if (error != 0)
+			return (error);
+	}
+	if (nblks <= NDADDR)
+		return (0);
+	remaining = nblks - NDADDR;
+	nindir = (uint64_t)NINDIR(pc->fs);
+	base_lbn = NDADDR;
+	for (level = 1; level <= NIADDR && remaining != 0; level++) {
+		cover = 1;
+		for (j = 0; j < level; j++) {
+			if (cover > UINT64_MAX / nindir) {
+				cover = UINT64_MAX;
+				break;
+			}
+			cover *= nindir;
+		}
+		need = resize_u64_min(remaining, cover);
+		if (iv.ib[level - 1] != 0) {
+			error = resize_refcheck_indirect(rc, iv.ib[level - 1],
+			    level, base_lbn, need, iv.size);
+			if (error != 0)
+				return (error);
+		}
+		remaining -= need;
+		if (cover == UINT64_MAX || base_lbn > UINT64_MAX - cover)
+			break;
+		base_lbn += cover;
+	}
+	return (0);
+}
+
+static int
+resize_check_block_refs(struct resize_runtime *rt, struct resize_super *sb,
+    const struct resize_plan_ctx *pc, const char *phase)
+{
+	struct fs *fs = (struct fs *)sb->raw;
+	struct resize_refcheck rc;
+	u_int8_t *cgbuf, *bfree, *imap;
+	struct cg *cgp;
+	uint64_t cg_abs, cgx, cg_base, keep, f, nbytes, start, end;
+	uint64_t csaddr, csfrags, ino;
+	int error;
+
+	memset(&rc, 0, sizeof(rc));
+	rc.pc = pc;
+	rc.phase = phase;
+	rc.size = (uint64_t)fs->fs_size;
+	rc.frag = (uint64_t)fs->fs_frag;
+	if (rc.size == 0 || rc.size > SIZE_MAX - NBBY)
+		return (EINVAL);
+	nbytes = (rc.size + NBBY - 1) / NBBY;
+	rc.freemap = calloc(1, (size_t)nbytes);
+	rc.seen = calloc(1, (size_t)nbytes);
+	if (rc.freemap == NULL || rc.seen == NULL) {
+		error = ENOMEM;
+		goto out;
+	}
+	error = resize_super_csaddr_fsb(fs, &csaddr);
+	if (error != 0)
+		goto out;
+	csfrags = howmany((uint64_t)fs->fs_cssize, (uint64_t)fs->fs_fsize);
+	for (f = csaddr; f < csaddr + csfrags && f < rc.size; f++)
+		resize_bit_set(rc.seen, f);
+	for (cgx = 0; cgx < (uint64_t)fs->fs_ncg; cgx++) {
+		cg_base = cgx * (uint64_t)fs->fs_fpg;
+		keep = resize_u64_min(rc.size - cg_base, (uint64_t)fs->fs_fpg);
+		error = resize_cg_reserved_range_frag(fs, (uint32_t)cgx,
+		    &start, &end);
+		if (error != 0)
+			goto out;
+		for (f = start; f < end && f < keep; f++)
+			resize_bit_set(rc.seen, cg_base + f);
+		error = resize_rt_read_cg(rt, (uint32_t)cgx, &cgbuf, &cgp,
+		    &cg_abs);
+		if (error != 0)
+			goto out;
+		bfree = cg_blksfree(cgp);
+		for (f = 0; f < keep; f++) {
+			if (resize_bit_is_set(bfree, f))
+				resize_bit_set(rc.freemap, cg_base + f);
+		}
+		free(cgbuf);
+	}
+	for (cgx = 0; cgx < (uint64_t)fs->fs_ncg; cgx++) {
+		error = resize_rt_read_cg(rt, (uint32_t)cgx, &cgbuf, &cgp,
+		    &cg_abs);
+		if (error != 0)
+			goto out;
+		imap = cg_inosused(cgp);
+		for (f = 0; f < (uint64_t)fs->fs_ipg; f++) {
+			if (!resize_bit_is_set(imap, f))
+				continue;
+			ino = cgx * (uint64_t)fs->fs_ipg + f;
+			if (ino < ROOTINO)
+				continue;
+			if (ino > UINT32_MAX) {
+				error = EOVERFLOW;
+				break;
+			}
+			error = resize_refcheck_inode(&rc, (ufsino_t)ino);
+			if (error != 0)
+				break;
+		}
+		free(cgbuf);
+		if (error != 0)
+			goto out;
+	}
+out:
+	free(rc.freemap);
+	free(rc.seen);
+	return (error);
+}
+
 static int
 resize_check_super_replicas(struct resize_runtime *rt, struct resize_super *sb,
     const char *phase)
@@ -4281,6 +5402,7 @@ resize_check_invariants(struct resize_runtime *rt, struct resize_super *sb,
 	uint64_t b, lim, f, run;
 	uint64_t used_inodes, dir_inodes;
 	uint64_t want_nclusterblks;
+	uint64_t size_blocks, want_ncg, fs_end, meta_start, meta_end;
 	int64_t tot_ndir, tot_nbfree, tot_nifree, tot_nffree;
 	int64_t cg_nbfree, cg_nffree, expect_nifree;
 	int64_t have_nbfree, have_nffree, have_nifree, have_ndir;
@@ -4349,6 +5471,35 @@ resize_check_invariants(struct resize_runtime *rt, struct resize_super *sb,
 	if (error != 0)
 		return (error);
 
+	/* Geometry: cg count, summary area and container bounds. */
+	error = resize_super_size_blocks(fs, &size_blocks);
+	if (error != 0)
+		return (resize_invariant_fail(phase, "invalid fs_size"));
+	error = resize_div_round_up_u64(size_blocks, (uint64_t)fs->fs_fpg,
+	    &want_ncg);
+	if (error != 0)
+		return (error);
+	if (want_ncg != (uint64_t)fs->fs_ncg)
+		return (resize_invariant_fail(phase,
+		    "fs_ncg=%d does not match fs_size=%" PRIu64
+		    " fs_fpg=%d (want %" PRIu64 ")", fs->fs_ncg, size_blocks,
+		    fs->fs_fpg, want_ncg));
+	if (fs->fs_cssize <= 0 || roundup((uint64_t)fs->fs_ncg *
+	    sizeof(struct csum), (uint64_t)fs->fs_fsize) >
+	    (uint64_t)fs->fs_cssize)
+		return (resize_invariant_fail(phase,
+		    "fs_cssize=%d too small for fs_ncg=%d", fs->fs_cssize,
+		    fs->fs_ncg));
+	error = resize_mul_u64(size_blocks, (uint64_t)fs->fs_fsize, &fs_end);
+	if (error == 0)
+		error = resize_add_u64(rt->fs_offset, fs_end, &fs_end);
+	if (error != 0)
+		return (error);
+	if (fs_end > rt->container_bytes)
+		return (resize_invariant_fail(phase,
+		    "fs end %" PRIu64 " beyond container %" PRIu64, fs_end,
+		    rt->container_bytes));
+
 	tot_ndir = 0;
 	tot_nbfree = 0;
 	tot_nifree = 0;
@@ -4371,6 +5522,24 @@ resize_check_invariants(struct resize_runtime *rt, struct resize_super *sb,
 		} else {
 			rem = (uint64_t)fs->fs_size - cg_base;
 			keep = resize_u64_min(rem, (uint64_t)fs->fs_fpg);
+		}
+		/*
+		 * The superblock copy, cg block and the whole inode table
+		 * of every cg must lie below fs_size.
+		 */
+		error = resize_cg_reserved_range_frag(fs, (uint32_t)cgx,
+		    &meta_start, &meta_end);
+		if (error != 0) {
+			free(cgbuf);
+			return (resize_invariant_fail(phase,
+			    "invalid cg layout cg=%" PRIu64, cgx));
+		}
+		if (meta_end > keep) {
+			free(cgbuf);
+			return (resize_invariant_fail(phase,
+			    "cg metadata beyond fs_size cg=%" PRIu64
+			    " cgdmin=%" PRIu64 " fs_size=%" PRIu64, cgx,
+			    cg_base + meta_end, (uint64_t)fs->fs_size));
 		}
 			if (cgp->cg_ndblk != keep) {
 				cg_ndblk = cgp->cg_ndblk;
@@ -4554,6 +5723,19 @@ resize_check_invariants(struct resize_runtime *rt, struct resize_super *sb,
 			if (!resize_bit_is_set(imap, f))
 				continue;
 			used_inodes++;
+			/*
+			 * FFS2: fsck_ffs and the kernel treat inodes at or
+			 * beyond cg_initediblk as never initialized.
+			 */
+			if (fs->fs_magic == FS_UFS2_MAGIC &&
+			    f >= (uint64_t)cgp->cg_initediblk) {
+				cg_u32 = cgp->cg_initediblk;
+				free(cgbuf);
+				return (resize_invariant_fail(phase,
+				    "used inode %" PRIu64 " beyond "
+				    "cg_initediblk=%u cg=%" PRIu64,
+				    ino_base + f, cg_u32, cgx));
+			}
 			if (ino_base + f > UINT32_MAX) {
 				free(cgbuf);
 				return (EOVERFLOW);
@@ -4651,6 +5833,9 @@ resize_check_invariants(struct resize_runtime *rt, struct resize_super *sb,
 			    "ffs1 cstotal mirror mismatch"));
 		}
 	}
+	error = resize_check_block_refs(rt, sb, &pc, phase);
+	if (error != 0)
+		return (error);
 	if (rt->dry_run)
 		return (0);
 	return (resize_check_super_replicas(rt, sb, phase));
@@ -4667,7 +5852,8 @@ resize_check_invariants_phase(const struct resize_options *opt,
 		return (0);
 	check_free_summaries = 1;
 	check_global_summaries = 1;
-	if (phase != NULL && strcmp(phase, "post-relocating") == 0) {
+	if (phase != NULL && (strcmp(phase, "post-relocating") == 0 ||
+	    strcmp(phase, "resume-start") == 0)) {
 		check_free_summaries = 0;
 		check_global_summaries = 0;
 	} else if (phase != NULL && strcmp(phase, "post-inode-remap") == 0) {
@@ -4726,51 +5912,165 @@ rt_alloc_mark_free(void *cookie, uint64_t fsb)
 	return (resize_alloc_set(&rt->amap, fsb, 0));
 }
 
+static int resize_ufs1_recompute_ncyl(struct fs *);
+
+/*
+ * Fit a requested file system size (in frags) to a valid cylinder group
+ * geometry, like newfs and growfs do: every cylinder group must hold its
+ * superblock copy, cg block and complete inode table, plus at least one
+ * data block, below fs_size.  A trailing cylinder group that is too small
+ * is dropped and the size is truncated to whole cylinder groups.
+ *
+ * The cylinder group summary area is never relocated, so the resulting
+ * number of cylinder groups must still fit in fs_cssize.
+ *
+ * newfs itself is more lenient: it keeps a last cylinder group as soon as
+ * rem >= roundup(dblkno, frag), i.e. one that may have no data block at
+ * all.  A cylinder group with index below newfs_ncg is taken to exist
+ * already and is kept under newfs's rule (cgdmin rounded up to a block,
+ * which includes the FFS1 cgoffset), so that a file system made by newfs
+ * is never cut down when it is not asked to shrink.  Pass 0 to apply the
+ * stricter rule to every cylinder group, or UINT32_MAX to only check that
+ * a geometry is valid.
+ *
+ * Returns ENOSPC if not even one cylinder group fits and EFBIG if the
+ * summary area is too small.
+ */
 static int
-resize_trim_ncg_for_size(struct fs *fs, uint64_t new_blocks)
+resize_fit_geometry(const struct fs *fs, uint64_t want_blocks,
+    uint32_t newfs_ncg, uint64_t *fit_blocksp, uint32_t *fit_ncgp)
 {
-	uint64_t cg_span_frags, cg_fsb, end_fsb;
-	u_int32_t ncg;
+	uint64_t ncg, last, rem, need, fpg, cs_need;
+	daddr_t base, dmin;
 	int error;
 
-	if (fs->fs_ncg == 0 || fs->fs_fsize <= 0 || fs->fs_cgsize <= 0)
+	if (fs->fs_fpg <= 0 || fs->fs_frag <= 0 || fs->fs_fsize <= 0)
 		return (EINVAL);
-	error = resize_div_round_up_u64((uint64_t)fs->fs_cgsize,
-	    (uint64_t)fs->fs_fsize, &cg_span_frags);
+	if (want_blocks == 0)
+		return (ENOSPC);
+	fpg = (uint64_t)fs->fs_fpg;
+	error = resize_div_round_up_u64(want_blocks, fpg, &ncg);
 	if (error != 0)
 		return (error);
-	ncg = fs->fs_ncg;
-	while (ncg > 1) {
-		cg_fsb = (uint64_t)cgtod(fs, ncg - 1);
-		error = resize_add_u64(cg_fsb, cg_span_frags, &end_fsb);
-		if (error != 0)
-			return (error);
-		if (end_fsb <= new_blocks)
-			break;
-		ncg--;
-	}
-	if (ncg == 0)
+	if (ncg == 0 || ncg > INT32_MAX)
+		return (EOVERFLOW);
+	last = ncg - 1;
+	base = cgbase(fs, (uint32_t)last);
+	dmin = cgdmin(fs, (uint32_t)last);
+	if (base < 0 || dmin < base)
 		return (EINVAL);
-	fs->fs_ncg = ncg;
+	if (last < newfs_ncg)
+		need = roundup((uint64_t)(dmin - base), (uint64_t)fs->fs_frag);
+	else
+		need = (uint64_t)(dmin - base) + (uint64_t)fs->fs_frag;
+	if (need > fpg)
+		return (EINVAL);
+	rem = want_blocks - last * fpg;
+	if (rem < need) {
+		if (ncg == 1)
+			return (ENOSPC);
+		ncg--;
+		want_blocks = ncg * fpg;
+	}
+	if (fs->fs_cssize <= 0)
+		return (EINVAL);
+	cs_need = roundup(ncg * sizeof(struct csum), (uint64_t)fs->fs_fsize);
+	if (cs_need > (uint64_t)fs->fs_cssize)
+		return (EFBIG);
+	*fit_blocksp = want_blocks;
+	*fit_ncgp = (uint32_t)ncg;
 	return (0);
 }
 
+/*
+ * Number of data frags in the first ncg cylinder groups of a file system
+ * of size_blocks frags, counted like newfs/growfs: everything except the
+ * superblock copy, cg block and inode table of each cg.  Constant terms
+ * (boot area, summary area) cancel out when two results are subtracted.
+ */
 static int
-resize_expand_ncg_for_size(struct fs *fs, uint64_t new_blocks)
+resize_geometry_data_frags(const struct fs *fs, uint64_t ncg,
+    uint64_t size_blocks, int64_t *outp)
 {
-	uint64_t need_ncg;
+	uint64_t cgx, base, keep;
+	int64_t sum;
+	daddr_t sblk, dmin;
+
+	sum = 0;
+	for (cgx = 0; cgx < ncg; cgx++) {
+		base = cgx * (uint64_t)fs->fs_fpg;
+		if (base >= size_blocks)
+			keep = 0;
+		else
+			keep = resize_u64_min(size_blocks - base,
+			    (uint64_t)fs->fs_fpg);
+		sblk = cgsblock(fs, (uint32_t)cgx);
+		dmin = cgdmin(fs, (uint32_t)cgx);
+		if (dmin < sblk)
+			return (EINVAL);
+		sum += (int64_t)keep - (int64_t)(dmin - sblk);
+	}
+	*outp = sum;
+	return (0);
+}
+
+/*
+ * Apply a new size to the in-memory superblock: cg count, ncyl, size and
+ * dsize.  new_blocks must already be a fitted size; it is checked against
+ * newfs's rule only, which also accepts the original size of a file
+ * system whose last cylinder group has no data block (revert).
+ */
+static int
+resize_geometry_apply(struct fs *fs, uint64_t new_blocks)
+{
+	uint64_t fit_blocks, old_blocks;
+	uint32_t fit_ncg;
+	int64_t old_data, new_data, old_dsize, new_dsize;
+	time_t now;
 	int error;
 
-	if (fs->fs_fpg <= 0)
-		return (EINVAL);
-	error = resize_div_round_up_u64(new_blocks, (uint64_t)fs->fs_fpg,
-	    &need_ncg);
+	error = resize_fit_geometry(fs, new_blocks, UINT32_MAX, &fit_blocks,
+	    &fit_ncg);
 	if (error != 0)
 		return (error);
-	if (need_ncg == 0 || need_ncg > UINT32_MAX)
+	if (fit_blocks != new_blocks)
+		return (EINVAL);
+	if (new_blocks > INT64_MAX)
 		return (EOVERFLOW);
-	if ((u_int32_t)need_ncg > fs->fs_ncg)
-		fs->fs_ncg = (u_int32_t)need_ncg;
+	error = resize_super_size_blocks(fs, &old_blocks);
+	if (error != 0)
+		return (error);
+	error = resize_geometry_data_frags(fs, (uint64_t)fs->fs_ncg,
+	    old_blocks, &old_data);
+	if (error != 0)
+		return (error);
+	error = resize_geometry_data_frags(fs, fit_ncg, new_blocks, &new_data);
+	if (error != 0)
+		return (error);
+	if (fs->fs_magic == FS_UFS1_MAGIC)
+		old_dsize = (int64_t)fs->fs_ffs1_dsize;
+	else
+		old_dsize = fs->fs_dsize;
+	new_dsize = old_dsize + (new_data - old_data);
+	if (new_dsize <= 0)
+		return (EINVAL);
+	if (fs->fs_magic == FS_UFS1_MAGIC &&
+	    (new_blocks > INT32_MAX || new_dsize > INT32_MAX))
+		return (EOVERFLOW);
+
+	fs->fs_ncg = fit_ncg;
+	error = resize_ufs1_recompute_ncyl(fs);
+	if (error != 0)
+		return (error);
+	fs->fs_size = (int64_t)new_blocks;
+	fs->fs_dsize = new_dsize;
+	if (fs->fs_magic == FS_UFS1_MAGIC) {
+		fs->fs_ffs1_size = (int32_t)new_blocks;
+		fs->fs_ffs1_dsize = (int32_t)new_dsize;
+	}
+	now = time(NULL);
+	fs->fs_time = (int64_t)now;
+	fs->fs_ffs1_time = (int32_t)now;
 	return (0);
 }
 
@@ -4823,10 +6123,8 @@ resize_superblock_set_size(struct resize_runtime *rt, struct resize_super *sb,
 {
 	struct fs *fs = (struct fs *)sb->raw;
 	struct resize_move mv;
+	struct fs check;
 	uint64_t new_blocks, old_blocks;
-	int64_t delta;
-	int64_t old_dsize, new_dsize;
-	time_t now;
 	int error;
 
 	if (new_size_bytes % sb->fs_fsize != 0)
@@ -4840,22 +6138,13 @@ resize_superblock_set_size(struct resize_runtime *rt, struct resize_super *sb,
 		return (EOVERFLOW);
 	if (old_blocks > INT64_MAX)
 		return (EOVERFLOW);
-	delta = (int64_t)new_blocks - (int64_t)old_blocks;
 
-	if (fs->fs_magic == FS_UFS1_MAGIC)
-		old_dsize = (int64_t)fs->fs_ffs1_dsize;
-	else
-		old_dsize = fs->fs_dsize;
-	new_dsize = old_dsize + delta;
-	if (new_dsize <= 0)
-		return (EINVAL);
-	error = resize_expand_ncg_for_size(fs, new_blocks);
-	if (error != 0)
-		return (error);
-	error = resize_trim_ncg_for_size(fs, new_blocks);
-	if (error != 0)
-		return (error);
-	error = resize_ufs1_recompute_ncyl(fs);
+	/*
+	 * The target was fitted by the caller; validate the whole new
+	 * geometry on a scratch copy before anything is journaled.
+	 */
+	check = *fs;
+	error = resize_geometry_apply(&check, new_blocks);
 	if (error != 0)
 		return (error);
 
@@ -4872,17 +6161,9 @@ resize_superblock_set_size(struct resize_runtime *rt, struct resize_super *sb,
 	if (error != 0)
 		return (error);
 
-	fs->fs_size = (int64_t)new_blocks;
-	fs->fs_dsize = new_dsize;
-	if (fs->fs_magic == FS_UFS1_MAGIC) {
-		if (new_blocks > INT32_MAX || new_dsize > INT32_MAX)
-			return (EOVERFLOW);
-		fs->fs_ffs1_size = (int32_t)new_blocks;
-		fs->fs_ffs1_dsize = (int32_t)new_dsize;
-	}
-	now = time(NULL);
-	fs->fs_time = (int64_t)now;
-	fs->fs_ffs1_time = (int32_t)now;
+	error = resize_geometry_apply(fs, new_blocks);
+	if (error != 0)
+		return (error);
 
 	if (!rt->dry_run) {
 		error = resize_super_write_all(rt, sb);
@@ -4901,17 +6182,6 @@ resize_superblock_set_size(struct resize_runtime *rt, struct resize_super *sb,
 	sb->fs_size_blocks = new_blocks;
 	sb->fs_size_bytes = new_size_bytes;
 	return (0);
-}
-
-static int
-resize_match_rec(const struct resize_jrec_v1 *a, const struct resize_jrec_v1 *b)
-{
-	return (a->op == b->op &&
-	    a->old_fsb == b->old_fsb &&
-	    a->new_fsb == b->new_fsb &&
-	    a->bytes == b->bytes &&
-	    a->owner_abs_offset == b->owner_abs_offset &&
-	    a->owner_width == b->owner_width);
 }
 
 static const char *
@@ -4943,9 +6213,7 @@ resize_superblock_apply_blocks_nojournal(struct resize_runtime *rt,
 {
 	struct resize_super sb;
 	struct fs *fs;
-	int64_t delta, old_dsize, new_dsize;
 	int error;
-	time_t now;
 
 	error = resize_read_super(rt->tfd, rt->fs_offset, rt->container_bytes,
 	    &sb);
@@ -4954,33 +6222,16 @@ resize_superblock_apply_blocks_nojournal(struct resize_runtime *rt,
 	if (new_blocks > INT64_MAX || sb.fs_size_blocks > INT64_MAX)
 		return (EOVERFLOW);
 
-	delta = (int64_t)new_blocks - (int64_t)sb.fs_size_blocks;
+	/*
+	 * Same geometry computation as resize_superblock_set_size(), so
+	 * replaying or reverting an sb-size record also grows/shrinks
+	 * fs_ncg and dsize consistently.  A record with an unfitted size
+	 * (written by an older resize_ffs) is refused.
+	 */
 	fs = (struct fs *)sb.raw;
-	if (fs->fs_magic == FS_UFS1_MAGIC)
-		old_dsize = (int64_t)fs->fs_ffs1_dsize;
-	else
-		old_dsize = fs->fs_dsize;
-	new_dsize = old_dsize + delta;
-	if (new_dsize <= 0)
-		return (EINVAL);
-	error = resize_trim_ncg_for_size(fs, new_blocks);
+	error = resize_geometry_apply(fs, new_blocks);
 	if (error != 0)
 		return (error);
-	error = resize_ufs1_recompute_ncyl(fs);
-	if (error != 0)
-		return (error);
-
-	fs->fs_size = (int64_t)new_blocks;
-	fs->fs_dsize = new_dsize;
-	if (fs->fs_magic == FS_UFS1_MAGIC) {
-		if (new_blocks > INT32_MAX || new_dsize > INT32_MAX)
-			return (EOVERFLOW);
-		fs->fs_ffs1_size = (int32_t)new_blocks;
-		fs->fs_ffs1_dsize = (int32_t)new_dsize;
-	}
-	now = time(NULL);
-	fs->fs_time = (int64_t)now;
-	fs->fs_ffs1_time = (int32_t)now;
 
 	if (!rt->dry_run)
 		return (resize_super_write_all(rt, &sb));
@@ -5139,40 +6390,169 @@ resize_replay_inode_remap_exec(struct resize_runtime *rt, struct resize_journal 
 	return (error);
 }
 
+static void
+resize_rt_ctx_init(struct resize_runtime *rt, struct resize_ctx *ctx,
+    struct resize_backend_ops *ops)
+{
+	memset(ops, 0, sizeof(*ops));
+	ops->read_block = rt_read_block;
+	ops->write_block = rt_write_block;
+	ops->sync_target = rt_sync_target;
+	ops->journal_intent = rt_journal_intent;
+	ops->journal_applied = rt_journal_applied;
+	ops->sync_journal = rt_sync_journal;
+	ops->owner_get = rt_owner_get;
+	ops->owner_set = rt_owner_set;
+	ops->alloc_is_free = rt_alloc_is_free;
+	ops->alloc_mark_allocated = rt_alloc_mark_allocated;
+	ops->alloc_mark_free = rt_alloc_mark_free;
+
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->cookie = rt;
+	ctx->ops = ops;
+	ctx->fs_fsize = rt->fs_fsize;
+}
+
+struct resize_jkey {
+	uint16_t op;
+	uint64_t old_fsb;
+	uint64_t new_fsb;
+	uint32_t bytes;
+	uint64_t owner_abs_offset;
+	uint32_t owner_width;
+	size_t idx;
+};
+
+static void
+resize_jkey_from_rec(struct resize_jkey *k, const struct resize_jrec_v1 *rec,
+    size_t idx)
+{
+	memset(k, 0, sizeof(*k));
+	k->op = rec->op;
+	k->old_fsb = rec->old_fsb;
+	k->new_fsb = rec->new_fsb;
+	k->bytes = rec->bytes;
+	k->owner_abs_offset = rec->owner_abs_offset;
+	k->owner_width = rec->owner_width;
+	k->idx = idx;
+}
+
+/*
+ * A record matches an APPLIED record with the same op, blocks, size and
+ * owner slot; the record index orders equal keys.
+ */
+static int
+resize_jkey_cmp(const void *a, const void *b)
+{
+	const struct resize_jkey *ka = a, *kb = b;
+
+	if (ka->op != kb->op)
+		return (ka->op < kb->op ? -1 : 1);
+	if (ka->old_fsb != kb->old_fsb)
+		return (ka->old_fsb < kb->old_fsb ? -1 : 1);
+	if (ka->new_fsb != kb->new_fsb)
+		return (ka->new_fsb < kb->new_fsb ? -1 : 1);
+	if (ka->bytes != kb->bytes)
+		return (ka->bytes < kb->bytes ? -1 : 1);
+	if (ka->owner_abs_offset != kb->owner_abs_offset)
+		return (ka->owner_abs_offset < kb->owner_abs_offset ? -1 : 1);
+	if (ka->owner_width != kb->owner_width)
+		return (ka->owner_width < kb->owner_width ? -1 : 1);
+	if (ka->idx != kb->idx)
+		return (ka->idx < kb->idx ? -1 : 1);
+	return (0);
+}
+
+/*
+ * For every INTENT and SBSET record i, set applied[i] when a matching
+ * APPLIED record follows it (the rule resize_recover_journal always
+ * used), in O(n log n) instead of one journal scan per record.
+ */
+static int
+resize_journal_applied_map(struct resize_journal *jr, size_t nrecs,
+    u_int8_t **appliedp)
+{
+	struct resize_jrec_v1 rec;
+	struct resize_jkey *keys, want;
+	u_int8_t *applied;
+	size_t i, n, lo, hi, mid;
+	int error;
+
+	*appliedp = NULL;
+	applied = calloc(nrecs + 1, 1);
+	keys = calloc(nrecs + 1, sizeof(*keys));
+	if (applied == NULL || keys == NULL) {
+		free(applied);
+		free(keys);
+		return (ENOMEM);
+	}
+	n = 0;
+	for (i = 0; i < nrecs; i++) {
+		error = resize_journal_read_record(jr, i, &rec);
+		if (error != 0)
+			goto fail;
+		if (rec.rec_type == RESIZE_REC_APPLIED)
+			resize_jkey_from_rec(&keys[n++], &rec, i);
+	}
+	qsort(keys, n, sizeof(*keys), resize_jkey_cmp);
+	for (i = 0; i < nrecs; i++) {
+		error = resize_journal_read_record(jr, i, &rec);
+		if (error != 0)
+			goto fail;
+		if (rec.rec_type != RESIZE_REC_INTENT &&
+		    rec.rec_type != RESIZE_REC_SBSET)
+			continue;
+		resize_jkey_from_rec(&want, &rec, i + 1);
+		lo = 0;
+		hi = n;
+		while (lo < hi) {
+			mid = lo + (hi - lo) / 2;
+			if (resize_jkey_cmp(&keys[mid], &want) < 0)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		if (lo < n) {
+			want.idx = keys[lo].idx;
+			if (resize_jkey_cmp(&keys[lo], &want) == 0)
+				applied[i] = 1;
+		}
+	}
+	free(keys);
+	*appliedp = applied;
+	return (0);
+fail:
+	free(keys);
+	free(applied);
+	return (error);
+}
+
 static int
 resize_recover_journal(struct resize_runtime *rt, struct resize_journal *jr)
 {
-	struct resize_jrec_v1 rec, cand;
-	size_t nrecs = 0, i, j;
+	struct resize_jrec_v1 rec;
+	struct resize_move mv;
+	u_int8_t *applied;
+	size_t nrecs = 0, i;
 	size_t nintent = 0, npending = 0, nreplayed = 0;
-	int has_applied;
 	int error;
 
 	error = resize_journal_record_count(jr, &nrecs);
+	if (error != 0)
+		return (error);
+	error = resize_journal_applied_map(jr, nrecs, &applied);
 	if (error != 0)
 		return (error);
 
 	for (i = 0; i < nrecs; i++) {
 		error = resize_journal_read_record(jr, i, &rec);
 		if (error != 0)
-			return (error);
+			goto out;
 		if (rec.rec_type != RESIZE_REC_INTENT &&
 		    rec.rec_type != RESIZE_REC_SBSET)
 			continue;
 		nintent++;
-		has_applied = 0;
-		for (j = i + 1; j < nrecs; j++) {
-			error = resize_journal_read_record(jr, j, &cand);
-			if (error != 0)
-				return (error);
-			if (cand.rec_type != RESIZE_REC_APPLIED)
-				continue;
-			if (resize_match_rec(&rec, &cand)) {
-				has_applied = 1;
-				break;
-			}
-		}
-		if (has_applied)
+		if (applied[i])
 			continue;
 		npending++;
 
@@ -5186,25 +6566,21 @@ resize_recover_journal(struct resize_runtime *rt, struct resize_journal *jr)
 		else
 			error = resize_replay_record(rt, &rec);
 		if (error != 0)
-			return (error);
-		{
-			struct resize_move mv;
-
-			memset(&mv, 0, sizeof(mv));
-			mv.old_fsb = rec.old_fsb;
-			mv.new_fsb = rec.new_fsb;
-			mv.bytes = rec.bytes;
-			mv.flags = rec.flags;
-			mv.owner_abs_offset = rec.owner_abs_offset;
-			mv.owner_width = rec.owner_width;
-			error = resize_journal_append(jr, RESIZE_REC_APPLIED,
-			    rec.op, &mv, 0);
-		}
+			goto out;
+		memset(&mv, 0, sizeof(mv));
+		mv.old_fsb = rec.old_fsb;
+		mv.new_fsb = rec.new_fsb;
+		mv.bytes = rec.bytes;
+		mv.flags = rec.flags;
+		mv.owner_abs_offset = rec.owner_abs_offset;
+		mv.owner_width = rec.owner_width;
+		error = resize_journal_append(jr, RESIZE_REC_APPLIED, rec.op,
+		    &mv, 0);
 		if (error != 0)
-			return (error);
+			goto out;
 		error = resize_journal_sync(jr);
 		if (error != 0)
-			return (error);
+			goto out;
 		nreplayed++;
 	}
 	resize_vlog(rt->verbose,
@@ -5213,31 +6589,272 @@ resize_recover_journal(struct resize_runtime *rt, struct resize_journal *jr)
 	if (rt->verbose && nreplayed == 0)
 		fprintf(stderr,
 		    "recover: journal appears fully applied; nothing to replay\n");
+	error = 0;
+out:
+	free(applied);
+	return (error);
+}
+
+struct resize_group_key {
+	uint64_t old_fsb;
+	uint64_t new_fsb;
+	uint32_t bytes;
+};
+
+static int
+resize_group_key_cmp(const void *a, const void *b)
+{
+	const struct resize_group_key *ka = a, *kb = b;
+
+	if (ka->old_fsb != kb->old_fsb)
+		return (ka->old_fsb < kb->old_fsb ? -1 : 1);
+	if (ka->new_fsb != kb->new_fsb)
+		return (ka->new_fsb < kb->new_fsb ? -1 : 1);
+	if (ka->bytes != kb->bytes)
+		return (ka->bytes < kb->bytes ? -1 : 1);
 	return (0);
+}
+
+/*
+ * Finish relocation groups that an interrupted run left between copy
+ * and free (after resize_recover_journal() replayed the pending
+ * intent): a copy that is not yet repointed is repointed, then the old
+ * copy is freed, both journaled like a normal run.  The owner slot is
+ * the one in the copy record; groups with more owners only exist on a
+ * damaged file system, and an owner left on the old block is planned
+ * again (the old data is never overwritten: destinations are always
+ * below the new size).
+ */
+static int
+resize_finish_partial_groups(struct resize_runtime *rt,
+    struct resize_journal *jr, size_t *nfinishedp)
+{
+	struct resize_jrec_v1 rec;
+	struct resize_group_key *freed, key;
+	struct resize_ctx ctx;
+	struct resize_backend_ops ops;
+	struct resize_move mv;
+	uint64_t owner_fsb;
+	size_t nrecs = 0, i, nfreed, nfinished;
+	int error;
+
+	*nfinishedp = 0;
+	error = resize_journal_record_count(jr, &nrecs);
+	if (error != 0)
+		return (error);
+	freed = calloc(nrecs + 1, sizeof(*freed));
+	if (freed == NULL)
+		return (ENOMEM);
+	nfreed = 0;
+	for (i = 0; i < nrecs; i++) {
+		error = resize_journal_read_record(jr, i, &rec);
+		if (error != 0)
+			goto out;
+		if (rec.rec_type != RESIZE_REC_APPLIED ||
+		    rec.op != RESIZE_MUT_FREE)
+			continue;
+		freed[nfreed].old_fsb = rec.old_fsb;
+		freed[nfreed].new_fsb = rec.new_fsb;
+		freed[nfreed].bytes = rec.bytes;
+		nfreed++;
+	}
+	qsort(freed, nfreed, sizeof(*freed), resize_group_key_cmp);
+	resize_rt_ctx_init(rt, &ctx, &ops);
+
+	nfinished = 0;
+	for (i = 0; i < nrecs; i++) {
+		error = resize_journal_read_record(jr, i, &rec);
+		if (error != 0)
+			goto out;
+		if (rec.rec_type != RESIZE_REC_APPLIED ||
+		    rec.op != RESIZE_MUT_COPY)
+			continue;
+		key.old_fsb = rec.old_fsb;
+		key.new_fsb = rec.new_fsb;
+		key.bytes = rec.bytes;
+		if (bsearch(&key, freed, nfreed, sizeof(*freed),
+		    resize_group_key_cmp) != NULL)
+			continue;
+
+		memset(&mv, 0, sizeof(mv));
+		mv.old_fsb = rec.old_fsb;
+		mv.new_fsb = rec.new_fsb;
+		mv.bytes = rec.bytes;
+		mv.owner_abs_offset = rec.owner_abs_offset;
+		mv.owner_width = rec.owner_width;
+		mv.owner.kind = RESIZE_OWNER_INDIRECT_SLOT;
+		mv.owner.owner_block_fsb = rec.owner_abs_offset;
+		mv.owner.slot_index = rec.owner_width;
+		mv.flags = RESIZE_MOVE_F_COPIED;
+		error = rt_owner_get(rt, &mv.owner, &owner_fsb);
+		if (error != 0)
+			goto out;
+		resize_vlog(rt->verbose, "resume: finish group old_fsb=%" PRIu64
+		    " new_fsb=%" PRIu64 " (owner %s)\n", mv.old_fsb, mv.new_fsb,
+		    owner_fsb == mv.new_fsb ? "repointed" : "not repointed");
+		if (owner_fsb == mv.old_fsb) {
+			error = resize_repoint_stage(&ctx, &mv);
+			if (error != 0)
+				goto out;
+		} else if (owner_fsb == mv.new_fsb) {
+			mv.flags |= RESIZE_MOVE_F_REPOINTED;
+		} else {
+			error = EINVAL;
+			goto out;
+		}
+		error = resize_free_stage(&ctx, &mv);
+		if (error != 0)
+			goto out;
+		nfinished++;
+	}
+	*nfinishedp = nfinished;
+	error = 0;
+out:
+	free(freed);
+	resize_alloc_free(&rt->amap);
+	return (error);
+}
+
+/*
+ * --resume of a shrink interrupted before its metadata phase: finish
+ * partial relocation groups, run the inode remap if it did not run yet,
+ * plan the blocks that are still beyond the new size from the current
+ * on-disk state, and complete the resize.  Only journals of truncating
+ * shrinks with an automatic plan (RESIZE_JF_AUTOPLAN) qualify; a plan
+ * from --moves is not in the journal.
+ */
+static int
+resize_resume_relocation(const struct resize_options *opt,
+    struct resize_runtime *rt, struct resize_journal *jr)
+{
+	struct resize_options ropt;
+	struct resize_super sb;
+	struct resize_plan_ctx ipc;
+	struct resize_ino_remap irm, done;
+	struct resize_move_list ml;
+	struct resize_jrec_v1 rec;
+	size_t nrecs = 0, i, nfinished;
+	ufsino_t new_ino;
+	int has_maps, exec_applied;
+	uint64_t target;
+	int error;
+
+	if ((jr->hdr.reserved[RESIZE_JHDR_FLAGS] & RESIZE_JF_AUTOPLAN) == 0 ||
+	    jr->hdr.new_fs_size_bytes >= jr->hdr.old_fs_size_bytes) {
+		fprintf(stderr, "resume: interrupted during phase %u, and the "
+		    "journal is not from a shrink with an automatic plan; use "
+		    "--revert\n", jr->hdr.phase);
+		return (ENOTSUP);
+	}
+	target = jr->hdr.new_fs_size_bytes;
+	rt->fs_offset = jr->hdr.fs_offset_bytes;
+	error = resize_read_super(rt->tfd, rt->fs_offset, rt->container_bytes,
+	    &sb);
+	if (error != 0)
+		return (error);
+	if (sb.fs_size_bytes != jr->hdr.old_fs_size_bytes ||
+	    target % sb.fs_fsize != 0)
+		return (EINVAL);
+	rt->fs = *(const struct fs *)sb.raw;
+	rt->fs_fsize = sb.fs_fsize;
+
+	error = resize_finish_partial_groups(rt, jr, &nfinished);
+	if (error != 0)
+		return (error);
+
+	error = resize_journal_record_count(jr, &nrecs);
+	if (error != 0)
+		return (error);
+	has_maps = 0;
+	exec_applied = 0;
+	for (i = 0; i < nrecs; i++) {
+		error = resize_journal_read_record(jr, i, &rec);
+		if (error != 0)
+			return (error);
+		if (rec.op == RESIZE_MUT_INODE_REMAP_MAP &&
+		    rec.rec_type == RESIZE_REC_INTENT)
+			has_maps = 1;
+		if (rec.op == RESIZE_MUT_INODE_REMAP_EXEC &&
+		    rec.rec_type == RESIZE_REC_APPLIED)
+			exec_applied = 1;
+	}
+	memset(&irm, 0, sizeof(irm));
+	memset(&done, 0, sizeof(done));
+	if (!exec_applied) {
+		/*
+		 * The remap did not run (an interrupted remap would have
+		 * been replayed by resize_recover_journal()), so the inodes
+		 * are where they were: plan it again.  Map records already
+		 * journaled (possibly only some of them) must agree with
+		 * the new plan; only the missing ones are journaled.
+		 */
+		error = resize_plan_ctx_init_from_super(&ipc, rt->tfd,
+		    rt->container_bytes, rt->fs_offset, opt->verbose, &sb);
+		if (error == 0)
+			error = resize_build_inode_remap(&ipc,
+			    target / sb.fs_fsize, &irm);
+		if (error == 0 && has_maps)
+			error = resize_collect_inode_remap_from_journal(jr,
+			    nrecs, &done);
+		for (i = 0; error == 0 && i < done.nent; i++) {
+			if (resize_ino_remap_find(&irm, done.ents[i].old_ino,
+			    &new_ino) != 0 || new_ino != done.ents[i].new_ino) {
+				fprintf(stderr, "resume: journaled inode map "
+				    "%u -> %u no longer matches the file "
+				    "system; use --revert\n",
+				    done.ents[i].old_ino, done.ents[i].new_ino);
+				error = EINVAL;
+			}
+		}
+		if (error != 0) {
+			resize_ino_remap_free(&irm);
+			resize_ino_remap_free(&done);
+			return (error);
+		}
+	}
+	resize_vlog(opt->verbose, "resume: shrink %" PRIu64 " -> %" PRIu64
+	    " from phase %u: %zu partial group(s) finished, %zu inode(s) "
+	    "to remap\n", sb.fs_size_bytes, target, jr->hdr.phase, nfinished,
+	    irm.nent);
+
+	ropt = *opt;
+	ropt.offset_bytes = rt->fs_offset;
+	ropt.moves_path = NULL;
+	ropt.policy = RESIZE_POLICY_TRUNCATE;
+	ropt.dry_run = 0;
+	memset(&ml, 0, sizeof(ml));
+	error = resize_execute_body(&ropt, rt, &sb, target, &ml, &irm,
+	    done.nent != 0 ? &done : NULL, 1, 0);
+	free(ml.moves);
+	resize_ino_remap_free(&irm);
+	resize_ino_remap_free(&done);
+	resize_alloc_free(&rt->amap);
+	if (error == 0 && opt->verbose)
+		fprintf(stderr, "resume: finalized at fs_offset=%" PRIu64
+		    " (shift-delta=0)\n", rt->fs_offset);
+	return (error);
 }
 
 static int
 resize_resume_journal(const struct resize_options *opt, struct resize_runtime *rt,
     struct resize_journal *jr)
 {
-	struct resize_jrec_v1 rec, cand;
+	struct resize_jrec_v1 rec;
 	struct resize_super sb;
-	size_t nrecs = 0, i, j;
+	u_int8_t *applied;
+	size_t nrecs = 0, i;
 	size_t npending;
-	int has_applied, has_commit, has_sbset, has_shift;
+	int has_commit, has_sbset, has_shift;
 	int delta_set;
-	uint64_t delta, d, fs_offset;
+	uint64_t delta, d, fs_offset, first_new_cg;
 	int error;
 
-	if (jr->hdr.phase < RESIZE_PHASE_METADATA) {
-		if (opt->verbose) {
-			fprintf(stderr,
-			    "resume: phase=%u is before metadata; cannot auto-finish\n",
-			    jr->hdr.phase);
-		}
-		return (ENOTSUP);
-	}
+	if (jr->hdr.phase < RESIZE_PHASE_METADATA)
+		return (resize_resume_relocation(opt, rt, jr));
 	error = resize_journal_record_count(jr, &nrecs);
+	if (error != 0)
+		return (error);
+	error = resize_journal_applied_map(jr, nrecs, &applied);
 	if (error != 0)
 		return (error);
 
@@ -5250,20 +6867,24 @@ resize_resume_journal(const struct resize_options *opt, struct resize_runtime *r
 	for (i = 0; i < nrecs; i++) {
 		error = resize_journal_read_record(jr, i, &rec);
 		if (error != 0)
-			return (error);
+			break;
 		if (rec.rec_type == RESIZE_REC_APPLIED) {
 			if (rec.op == RESIZE_MUT_SB_SIZE)
 				has_sbset = 1;
 			else if (rec.op == RESIZE_MUT_SHIFT_CHUNK) {
 				has_shift = 1;
-				if (rec.new_fsb < rec.old_fsb)
-					return (EINVAL);
+				if (rec.new_fsb < rec.old_fsb) {
+					error = EINVAL;
+					break;
+				}
 				d = rec.new_fsb - rec.old_fsb;
 				if (!delta_set) {
 					delta = d;
 					delta_set = 1;
-				} else if (d != delta)
-					return (EINVAL);
+				} else if (d != delta) {
+					error = EINVAL;
+					break;
+				}
 			}
 		} else if (rec.rec_type == RESIZE_REC_COMMIT) {
 			has_commit = 1;
@@ -5271,21 +6892,12 @@ resize_resume_journal(const struct resize_options *opt, struct resize_runtime *r
 		if (rec.rec_type != RESIZE_REC_INTENT &&
 		    rec.rec_type != RESIZE_REC_SBSET)
 			continue;
-		has_applied = 0;
-		for (j = i + 1; j < nrecs; j++) {
-			error = resize_journal_read_record(jr, j, &cand);
-			if (error != 0)
-				return (error);
-			if (cand.rec_type != RESIZE_REC_APPLIED)
-				continue;
-			if (resize_match_rec(&rec, &cand)) {
-				has_applied = 1;
-				break;
-			}
-		}
-		if (!has_applied)
+		if (!applied[i])
 			npending++;
 	}
+	free(applied);
+	if (error != 0)
+		return (error);
 	if (npending != 0) {
 		if (opt->verbose) {
 			fprintf(stderr,
@@ -5316,7 +6928,23 @@ resize_resume_journal(const struct resize_options *opt, struct resize_runtime *r
 		return (0);
 	}
 
-	error = resize_recompute_free_summaries(rt, &sb);
+	/*
+	 * On a grow interrupted before commit, cgs past the old cg count
+	 * were never allocated from and are rebuilt from scratch.  Once
+	 * committed, the fs may have been mounted and used: keep them.
+	 */
+	first_new_cg = (uint64_t)((const struct fs *)sb.raw)->fs_ncg;
+	if (jr->hdr.phase < RESIZE_PHASE_COMMITTING &&
+	    jr->hdr.old_fs_size_bytes < jr->hdr.new_fs_size_bytes &&
+	    sb.fs_fsize != 0 && ((const struct fs *)sb.raw)->fs_fpg > 0) {
+		error = resize_div_round_up_u64(
+		    jr->hdr.old_fs_size_bytes / sb.fs_fsize,
+		    (uint64_t)((const struct fs *)sb.raw)->fs_fpg,
+		    &first_new_cg);
+		if (error != 0)
+			return (error);
+	}
+	error = resize_recompute_free_summaries(rt, &sb, first_new_cg);
 	if (error != 0)
 		return (error);
 
@@ -5361,8 +6989,56 @@ resize_resume_journal(const struct resize_options *opt, struct resize_runtime *r
 	return (0);
 }
 
+/*
+ * Undo an inode remap, complete or partial: resize_apply_inode_remap()
+ * with the journaled maps reversed.
+ */
 static int
-resize_revert_record(struct resize_runtime *rt, const struct resize_jrec_v1 *rec)
+resize_revert_inode_remap(struct resize_runtime *rt, struct resize_journal *jr,
+    size_t nrecs)
+{
+	struct resize_ino_remap rm;
+	struct resize_super sb;
+	struct resize_plan_ctx pc;
+	ufsino_t t;
+	size_t i;
+	int error;
+
+	error = resize_collect_inode_remap_from_journal(jr, nrecs, &rm);
+	if (error != 0)
+		return (error);
+	if (rm.nent == 0) {
+		resize_ino_remap_free(&rm);
+		return (0);
+	}
+	for (i = 0; i < rm.nent; i++) {
+		t = rm.ents[i].old_ino;
+		rm.ents[i].old_ino = rm.ents[i].new_ino;
+		rm.ents[i].new_ino = t;
+	}
+	qsort(rm.ents, rm.nent, sizeof(rm.ents[0]), resize_ino_remap_cmp_old);
+	error = resize_read_super(rt->tfd, rt->fs_offset, rt->container_bytes,
+	    &sb);
+	if (error == 0)
+		error = resize_plan_ctx_init_from_super(&pc, rt->tfd,
+		    rt->container_bytes, rt->fs_offset, rt->verbose, &sb);
+	if (error == 0)
+		error = resize_apply_inode_remap(&pc, &sb, &rm);
+	if (error == 0 && !rt->dry_run)
+		error = resize_super_write_all(rt, &sb);
+	resize_ino_remap_free(&rm);
+	return (error);
+}
+
+/*
+ * Undo one record.  Every undo is idempotent and also correct when the
+ * forward mutation never happened or happened only in part, so pending
+ * intents (no APPLIED record: the run was interrupted during that step)
+ * are undone too.
+ */
+static int
+resize_revert_record(struct resize_runtime *rt, struct resize_journal *jr,
+    size_t nrecs, const struct resize_jrec_v1 *rec)
 {
 	struct resize_move mv;
 	struct resize_super sb;
@@ -5417,7 +7093,21 @@ resize_revert_record(struct resize_runtime *rt, const struct resize_jrec_v1 *rec
 			return (error);
 		rt->fs = *(const struct fs *)sb.raw;
 		rt->fs_fsize = sb.fs_fsize;
+		/*
+		 * Undoing a shrink: give the cgs their old extent back
+		 * before the frees of blocks in it are undone (no cg is
+		 * rebuilt; the removed cgs were left intact on disk).
+		 */
+		if (rec->old_fsb > rec->new_fsb && !rt->dry_run) {
+			error = resize_recompute_free_summaries(rt, &sb,
+			    (uint64_t)((const struct fs *)sb.raw)->fs_ncg);
+			if (error != 0)
+				return (error);
+			rt->fs = *(const struct fs *)sb.raw;
+		}
 		return (0);
+	case RESIZE_MUT_INODE_REMAP_EXEC:
+		return (resize_revert_inode_remap(rt, jr, nrecs));
 	case RESIZE_MUT_INODE_REMAP_MAP:
 		return (0);
 	default:
@@ -5431,96 +7121,130 @@ resize_revert_journal(const struct resize_options *opt, struct resize_runtime *r
 {
 	struct resize_jrec_v1 rec;
 	struct resize_super sb;
+	u_int8_t *applied;
 	size_t nrecs = 0, i;
-	size_t napplied, nreverted;
+	size_t napplied, npending, nreverted;
+	int pending;
 	int error;
 
 	error = resize_journal_record_count(jr, &nrecs);
 	if (error != 0)
 		return (error);
+	error = resize_journal_applied_map(jr, nrecs, &applied);
+	if (error != 0)
+		return (error);
 
 	napplied = 0;
+	npending = 0;
 	nreverted = 0;
 	for (i = 0; i < nrecs; i++) {
 		error = resize_journal_read_record(jr, i, &rec);
 		if (error != 0)
-			return (error);
-		if (rec.rec_type != RESIZE_REC_APPLIED)
-			continue;
+			goto out;
 		if (rec.op == RESIZE_MUT_INODE_REMAP_MAP)
 			continue;
-		napplied++;
-		if (rec.op == RESIZE_MUT_INODE_REMAP_EXEC ||
-		    rec.op == RESIZE_MUT_SHIFT_CHUNK) {
+		if (rec.rec_type == RESIZE_REC_APPLIED)
+			napplied++;
+		else if ((rec.rec_type == RESIZE_REC_INTENT ||
+		    rec.rec_type == RESIZE_REC_SBSET) && !applied[i])
+			npending++;
+		else
+			continue;
+		if (rec.op == RESIZE_MUT_SHIFT_CHUNK) {
 			if (opt->verbose) {
 				fprintf(stderr,
-				    "revert: unsupported applied op=%u (%s)\n",
+				    "revert: unsupported op=%u (%s)\n",
 				    rec.op, resize_mutation_name(rec.op));
 			}
-			return (ENOTSUP);
+			error = ENOTSUP;
+			goto out;
 		}
 	}
-	if (napplied == 0) {
+	if (napplied == 0 && npending == 0) {
+		/*
+		 * Interrupted before its first change: only the clean flag
+		 * was cleared (resize_execute_body marks the file system
+		 * dirty first).  Set it again if it was set before, so the
+		 * file system mounts; the reset below clears WASCLEAN.
+		 */
 		if (opt->verbose)
 			fprintf(stderr,
 			    "revert: journal has no applied reversible records\n");
-		return (0);
+		error = resize_read_super(rt->tfd, rt->fs_offset,
+		    rt->container_bytes, &sb);
+		if (error == 0 && !rt->dry_run && (jr->hdr.reserved[
+		    RESIZE_JHDR_FLAGS] & RESIZE_JF_WASCLEAN) != 0) {
+			rt->fs = *(const struct fs *)sb.raw;
+			rt->fs_fsize = sb.fs_fsize;
+			error = resize_superblock_set_clean_state(rt, &sb, 1);
+		}
+		if (error == 0)
+			error = resize_journal_reset(jr);
+		goto out;
 	}
 
 	error = resize_read_super(rt->tfd, rt->fs_offset, rt->container_bytes, &sb);
 	if (error != 0)
-		return (error);
+		goto out;
 	rt->fs = *(const struct fs *)sb.raw;
 	rt->fs_fsize = sb.fs_fsize;
 
 	error = resize_superblock_set_clean_state(rt, &sb, 0);
 	if (error != 0)
-		return (error);
+		goto out;
 
 	for (i = nrecs; i > 0; i--) {
 		error = resize_journal_read_record(jr, i - 1, &rec);
 		if (error != 0)
-			return (error);
-		if (rec.rec_type != RESIZE_REC_APPLIED)
-			continue;
+			goto out;
 		if (rec.op == RESIZE_MUT_INODE_REMAP_MAP)
 			continue;
+		pending = 0;
+		if (rec.rec_type == RESIZE_REC_INTENT ||
+		    rec.rec_type == RESIZE_REC_SBSET) {
+			if (applied[i - 1])
+				continue;
+			pending = 1;
+		} else if (rec.rec_type != RESIZE_REC_APPLIED)
+			continue;
 		resize_vlog(opt->verbose,
-		    "revert: undo op=%u (%s) old=%" PRIu64
+		    "revert: undo%s op=%u (%s) old=%" PRIu64
 		    " new=%" PRIu64 " bytes=%u owner_off=%" PRIu64 " owner_w=%u\n",
-		    rec.op, resize_mutation_name(rec.op), rec.old_fsb, rec.new_fsb,
+		    pending ? " pending" : "", rec.op,
+		    resize_mutation_name(rec.op), rec.old_fsb, rec.new_fsb,
 		    rec.bytes, rec.owner_abs_offset, rec.owner_width);
-		error = resize_revert_record(rt, &rec);
+		error = resize_revert_record(rt, jr, nrecs, &rec);
 		if (error != 0)
-			return (error);
+			goto out;
 		nreverted++;
 	}
 
 	error = resize_read_super(rt->tfd, rt->fs_offset, rt->container_bytes, &sb);
 	if (error != 0)
-		return (error);
+		goto out;
 	rt->fs = *(const struct fs *)sb.raw;
 	rt->fs_fsize = sb.fs_fsize;
 
-	error = resize_recompute_free_summaries(rt, &sb);
+	error = resize_recompute_free_summaries(rt, &sb,
+	    (uint64_t)((const struct fs *)sb.raw)->fs_ncg);
 	if (error != 0)
-		return (error);
+		goto out;
 	error = resize_superblock_set_clean_state(rt, &sb, 1);
 	if (error != 0)
-		return (error);
+		goto out;
 	if (opt->check_invariants) {
 		error = resize_check_invariants_phase(opt, rt, &sb, "post-revert");
 		if (error != 0)
-			return (error);
+			goto out;
 	}
 	if (opt->verbose)
-		fprintf(stderr, "revert: applied=%zu reverted=%zu\n",
-		    napplied, nreverted);
+		fprintf(stderr, "revert: applied=%zu pending=%zu reverted=%zu\n",
+		    napplied, npending, nreverted);
 
 	error = resize_journal_reset(jr);
-	if (error != 0)
-		return (error);
-	return (0);
+out:
+	free(applied);
+	return (error);
 }
 
 static int
@@ -5533,23 +7257,7 @@ resize_run_relocation(struct resize_runtime *rt, struct resize_move_list *ml)
 	uint32_t bytes;
 	int error;
 
-	memset(&ops, 0, sizeof(ops));
-	ops.read_block = rt_read_block;
-	ops.write_block = rt_write_block;
-	ops.sync_target = rt_sync_target;
-	ops.journal_intent = rt_journal_intent;
-	ops.journal_applied = rt_journal_applied;
-	ops.sync_journal = rt_sync_journal;
-	ops.owner_get = rt_owner_get;
-	ops.owner_set = rt_owner_set;
-	ops.alloc_is_free = rt_alloc_is_free;
-	ops.alloc_mark_allocated = rt_alloc_mark_allocated;
-	ops.alloc_mark_free = rt_alloc_mark_free;
-
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.cookie = rt;
-	ctx.ops = &ops;
-	ctx.fs_fsize = rt->fs_fsize;
+	resize_rt_ctx_init(rt, &ctx, &ops);
 
 	ngroups = 0;
 	for (i = 0; i < ml->nmoves;) {
@@ -5619,27 +7327,332 @@ out:
 	return (error);
 }
 
+struct resize_ino_slot {
+	uint64_t old_abs;
+	uint64_t new_abs;
+};
+
+static int
+resize_ino_slot_cmp(const void *a, const void *b)
+{
+	const struct resize_ino_slot *sa = a, *sb = b;
+
+	if (sa->old_abs != sb->old_abs)
+		return (sa->old_abs < sb->old_abs ? -1 : 1);
+	return (0);
+}
+
+/*
+ * A plan made before the inode remap has owner slots inside the dinodes
+ * of remapped inodes.  Point them at the same slots of the new dinodes,
+ * so the plan made (and checked) before anything was written is the one
+ * that runs.
+ */
+static int
+resize_plan_follow_remap(const struct resize_plan_ctx *pc,
+    const struct resize_ino_remap *irm, struct resize_move_list *ml)
+{
+	struct resize_ino_slot *slots;
+	uint64_t o;
+	size_t i, lo, hi, mid, n;
+	int error;
+
+	if (ml->nmoves == 0 || irm->nent == 0)
+		return (0);
+	slots = calloc(irm->nent, sizeof(*slots));
+	if (slots == NULL)
+		return (ENOMEM);
+	error = 0;
+	for (i = 0; i < irm->nent && error == 0; i++) {
+		error = resize_inode_locate(pc, irm->ents[i].old_ino, NULL,
+		    NULL, NULL, &slots[i].old_abs);
+		if (error == 0)
+			error = resize_inode_locate(pc, irm->ents[i].new_ino,
+			    NULL, NULL, NULL, &slots[i].new_abs);
+	}
+	if (error != 0)
+		goto out;
+	qsort(slots, irm->nent, sizeof(*slots), resize_ino_slot_cmp);
+	n = 0;
+	for (i = 0; i < ml->nmoves; i++) {
+		o = ml->moves[i].owner_abs_offset;
+		lo = 0;
+		hi = irm->nent;
+		while (lo < hi) {
+			mid = lo + (hi - lo) / 2;
+			if (slots[mid].old_abs <= o)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		if (lo == 0 || o >= slots[lo - 1].old_abs + pc->inode_size)
+			continue;
+		ml->moves[i].owner_abs_offset = slots[lo - 1].new_abs +
+		    (o - slots[lo - 1].old_abs);
+		n++;
+	}
+	resize_vlog(pc->verbose, "inode-remap: %zu planned owner slot(s) "
+	    "moved to the new inodes\n", n);
+out:
+	free(slots);
+	return (error);
+}
+
+/*
+ * The mutating part of a resize, shared by a new run and by --resume of
+ * a shrink that was interrupted before its metadata phase.  rt->jr is
+ * open.  irm is the inode remap still to execute; entries also in irm_done
+ * are already journaled (resume).  A plan in ml was made before the remap;
+ * its owner slots in remapped inodes are moved along with the inodes.
+ * When resuming, the summaries are stale until the metadata phase.
+ */
+static int
+resize_execute_body(const struct resize_options *opt, struct resize_runtime *rt,
+    struct resize_super *sb, uint64_t target_size, struct resize_move_list *ml,
+    const struct resize_ino_remap *irm, const struct resize_ino_remap *irm_done,
+    int resuming, uint64_t shift_delta)
+{
+	struct resize_journal *jr = rt->jr;
+	struct resize_plan_ctx pc;
+	struct resize_move mv;
+	uint64_t old_size_bytes, old_ncg;
+	size_t i;
+	const char *where;
+	ufsino_t done_ino;
+	int error;
+
+	old_size_bytes = sb->fs_size_bytes;
+
+	where = "superblock/mark-dirty";
+	error = resize_superblock_set_clean_state(rt, sb, 0);
+	if (error != 0)
+		goto out;
+	where = "invariants/post-mark-dirty";
+	error = resize_check_invariants_phase(opt, rt, sb,
+	    resuming ? "resume-start" : "post-mark-dirty");
+	if (error != 0)
+		goto out;
+
+	if (irm != NULL && irm->nent != 0) {
+		where = "inode-remap/plan-ctx-init";
+		error = resize_plan_ctx_init_from_super(&pc, rt->tfd,
+		    rt->container_bytes, rt->fs_offset, opt->verbose, sb);
+		if (error != 0)
+			goto out;
+		for (i = 0; i < irm->nent; i++) {
+			if (irm_done != NULL && resize_ino_remap_find(irm_done,
+			    irm->ents[i].old_ino, &done_ino) == 0)
+				continue;
+			memset(&mv, 0, sizeof(mv));
+			mv.old_fsb = irm->ents[i].old_ino;
+			mv.new_fsb = irm->ents[i].new_ino;
+			mv.bytes = pc.inode_size;
+			where = "inode-remap/journal-map-intent";
+			error = resize_journal_append(jr, RESIZE_REC_INTENT,
+			    RESIZE_MUT_INODE_REMAP_MAP, &mv, 0);
+			if (error != 0)
+				goto out;
+			where = "inode-remap/journal-map-applied";
+			error = resize_journal_append(jr, RESIZE_REC_APPLIED,
+			    RESIZE_MUT_INODE_REMAP_MAP, &mv, 0);
+			if (error != 0)
+				goto out;
+		}
+		memset(&mv, 0, sizeof(mv));
+		mv.old_fsb = irm->nent;
+		where = "inode-remap/journal-exec-intent";
+		error = resize_journal_append(jr, RESIZE_REC_INTENT,
+		    RESIZE_MUT_INODE_REMAP_EXEC, &mv, 0);
+		if (error != 0)
+			goto out;
+		where = "inode-remap/journal-sync-before-exec";
+		error = resize_journal_sync(jr);
+		if (error != 0)
+			goto out;
+		where = "inode-remap/apply";
+		error = resize_apply_inode_remap(&pc, sb, irm);
+		if (error != 0)
+			goto out;
+		where = "inode-remap/journal-exec-applied";
+		error = resize_journal_append(jr, RESIZE_REC_APPLIED,
+		    RESIZE_MUT_INODE_REMAP_EXEC, &mv, 0);
+		if (error != 0)
+			goto out;
+		where = "inode-remap/journal-sync-after-exec";
+		error = resize_journal_sync(jr);
+		if (error != 0)
+			goto out;
+		where = "inode-remap/move-plan-owners";
+		error = resize_plan_follow_remap(&pc, irm, ml);
+		if (error != 0)
+			goto out;
+		where = "invariants/post-inode-remap";
+		error = resize_check_invariants_phase(opt, rt, sb,
+		    "post-inode-remap");
+		if (error != 0)
+			goto out;
+	}
+
+	if (ml->nmoves == 0 && opt->moves_path == NULL &&
+	    target_size < sb->fs_size_bytes) {
+		/*
+		 * Plan from the current on-disk state: after an inode remap
+		 * the owner slots of remapped inodes have moved, and on
+		 * resume some blocks have already been relocated.
+		 */
+		where = "auto-plan/current-state";
+		error = resize_plan_auto_shrink_end(rt->tfd,
+		    rt->container_bytes, opt, sb, target_size, ml);
+		if (error != 0)
+			goto out;
+		where = "auto-plan/finalize";
+		error = resize_plan_finalize(ml, (const struct fs *)sb->raw,
+		    rt->tfd, rt->container_bytes, rt->fs_offset,
+		    target_size / sb->fs_fsize, opt->verbose);
+		if (error != 0)
+			goto out;
+	}
+
+	where = "alloc/init-from-moves";
+	error = resize_alloc_init_from_moves(&rt->amap, ml);
+	if (error != 0)
+		goto out;
+
+	if (ml->nmoves != 0) {
+		resize_vlog(opt->verbose, "phase: relocating (%zu moves)\n",
+		    ml->nmoves);
+		where = "phase-set/relocating";
+		error = resize_journal_set_phase(jr, RESIZE_PHASE_RELOCATING);
+		if (error != 0)
+			goto out;
+		where = "journal-sync/relocating";
+		error = resize_journal_sync(jr);
+		if (error != 0)
+			goto out;
+		where = "relocation/run";
+		error = resize_run_relocation(rt, ml);
+		if (error != 0)
+			goto out;
+		where = "invariants/post-relocating";
+		error = resize_check_invariants_phase(opt, rt, sb,
+		    "post-relocating");
+		if (error != 0)
+			goto out;
+	}
+
+	where = "phase-set/metadata";
+	error = resize_journal_set_phase(jr, RESIZE_PHASE_METADATA);
+	if (error != 0)
+		goto out;
+	resize_vlog(opt->verbose, "phase: metadata (superblock update)\n");
+	where = "journal-sync/metadata";
+	error = resize_journal_sync(jr);
+	if (error != 0)
+		goto out;
+	old_ncg = (uint64_t)((const struct fs *)sb->raw)->fs_ncg;
+	where = "superblock/set-size";
+	error = resize_superblock_set_size(rt, sb, target_size);
+	if (error != 0)
+		goto out;
+	if (target_size != old_size_bytes) {
+		rt->fs = *(const struct fs *)sb->raw;
+		where = "summaries/recompute";
+		error = resize_recompute_free_summaries(rt, sb, old_ncg);
+		if (error != 0)
+			goto out;
+	}
+	where = "invariants/post-metadata";
+	error = resize_check_invariants_phase(opt, rt, sb, "post-metadata");
+	if (error != 0)
+		goto out;
+
+	if (shift_delta != 0) {
+		resize_vlog(opt->verbose,
+		    "phase: shifting-image (delta=%" PRIu64 ")\n",
+		    shift_delta);
+		where = "shift-image/journaled-copy";
+		error = resize_shift_image_up_journal(rt, rt->fs_offset,
+		    target_size, shift_delta);
+		if (error != 0)
+			goto out;
+		where = "shift-image/verify-super";
+		error = resize_shift_rebase_super(rt, sb, shift_delta,
+		    target_size);
+		if (error != 0)
+			goto out;
+		where = "invariants/post-shifting-image";
+		error = resize_check_invariants_phase(opt, rt, sb,
+		    "post-shifting-image");
+		if (error != 0)
+			goto out;
+	}
+
+	where = "phase-set/committing";
+	error = resize_journal_set_phase(jr, RESIZE_PHASE_COMMITTING);
+	if (error != 0)
+		goto out;
+	resize_vlog(opt->verbose, "phase: committing\n");
+	where = "commit/append";
+	error = resize_journal_append(jr, RESIZE_REC_COMMIT, 0, NULL, 0);
+	if (error != 0)
+		goto out;
+	where = "commit/sync";
+	error = resize_journal_sync(jr);
+	if (error != 0)
+		goto out;
+
+	where = "phase-set/committed";
+	error = resize_journal_set_phase(jr, RESIZE_PHASE_COMMITTED);
+	if (error != 0)
+		goto out;
+	resize_vlog(opt->verbose, "phase: committed\n");
+	where = "committed/sync";
+	error = resize_journal_sync(jr);
+	if (error != 0)
+		goto out;
+	where = "superblock/mark-clean";
+	error = resize_superblock_set_clean_state(rt, sb, 1);
+	if (error == 0) {
+		where = "invariants/post-mark-clean";
+		error = resize_check_invariants_phase(opt, rt, sb,
+		    "post-mark-clean");
+	}
+out:
+	if (error != 0 && opt->verbose && where != NULL)
+		fprintf(stderr, "execute: %s failed (%s)\n", where,
+		    strerror(error));
+	return (error);
+}
+
 static int
 resize_execute(const struct resize_options *opt, int tfd, uint64_t container_bytes,
     struct resize_super *sb, uint64_t target_size, struct resize_move_list *ml,
     const struct resize_ino_remap *irm, uint64_t shift_delta)
 {
 	struct resize_runtime rt;
-	struct resize_plan_ctx pc;
-	struct resize_move mv;
-	uint64_t old_size_bytes;
-	size_t i;
 	struct resize_journal jr;
-	const char *where;
+	uint64_t jflags;
 	int error;
 
+	jflags = 0;
+	if (opt->moves_path == NULL && shift_delta == 0 &&
+	    opt->policy == RESIZE_POLICY_TRUNCATE &&
+	    target_size < sb->fs_size_bytes)
+		jflags |= RESIZE_JF_AUTOPLAN;
+	if (((const struct fs *)sb->raw)->fs_clean != 0 &&
+	    (((const struct fs *)sb->raw)->fs_flags & FS_UNCLEAN) == 0)
+		jflags |= RESIZE_JF_WASCLEAN;
 	memset(&jr, 0, sizeof(jr));
 	jr.fd = -1;
-	where = "journal-create";
 	error = resize_journal_create(opt->journal_path, opt->offset_bytes,
-	    sb->fs_size_bytes, target_size, sb->sb_rel_offset, sb->fs_fsize, &jr);
-	if (error != 0)
+	    sb->fs_size_bytes, target_size, sb->sb_rel_offset, sb->fs_fsize,
+	    jflags, &jr);
+	if (error != 0) {
+		if (opt->verbose)
+			fprintf(stderr, "execute: journal-create failed (%s)\n",
+			    strerror(error));
 		return (error);
+	}
 
 	memset(&rt, 0, sizeof(rt));
 	rt.tfd = tfd;
@@ -5652,187 +7665,9 @@ resize_execute(const struct resize_options *opt, int tfd, uint64_t container_byt
 	    isatty(STDERR_FILENO));
 	rt.verbose = opt->verbose;
 	rt.jr = &jr;
-	old_size_bytes = sb->fs_size_bytes;
 
-	where = "superblock/mark-dirty";
-	error = resize_superblock_set_clean_state(&rt, sb, 0);
-	if (error != 0)
-		goto out;
-	where = "invariants/post-mark-dirty";
-	error = resize_check_invariants_phase(opt, &rt, sb, "post-mark-dirty");
-	if (error != 0)
-		goto out;
-
-	if (irm != NULL && irm->nent != 0) {
-		where = "inode-remap/plan-ctx-init";
-		error = resize_plan_ctx_init_from_super(&pc, tfd, container_bytes,
-		    opt->offset_bytes, opt->verbose, sb);
-		if (error != 0)
-			goto out;
-		for (i = 0; i < irm->nent; i++) {
-			memset(&mv, 0, sizeof(mv));
-			mv.old_fsb = irm->ents[i].old_ino;
-			mv.new_fsb = irm->ents[i].new_ino;
-			mv.bytes = pc.inode_size;
-			where = "inode-remap/journal-map-intent";
-			error = resize_journal_append(&jr, RESIZE_REC_INTENT,
-			    RESIZE_MUT_INODE_REMAP_MAP, &mv, 0);
-			if (error != 0)
-				goto out;
-			where = "inode-remap/journal-map-applied";
-			error = resize_journal_append(&jr, RESIZE_REC_APPLIED,
-			    RESIZE_MUT_INODE_REMAP_MAP, &mv, 0);
-			if (error != 0)
-				goto out;
-		}
-		memset(&mv, 0, sizeof(mv));
-		mv.old_fsb = irm->nent;
-		where = "inode-remap/journal-exec-intent";
-		error = resize_journal_append(&jr, RESIZE_REC_INTENT,
-		    RESIZE_MUT_INODE_REMAP_EXEC, &mv, 0);
-		if (error != 0)
-			goto out;
-		where = "inode-remap/journal-sync-before-exec";
-		error = resize_journal_sync(&jr);
-		if (error != 0)
-			goto out;
-		where = "inode-remap/apply";
-		error = resize_apply_inode_remap(&pc, sb, irm);
-		if (error != 0)
-			goto out;
-		where = "inode-remap/journal-exec-applied";
-		error = resize_journal_append(&jr, RESIZE_REC_APPLIED,
-		    RESIZE_MUT_INODE_REMAP_EXEC, &mv, 0);
-		if (error != 0)
-			goto out;
-		where = "inode-remap/journal-sync-after-exec";
-		error = resize_journal_sync(&jr);
-		if (error != 0)
-			goto out;
-		where = "invariants/post-inode-remap";
-		error = resize_check_invariants_phase(opt, &rt, sb,
-		    "post-inode-remap");
-		if (error != 0)
-			goto out;
-	}
-
-	if (ml->nmoves == 0 && opt->moves_path == NULL &&
-	    target_size < sb->fs_size_bytes) {
-		where = "auto-plan/post-remap";
-		error = resize_plan_auto_shrink_end(tfd, container_bytes, opt, sb,
-		    target_size, ml);
-		if (error != 0)
-			goto out;
-		resize_reorder_moves(ml, false);
-	}
-
-	where = "alloc/init-from-moves";
-	error = resize_alloc_init_from_moves(&rt.amap, ml);
-	if (error != 0)
-		goto out;
-
-	if (ml->nmoves != 0) {
-		resize_vlog(opt->verbose, "phase: relocating (%zu moves)\n",
-		    ml->nmoves);
-		where = "phase-set/relocating";
-		error = resize_journal_set_phase(&jr, RESIZE_PHASE_RELOCATING);
-		if (error != 0)
-			goto out;
-		where = "journal-sync/relocating";
-		error = resize_journal_sync(&jr);
-		if (error != 0)
-			goto out;
-		where = "relocation/run";
-		error = resize_run_relocation(&rt, ml);
-		if (error != 0)
-			goto out;
-		where = "invariants/post-relocating";
-		error = resize_check_invariants_phase(opt, &rt, sb,
-		    "post-relocating");
-		if (error != 0)
-			goto out;
-	}
-
-	where = "phase-set/metadata";
-	error = resize_journal_set_phase(&jr, RESIZE_PHASE_METADATA);
-	if (error != 0)
-		goto out;
-	resize_vlog(opt->verbose, "phase: metadata (superblock update)\n");
-	where = "journal-sync/metadata";
-	error = resize_journal_sync(&jr);
-	if (error != 0)
-		goto out;
-	where = "superblock/set-size";
-	error = resize_superblock_set_size(&rt, sb, target_size);
-	if (error != 0)
-		goto out;
-	if (target_size != old_size_bytes) {
-		rt.fs = *(const struct fs *)sb->raw;
-		where = "summaries/recompute";
-		error = resize_recompute_free_summaries(&rt, sb);
-		if (error != 0)
-			goto out;
-	}
-	where = "invariants/post-metadata";
-	error = resize_check_invariants_phase(opt, &rt, sb, "post-metadata");
-	if (error != 0)
-		goto out;
-
-	if (shift_delta != 0) {
-		resize_vlog(opt->verbose,
-		    "phase: shifting-image (delta=%" PRIu64 ")\n",
-		    shift_delta);
-		where = "shift-image/journaled-copy";
-		error = resize_shift_image_up_journal(&rt, opt->offset_bytes,
-		    target_size, shift_delta);
-		if (error != 0)
-			goto out;
-		where = "shift-image/verify-super";
-		error = resize_shift_rebase_super(&rt, sb, shift_delta,
-		    target_size);
-		if (error != 0)
-			goto out;
-		where = "invariants/post-shifting-image";
-		error = resize_check_invariants_phase(opt, &rt, sb,
-		    "post-shifting-image");
-		if (error != 0)
-			goto out;
-	}
-
-	where = "phase-set/committing";
-	error = resize_journal_set_phase(&jr, RESIZE_PHASE_COMMITTING);
-	if (error != 0)
-		goto out;
-	resize_vlog(opt->verbose, "phase: committing\n");
-	where = "commit/append";
-	error = resize_journal_append(&jr, RESIZE_REC_COMMIT, 0, NULL, 0);
-	if (error != 0)
-		goto out;
-	where = "commit/sync";
-	error = resize_journal_sync(&jr);
-	if (error != 0)
-		goto out;
-
-	where = "phase-set/committed";
-	error = resize_journal_set_phase(&jr, RESIZE_PHASE_COMMITTED);
-	if (error != 0)
-		goto out;
-	resize_vlog(opt->verbose, "phase: committed\n");
-	where = "committed/sync";
-	error = resize_journal_sync(&jr);
-	if (error != 0)
-		goto out;
-	where = "superblock/mark-clean";
-	error = resize_superblock_set_clean_state(&rt, sb, 1);
-	if (error == 0) {
-		where = "invariants/post-mark-clean";
-		error = resize_check_invariants_phase(opt, &rt, sb,
-		    "post-mark-clean");
-	}
-out:
-	if (error != 0 && opt->verbose && where != NULL)
-		fprintf(stderr, "execute: %s failed (%s)\n", where,
-		    strerror(error));
+	error = resize_execute_body(opt, &rt, sb, target_size, ml, irm, NULL, 0,
+	    shift_delta);
 	resize_alloc_free(&rt.amap);
 	resize_journal_close(&jr);
 	return (error);
@@ -5840,7 +7675,7 @@ out:
 
 static int
 resize_resolve_target_size(const struct resize_options *opt, uint64_t container_bytes,
-    uint64_t current_size, uint64_t *target_size)
+    uint64_t current_size, uint32_t fsize, uint64_t *target_size)
 {
 	uint64_t tsize;
 	int error;
@@ -5849,6 +7684,9 @@ resize_resolve_target_size(const struct resize_options *opt, uint64_t container_
 		tsize = opt->size_bytes;
 	} else if (container_bytes > opt->offset_bytes) {
 		tsize = container_bytes - opt->offset_bytes;
+		/* Default: the largest fragment-aligned size that fits. */
+		if (fsize != 0)
+			tsize -= tsize % fsize;
 	} else {
 		tsize = current_size;
 	}
@@ -5860,6 +7698,91 @@ resize_resolve_target_size(const struct resize_options *opt, uint64_t container_
 	if (current_size > container_bytes)
 		return (EINVAL);
 	*target_size = tsize;
+	return (0);
+}
+
+/*
+ * Fit the (fragment-aligned) target size to a valid cylinder group
+ * geometry.  Prints a diagnostic and returns non-zero if the target is
+ * unusable; prints a warning if the tail had to be dropped.
+ *
+ * A target that is not smaller than the current size never shrinks the
+ * file system: the existing last cylinder group is kept under newfs's
+ * rule even if it has no room for a data block.  If the fitted size is
+ * the current size, RESIZE_FIT_NOOP is returned when the size was not
+ * given or equals the current size, and ENOSPC ("not enough new space")
+ * when a larger size was asked for explicitly.
+ */
+#define RESIZE_FIT_NOOP	(-1)
+
+static int
+resize_fit_target(const struct resize_super *sb, int have_size,
+    uint64_t *target_sizep, uint32_t *old_ncgp, uint32_t *new_ncgp)
+{
+	const struct fs *fs = (const struct fs *)sb->raw;
+	uint64_t want_blocks, fit_blocks, fit_size, lost;
+	uint32_t fit_ncg, newfs_ncg;
+	int error;
+
+	*old_ncgp = (uint32_t)fs->fs_ncg;
+	want_blocks = *target_sizep / sb->fs_fsize;
+	/*
+	 * Not shrinking: the current last cg may stay as newfs made it.
+	 * Shrinking: every remaining cg must hold a data block.
+	 */
+	newfs_ncg = (*target_sizep >= sb->fs_size_bytes) ?
+	    (uint32_t)fs->fs_ncg : 0;
+	error = resize_fit_geometry(fs, want_blocks, newfs_ncg, &fit_blocks,
+	    &fit_ncg);
+	switch (error) {
+	case 0:
+		break;
+	case ENOSPC:
+		fprintf(stderr, "target size %" PRIu64 " too small: the first "
+		    "cylinder group does not fit\n", *target_sizep);
+		return (error);
+	case EFBIG:
+		fprintf(stderr, "target size %" PRIu64 " needs more cylinder "
+		    "groups than the summary area (fs_cssize=%d) can hold; "
+		    "relocating the summary area is not supported\n",
+		    *target_sizep, fs->fs_cssize);
+		return (error);
+	default:
+		fprintf(stderr, "cannot fit geometry for target size %" PRIu64
+		    ": %s\n", *target_sizep, strerror(error));
+		return (error);
+	}
+	fit_size = fit_blocks * sb->fs_fsize;
+	if (fit_size != *target_sizep) {
+		lost = *target_sizep - fit_size;
+		fprintf(stderr, "warning: last cylinder group too small for its "
+		    "metadata; %" PRIu64 " sector(s) cannot be allocated, "
+		    "target size %" PRIu64 " -> %" PRIu64 "\n",
+		    lost / DEV_BSIZE, *target_sizep, fit_size);
+	}
+	if (*target_sizep >= sb->fs_size_bytes && fit_size < sb->fs_size_bytes) {
+		/* Cannot happen with a valid current geometry; never shrink. */
+		fprintf(stderr, "refusing to shrink: target size %" PRIu64
+		    " is not below the current %" PRIu64 " bytes, but its "
+		    "geometry fits only %" PRIu64 " bytes\n",
+		    *target_sizep, sb->fs_size_bytes, fit_size);
+		return (EINVAL);
+	}
+	if (fit_size == sb->fs_size_bytes &&
+	    (!have_size || *target_sizep == sb->fs_size_bytes)) {
+		printf("nothing to do: file system size is already %" PRIu64
+		    " bytes (%u cylinder groups)\n", sb->fs_size_bytes,
+		    *old_ncgp);
+		return (RESIZE_FIT_NOOP);
+	}
+	if (*target_sizep > sb->fs_size_bytes && fit_size <= sb->fs_size_bytes) {
+		fprintf(stderr, "not enough new space: target size %" PRIu64
+		    " fits no more than the current %" PRIu64 " bytes\n",
+		    *target_sizep, sb->fs_size_bytes);
+		return (ENOSPC);
+	}
+	*target_sizep = fit_size;
+	*new_ncgp = fit_ncg;
 	return (0);
 }
 
@@ -6091,9 +8014,9 @@ main(int argc, char **argv)
 	struct stat st;
 	uint64_t container_bytes, target_size, old_size_bytes;
 	uint64_t begin_delta;
+	uint32_t old_ncg, new_ncg;
 	const char *move_src;
 	int shift_beginning_mode;
-	int dryrun_irm_preview = 0;
 	int defer_autoplan = 0;
 	int li_error;
 	int tfd = -1;
@@ -6186,7 +8109,7 @@ main(int argc, char **argv)
 	old_size_bytes = sb.fs_size_bytes;
 
 	error = resize_resolve_target_size(&opt, container_bytes, sb.fs_size_bytes,
-	    &target_size);
+	    sb.fs_fsize, &target_size);
 	if (error != 0) {
 		fprintf(stderr, "size resolution failed: %s\n", strerror(error));
 		close(tfd);
@@ -6199,6 +8122,16 @@ main(int argc, char **argv)
 		close(tfd);
 		return (1);
 	}
+	error = resize_fit_target(&sb, opt.have_size, &target_size, &old_ncg,
+	    &new_ncg);
+	if (error == RESIZE_FIT_NOOP) {
+		close(tfd);
+		return (0);
+	}
+	if (error != 0) {
+		close(tfd);
+		return (1);
+	}
 	if (opt.policy == RESIZE_POLICY_PUSH_FORWARD &&
 	    target_size < old_size_bytes) {
 		fprintf(stderr,
@@ -6206,9 +8139,15 @@ main(int argc, char **argv)
 		close(tfd);
 		return (1);
 	}
-
+	/*
+	 * Everything that can make a shrink impossible is checked here,
+	 * before the journal is created or anything is written: inodes in
+	 * the removed area need free inodes below the new end, and all
+	 * blocks beyond it need room below it.  These failures are never
+	 * overridden by --force: continuing would lose inodes or data.
+	 */
 	memset(&irm, 0, sizeof(irm));
-	if (target_size < old_size_bytes && opt.moves_path == NULL) {
+	if (target_size < old_size_bytes) {
 		memset(&ipc, 0, sizeof(ipc));
 		ipc.tfd = tfd;
 		ipc.container_bytes = container_bytes;
@@ -6222,32 +8161,38 @@ main(int argc, char **argv)
 		if (((const struct fs *)sb.raw)->fs_magic == FS_UFS1_MAGIC) {
 			ipc.ptr_width = 4;
 			ipc.inode_size = sizeof(struct ufs1_dinode);
-			ipc.maxsymlinklen = MAXSYMLINKLEN_UFS1;
+			ipc.maxsymlinklen = (uint32_t)
+			    ((const struct fs *)sb.raw)->fs_maxsymlinklen;
 		} else {
 			ipc.ptr_width = 8;
 			ipc.inode_size = sizeof(struct ufs2_dinode);
-			ipc.maxsymlinklen = MAXSYMLINKLEN_UFS2;
+			ipc.maxsymlinklen = (uint32_t)
+			    ((const struct fs *)sb.raw)->fs_maxsymlinklen;
 		}
 		error = resize_build_inode_remap(&ipc, target_size / sb.fs_fsize,
 		    &irm);
-		if (error != 0 && !opt.force) {
-			fprintf(stderr, "inode-remap planning failed: %s\n",
-			    strerror(error));
+		if (error != 0) {
+			fprintf(stderr, "inode-remap planning failed: %s%s; %s "
+			    "not modified\n", strerror(error),
+			    error == ENOSPC ? " (not enough free inodes below "
+			    "the new size)" : "", opt.target_path);
 			close(tfd);
 			return (1);
 		}
-		if (error != 0 && opt.force)
-			resize_vlog(opt.verbose,
-			    "inode-remap planning failed (%s), continuing due to --force\n",
-			    strerror(error));
-		if (error == 0 && irm.nent != 0) {
+		if (irm.nent != 0 && opt.moves_path != NULL) {
+			fprintf(stderr, "%zu used inode(s) lie beyond the new "
+			    "size; --moves cannot relocate inodes, use the "
+			    "automatic plan; %s not modified\n", irm.nent,
+			    opt.target_path);
+			resize_ino_remap_free(&irm);
+			close(tfd);
+			return (1);
+		}
+		if (irm.nent != 0) {
 			fprintf(stderr,
 			    "inode-remap: %zu inode(s) will be relocated out of doomed inode-table blocks\n",
 			    irm.nent);
-			if (opt.dry_run)
-				dryrun_irm_preview = 1;
-			else if (opt.moves_path == NULL)
-				defer_autoplan = 1;
+			defer_autoplan = 1;
 		}
 	}
 
@@ -6264,37 +8209,56 @@ main(int argc, char **argv)
 			close(tfd);
 			return (1);
 		}
-		resize_reorder_moves(&ml, false);
+		error = resize_plan_finalize(&ml, (const struct fs *)sb.raw,
+		    tfd, container_bytes, opt.offset_bytes,
+		    target_size < old_size_bytes ? target_size / sb.fs_fsize : 0,
+		    opt.verbose);
+		if (error == 0 && target_size < sb.fs_size_bytes)
+			error = resize_plan_check_coverage(&ml,
+			    (const struct fs *)sb.raw, tfd, container_bytes,
+			    opt.offset_bytes, target_size / sb.fs_fsize);
+		if (error != 0) {
+			fprintf(stderr, "invalid move plan %s: %s; %s not "
+			    "modified\n", opt.moves_path, strerror(error),
+			    opt.target_path);
+			free(ml.moves);
+			close(tfd);
+			return (1);
+		}
 		move_src = opt.moves_path;
 	} else {
 		move_src = "(none)";
-		if (dryrun_irm_preview) {
-			move_src = "(auto+inode-remap-preview)";
-		} else if (defer_autoplan) {
-			move_src = "(auto-post-remap)";
-		} else if (target_size < sb.fs_size_bytes) {
+		if (target_size < sb.fs_size_bytes) {
 			error = resize_plan_auto_shrink_end(tfd, container_bytes,
 			    &opt, &sb, target_size, &ml);
+			if (error == 0)
+				error = resize_plan_finalize(&ml,
+				    (const struct fs *)sb.raw, tfd, container_bytes,
+				    opt.offset_bytes,
+				    target_size / sb.fs_fsize, opt.verbose);
+			if (error == 0)
+				error = resize_plan_check_coverage(&ml,
+				    (const struct fs *)sb.raw, tfd, container_bytes,
+				    opt.offset_bytes, target_size / sb.fs_fsize);
 			if (error != 0) {
-				if (!opt.force) {
-					if (error == ENOTSUP) {
-						fprintf(stderr,
-						    "auto-plan failed: %s; inode remap + relocation could not satisfy target.\n",
-						    strerror(error));
-					} else {
-						fprintf(stderr,
-						    "auto-plan failed: %s\n",
-						    strerror(error));
-					}
-					free(ml.moves);
-					close(tfd);
-					return (1);
-				}
-				resize_vlog(opt.verbose,
-				    "auto-plan failed (%s), continuing due to --force\n",
-				    strerror(error));
-			} else {
-				move_src = "(auto)";
+				fprintf(stderr, "auto-plan failed: %s%s; %s not "
+				    "modified\n", strerror(error),
+				    error == ENOSPC ? " (not enough free space "
+				    "below the new size)" : "",
+				    opt.target_path);
+				free(ml.moves);
+				resize_ino_remap_free(&irm);
+				close(tfd);
+				return (1);
+			}
+			move_src = "(auto)";
+			if (defer_autoplan) {
+				/*
+				 * This plan runs after the remap, with its
+				 * owner slots in remapped inodes moved
+				 * along (resize_plan_follow_remap).
+				 */
+				move_src = "(auto+inode-remap)";
 			}
 		}
 	}
@@ -6333,15 +8297,12 @@ main(int argc, char **argv)
 		    target_size, sb.fs_fsize, ml.nmoves,
 		    resize_policy_name(opt.policy),
 		    move_src);
+		fprintf(stdout, " ncg=%u->%u", old_ncg, new_ncg);
 		if (shift_beginning_mode) {
 			fprintf(stdout, " new_offset=%" PRIu64 " delta=%" PRIu64,
 			    opt.offset_bytes + begin_delta, begin_delta);
 		}
 		fprintf(stdout, "\n");
-		if (dryrun_irm_preview) {
-			fprintf(stdout,
-			    "note: inode remap preview mode; relocation move count requires non-dry-run execution path\n");
-		}
 		resize_print_label_hint(stdout, &opt, &li, li_error,
 		    old_size_bytes, target_size);
 		free(ml.moves);
