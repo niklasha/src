@@ -42,8 +42,35 @@ Specify the offset of the file system inside
 The default is zero.
 .It Cm --size Ar bytes
 Resize the file system to
-.Ar bytes .
-If omitted, the size is inferred from the containing partition or file.
+.Ar bytes ,
+which must be a multiple of the fragment size.
+If omitted, the size is inferred from the containing partition or file,
+rounded down to a multiple of the fragment size.
+As with
+.Xr growfs 8 ,
+if the last cylinder group would be too small to hold its superblock copy,
+cylinder group block, inode table and one data block, it is not created and
+the size is truncated to a whole number of cylinder groups; a warning gives
+the number of sectors that cannot be allocated.
+This rule applies to new cylinder groups and to shrinking; when the size is
+not reduced, the existing last cylinder group is kept as long as it satisfies
+.Xr newfs 8 Ns 's
+own rule (room for its metadata, rounded up to a block), so the file system
+is never made smaller unless a smaller size is asked for.
+If the resulting size equals the current size and
+.Cm --size
+was omitted or equals the current size,
+.Nm
+prints
+.Dq nothing to do ,
+does not modify
+.Ar target
+and exits 0; an explicit larger
+.Cm --size
+that gains nothing fails with
+.Dq not enough new space .
+The new number of cylinder groups must fit in the existing cylinder group
+summary area; growing beyond that is refused.
 .It Cm --policy Ar truncate | shrink-move | push-forward
 Select the resize policy.
 .Cm truncate
@@ -64,22 +91,46 @@ The default is
 Load an explicit relocation plan from
 .Ar path
 instead of generating one automatically.
+Each line holds five numbers: old block, new block (both in fragments),
+size in bytes, absolute byte offset of the pointer to the block, and the
+pointer width (4 or 8).
+The lines are executed in file order, except that all lines for one block
+are done together, at the position of its first line.
+A pointer that lies in a block moved by an earlier line is updated in the
+new copy of that block.
+A plan is refused before anything is written if a fragment run crosses a
+block boundary, a destination lies beyond the new size, any source or
+destination overlaps another, a source is not allocated or a destination
+not free in its cylinder group, a pointer does not hold its old block or
+has the wrong width, or an allocated fragment beyond the new size is not
+moved by any line.
 .It Cm --dry-run
 Print the planned resize operation without modifying the target.
 .It Cm --recover
 Replay any unapplied journal records and stop.
 .It Cm --revert
-Undo reversible journaled changes in reverse order and reset the journal.
+Undo the journaled changes in reverse order, including a step that was
+interrupted, and reset the journal.
+This also undoes moving inodes out of removed cylinder groups.
 .It Cm --resume
-Replay pending journal records and attempt to finish a partially completed
-resize.
+Replay pending journal records and finish a partially completed resize.
+A shrink interrupted while moving inodes or blocks is finished by planning
+the blocks still beyond the new size again from the file system.
 .It Cm --force
-Continue past certain planning failures that would otherwise abort the
-operation.
+Accepted for compatibility.
+A shrink that does not fit (not enough free inodes or free space below the
+new size) or would leave allocated data beyond the new size is refused
+even with
+.Cm --force ,
+before anything is written.
 .It Cm --progress
 Display progress while relocation or shift work is running.
 .It Cm --check-invariants
-Run additional on-disk consistency checks after each mutating phase.
+Run additional on-disk consistency checks after each mutating phase:
+geometry, cylinder group summaries, that used FFS2 inodes lie below
+.Va cg_initediblk ,
+and that every block a used inode refers to lies inside the file system,
+is allocated, and is not shared with metadata or another reference.
 .It Cm --verbose
 Print additional progress and planning information.
 .El
@@ -95,6 +146,8 @@ utility is intended for offline use on unmounted file systems.
 .It Pa ./resize.journal
 Default journal path.
 .El
+.Sh EXIT STATUS
+.Ex -std
 .Sh SEE ALSO
 .Xr fsck_ffs 8 ,
 .Xr growfs 8 ,
@@ -104,3 +157,45 @@ Default journal path.
 Running
 .Nm
 against a mounted file system is not supported.
+.Sh BUGS
+The cylinder group summary area is never moved: a shrink below its end is
+refused.
+A shrink of an FFS2 file system with extended attribute blocks
+.Pq Va di_extb ,
+which
+.Ox
+never creates, is refused.
+.Pp
+A
+.Cm --moves
+plan cannot move inodes: a shrink that removes cylinder groups holding used
+inodes is refused with
+.Cm --moves ;
+use the automatic plan.
+.Pp
+.Cm --resume
+of a shrink that was interrupted before its metadata phase works only for
+a journal of a
+.Cm truncate
+shrink with the automatic plan, written by this version of
+.Nm .
+Other interrupted shrinks (with
+.Cm --moves ,
+with
+.Cm shrink-move ,
+or with a journal from an older version) are refused with an error and
+can be undone with
+.Cm --revert .
+A resumed shrink plans the blocks that are left again; very close to the
+minimum size that plan can fail, and then
+.Cm --revert
+undoes the shrink.
+.Cm --revert
+cannot undo the image shift of
+.Cm shrink-move .
+.Pp
+.Cm --revert
+and
+.Cm --resume
+assume that the file system was not mounted since the resize; a
+completed resize that was mounted and modified must not be reverted.
