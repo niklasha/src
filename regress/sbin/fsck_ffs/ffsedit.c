@@ -23,6 +23,11 @@
  *	ffsedit image tail N		fs_size = cgbase(ncg - 1) + N
  *	ffsedit image size N		fs_size = N
  *	ffsedit image db INO N		di_db[0] of inode INO = N
+ *	ffsedit image nlink INO N	di_nlink of inode INO = N
+ *	ffsedit image mode INO N	di_mode of inode INO = N (0 prefix: octal)
+ *	ffsedit image getdb INO		print di_db[0] of inode INO
+ *	ffsedit image sbncg N		fs_ncg = N in the primary super block only
+ *	ffsedit image unclean		clear fs_clean in the primary super block
  *
  * fs_size is written to the primary and all alternate super blocks,
  * as resize_ffs does when it grows a file system.
@@ -35,6 +40,7 @@
 #include <ufs/ffs/fs.h>
 
 #include <err.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -54,19 +60,21 @@ static void
 usage(void)
 {
 	fprintf(stderr, "usage: ffsedit image info | tail n | size n | "
-	    "db ino n\n");
+	    "db ino n | nlink ino n | mode ino n |\n"
+	    "\tgetdb ino | sbncg n | unclean\n");
 	exit(1);
 }
 
 static long long
 num(const char *s)
 {
-	const char *errstr;
 	long long n;
+	char *ep;
 
-	n = strtonum(s, 0, LLONG_MAX, &errstr);
-	if (errstr)
-		errx(1, "%s: %s", s, errstr);
+	errno = 0;
+	n = strtoll(s, &ep, 0);
+	if (*s == '\0' || *ep != '\0' || n < 0 || errno == ERANGE)
+		errx(1, "%s: invalid number", s);
 	return (n);
 }
 
@@ -106,8 +114,12 @@ setsize(int fd, int64_t size)
 			err(1, "pwrite alternate super block %u", c);
 }
 
+/*
+ * Set field (db, nlink or mode) of inode ino to val, or print di_db[0]
+ * for getdb.
+ */
 static void
-setdb(int fd, ino_t ino, int64_t blk)
+setino(int fd, ino_t ino, const char *field, int64_t val)
 {
 	struct ufs1_dinode d1;
 	struct ufs2_dinode d2;
@@ -118,14 +130,30 @@ setdb(int fd, ino_t ino, int64_t blk)
 		off += ino_to_fsbo(fs, ino) * sizeof(d1);
 		if (pread(fd, &d1, sizeof(d1), off) != sizeof(d1))
 			err(1, "pread inode");
-		d1.di_db[0] = blk;
+		if (strcmp(field, "getdb") == 0) {
+			printf("%lld\n", (long long)d1.di_db[0]);
+			return;
+		} else if (strcmp(field, "db") == 0)
+			d1.di_db[0] = val;
+		else if (strcmp(field, "mode") == 0)
+			d1.di_mode = val;
+		else
+			d1.di_nlink = val;
 		if (pwrite(fd, &d1, sizeof(d1), off) != sizeof(d1))
 			err(1, "pwrite inode");
 	} else {
 		off += ino_to_fsbo(fs, ino) * sizeof(d2);
 		if (pread(fd, &d2, sizeof(d2), off) != sizeof(d2))
 			err(1, "pread inode");
-		d2.di_db[0] = blk;
+		if (strcmp(field, "getdb") == 0) {
+			printf("%lld\n", (long long)d2.di_db[0]);
+			return;
+		} else if (strcmp(field, "db") == 0)
+			d2.di_db[0] = val;
+		else if (strcmp(field, "mode") == 0)
+			d2.di_mode = val;
+		else
+			d2.di_nlink = val;
 		if (pwrite(fd, &d2, sizeof(d2), off) != sizeof(d2))
 			err(1, "pwrite inode");
 	}
@@ -158,8 +186,21 @@ main(int argc, char *argv[])
 		setsize(fd, cgbase(fs, last) + num(argv[3]));
 	} else if (strcmp(argv[2], "size") == 0 && argc == 4) {
 		setsize(fd, num(argv[3]));
-	} else if (strcmp(argv[2], "db") == 0 && argc == 5) {
-		setdb(fd, num(argv[3]), num(argv[4]));
+	} else if ((strcmp(argv[2], "db") == 0 ||
+	    strcmp(argv[2], "nlink") == 0 ||
+	    strcmp(argv[2], "mode") == 0) && argc == 5) {
+		setino(fd, num(argv[3]), argv[2], num(argv[4]));
+	} else if (strcmp(argv[2], "getdb") == 0 && argc == 4) {
+		setino(fd, num(argv[3]), argv[2], 0);
+	} else if (strcmp(argv[2], "sbncg") == 0 && argc == 4) {
+		/* Primary only: the alternates keep the real value. */
+		fs->fs_ncg = num(argv[3]);
+		if (pwrite(fd, u.buf, SBLOCKSIZE, sbloc) != SBLOCKSIZE)
+			err(1, "pwrite super block");
+	} else if (strcmp(argv[2], "unclean") == 0 && argc == 3) {
+		fs->fs_clean = 0;
+		if (pwrite(fd, u.buf, SBLOCKSIZE, sbloc) != SBLOCKSIZE)
+			err(1, "pwrite super block");
 	} else
 		usage();
 	close(fd);

@@ -3,7 +3,13 @@
 #
 # Regress tests for fsck_ffs: super blocks whose cylinder group layout
 # does not fit in fs_size, the exit status when the check cannot run,
-# block numbers at fs_size, and clean file systems of several shapes.
+# block numbers at fs_size, clean file systems of several shapes, and
+# the exit status: 8 whenever inconsistencies remain unresolved (-n,
+# no answers, no write access, write or read errors) or the file system
+# is larger than its partition or image file; repairs that need a
+# second pass (root reallocation) or used to leave inconsistencies
+# behind (hard links in a lost root, HOLD BAD BLOCK, a bad primary super
+# block, a label without geometry).
 #
 # usage: checkfsck ffsedit [fsck_ffs]
 
@@ -22,6 +28,7 @@ cleanup() {
 	[ -z "$vnd" ] || vnconfig -u "$vnd"
 	vnd=
 	mnt=
+	chflags -R nouchg "${T:?}"
 	rm -rf "${T:?}"
 }
 trap 'cleanup; exit 1' INT TERM
@@ -47,7 +54,7 @@ mkfs() {
 	dd if=/dev/zero of=$img bs=512 count=0 seek=$2 2>/dev/null
 	shift 2
 	attach $img
-	newfs "$@" /dev/r${vnd}c >/dev/null 2>&1 ||
+	newfs "$@" /dev/r${vnd}c >${img%.img}.newfs 2>&1 ||
 	    { echo "newfs $* failed"; detach; cleanup; exit 1; }
 	detach
 }
@@ -63,12 +70,21 @@ info() {
 # Run fsck_ffs on image, require exit status want-exit and, unless
 # pattern is empty, a line matching pattern.
 check() {
-	name=$1 image=$2 want=$3 pat=$4
-	shift 4
+	name=$1 image=$2
+	shift 2
 	attach $image
-	$FSCK "$@" /dev/r${vnd}c >$T/out 2>&1 </dev/null
-	got=$?
+	checkdev $name /dev/r${vnd}c "$@"
 	detach
+}
+
+# checkdev name device want-exit pattern fsck-flags...
+# The same, on a device or file that is already set up.  $PRE, if set,
+# is run in the subshell that starts fsck_ffs (e.g. a ulimit).
+checkdev() {
+	name=$1 dev=$2 want=$3 pat=$4
+	shift 4
+	(eval "${PRE:-:}"; exec $FSCK "$@" $dev) >$T/out 2>&1 </dev/null
+	got=$?
 	if [ $got -ne $want ]; then
 		fail "$name: fsck_ffs $*: exit $got, want $want"
 	elif [ -n "$pat" ] && ! grep -Eq "$pat" $T/out; then
@@ -76,6 +92,18 @@ check() {
 	else
 		echo "ok $name: fsck_ffs $*: exit $got"
 	fi
+}
+
+# nomatch name pattern: the last fsck_ffs output has no line matching.
+nomatch() {
+	if grep -Eq "$2" $T/out; then
+		fail "$1: unexpected line matching /$2/"
+	fi
+}
+
+# same name image sum: image is unchanged.
+same() {
+	[ "$3" = "$(sha256 -q $2)" ] || fail "$1: fsck_ffs changed the image"
 }
 
 # quiet name image: a clean file system gives no messages besides the
@@ -145,25 +173,325 @@ badgeom() {
 	rm -f $T/hdr.img $T/hdrend.img $T/part.img $T/dmin1.img $T/size.img
 }
 
-# A direct block at fs_size, one past the last fragment, must be
-# reported as BAD; unfixed fsck_ffs accepted it and set a bit past the
-# end of blockmap.
-badblk() {
+# populate name sectors newfs-args...: a new file system with one file
+# in it (and a second link to it if LINK is set); sets ino to the file's inode number and the info variables.
+populate() {
 	o=$1
 	shift
 	mkfs $o "$@"
 	attach $T/$o.img
 	mnt=$T/mnt
 	mkdir -p $mnt
-	mount /dev/${vnd}c $mnt || { fail "$o: mount"; detach; return; }
+	mount /dev/${vnd}c $mnt ||
+	    { echo "$o: mount failed"; detach; cleanup; exit 1; }
 	echo data >$mnt/file
+	[ -z "$LINK" ] || ln $mnt/file $mnt/link
 	ino=$(ls -i $mnt/file | awk '{ print $1 }')
 	umount $mnt
 	mnt=
 	detach
 	info $T/$o.img
+}
+
+# has name pattern: the last fsck_ffs output has a line matching.
+has() {
+	grep -Eq "$2" $T/out || fail "$1: no line matching /$2/"
+}
+
+# altsb name: the second super block backup newfs reported for name.
+altsb() {
+	awk '/backups/ { getline; split($0, a, ","); print a[2] + 0; exit }' \
+	    $T/$1.newfs
+}
+
+unres='UNRESOLVED INCONSISTENCIES REMAIN'
+exceeds='FILE SYSTEM SIZE [0-9]+ EXCEEDS (PARTITION|FILE) SIZE [0-9]+'
+
+# A direct block at fs_size, one past the last fragment, must be
+# reported as BAD; unfixed fsck_ffs accepted it and set a bit past the
+# end of blockmap.  Preen does not fix a bad block and -n fixes
+# nothing, so both exit 8; -y clears the inode and exits 0.
+badblk() {
+	o=$1
+	shift
+	populate $o "$@"
 	$FFSEDIT $T/$o.img db $ino $size
-	check $o-blk $T/$o.img 0 "^$size BAD I=$ino\$" -n -f
+	check $o-blk $T/$o.img 8 "^$size BAD I=$ino\$" -n -f
+	has $o-blk "$unres"
+	check $o-blk $T/$o.img 8 'UNEXPECTED INCONSISTENCY' -p -f
+	check $o-blk $T/$o.img 0 "^$size BAD I=$ino\$" -y -f
+	nomatch $o-blk "$unres"
+	check $o-blk $T/$o.img 0 '^[0-9]+ files, ' -n -f
+	nomatch $o-blk "$unres"
+	rm -f $T/$o.img
+}
+
+# Exit status on a clean file system, and on an unclean one without
+# inconsistencies: always 0, with no new messages.
+cleanfs() {
+	o=$1
+	shift
+	mkfs $o "$@"
+	quiet $o $T/$o.img
+	check $o $T/$o.img 0 'clean; not checking' -n
+	check $o $T/$o.img 0 'clean; not checking' -y
+	check $o $T/$o.img 0 '^[0-9]+ files, ' -y -f
+	nomatch $o "$unres|MODIFIED"
+	check $o $T/$o.img 0 ' [0-9]+ files, ' -p -f
+	$FFSEDIT $T/$o.img unclean
+	check $o-unclean $T/$o.img 0 '^[0-9]+ files, ' -n
+	nomatch $o-unclean "$unres"
+	check $o-unclean $T/$o.img 0 'MARKING FILE SYSTEM CLEAN' -p
+	quiet $o $T/$o.img
+	rm -f $T/$o.img
+}
+
+# A link count that is too high on an unclean file system: preen
+# fixes it.  -n, and a run without -n or -y that gets no answers,
+# report it and exit 8.  -y fixes it and exits 0, unless it cannot
+# write: then it exits 8 too.
+linkcount() {
+	o=$1
+	shift
+	populate $o "$@"
+	$FFSEDIT $T/$o.img nlink $ino 2
+	$FFSEDIT $T/$o.img unclean
+	img=$T/$o.img
+	sum=$(sha256 -q $img)
+	check $o-nlink $img 8 "LINK COUNT FILE I=$ino" -n
+	has $o-nlink "ADJUST\? no"
+	has $o-nlink "$unres"
+	check $o-nlink $img 8 "$unres" -n -f
+	check $o-nlink $img 8 "$unres"
+	same $o-nlink $img $sum
+
+	# No write access.
+	chflags uchg $img
+	checkdev $o-nlink-rdonly $img 8 "$unres" -y
+	has $o-nlink-rdonly 'NO WRITE'
+	chflags nouchg $img
+	same $o-nlink-rdonly $img $sum
+
+	# Every write fails (beyond the file size limit).
+	PRE="trap '' XFSZ; ulimit -f 16"
+	checkdev $o-nlink-nowrite $img 8 "$unres" -y
+	PRE=
+	has $o-nlink-nowrite 'CANNOT WRITE'
+	nomatch $o-nlink-nowrite 'MARK FILE SYSTEM CLEAN'
+	same $o-nlink-nowrite $img $sum
+
+	check $o-nlink $img 0 "SHOULD BE 1 \\(ADJUSTED\\)" -p
+	check $o-nlink $img 0 'clean; not checking' -p
+	quiet $o-nlink $img
+
+	rm -f $img
+}
+
+# The same with -y, on a fresh copy.
+linkcounty() {
+	o=$1
+	shift
+	populate $o "$@"
+	$FFSEDIT $T/$o.img nlink $ino 2
+	check $o-nlink-y $T/$o.img 0 'ADJUST\? yes' -y -f
+	nomatch $o-nlink-y "$unres"
+	quiet $o-nlink-y $T/$o.img
+	rm -f $T/$o.img
+}
+
+# A file system larger than its partition or image file is refused
+# before anything is written.  fsck -p still skips it when it is clean.
+shortdev() {
+	o=$1
+	shift
+	mkfs $o "$@"
+	info $T/$o.img
+	# The device ends one block short, in the data area of the last cg.
+	cut=$(((size - frag) * fsize / 512))
+	img=$T/short.img
+	cp $T/$o.img $img
+	dd if=/dev/null of=$img bs=512 seek=$cut 2>/dev/null
+	sum=$(sha256 -q $img)
+	checkdev $o-shortfile $img 8 'EXCEEDS FILE SIZE' -n -f
+	check $o-short $img 8 'EXCEEDS PARTITION SIZE' -n -f
+	check $o-short $img 8 "$exceeds" -y -f
+	check $o-short $img 8 "$exceeds" -p -f
+	check $o-short $img 0 'clean; not checking' -p
+	check $o-short $img 0 'clean; not checking' -n
+	same $o-short $img $sum
+	$FFSEDIT $img unclean
+	sum=$(sha256 -q $img)
+	check $o-short-unclean $img 8 "$exceeds" -p
+	# pfatal() ends the line in preen: no empty line before UNEXPECTED.
+	nomatch $o-short-unclean '^$'
+	check $o-short-unclean $img 8 "$exceeds" -y
+	same $o-short-unclean $img $sum
+
+	# The last alternate super block is gone too: -y finds another
+	# alternate and must still refuse.
+	cp $T/$o.img $img
+	dd if=/dev/null of=$img bs=512 seek=$((base * fsize / 512)) \
+	    2>/dev/null
+	sum=$(sha256 -q $img)
+	check $o-short2 $img 8 '' -n -f
+	check $o-short2 $img 8 "" -y
+	check $o-short2 $img 8 "$exceeds" -y -b $(altsb $o)
+	same $o-short2 $img $sum
+
+	# A partition shorter than the file system.
+	cp $T/$o.img $img
+	attach $img
+	echo "a: $cut 0 4.2BSD 2048 16384 16" >$T/proto
+	disklabel -R $vnd $T/proto >/dev/null 2>&1 ||
+	    fail "$o: disklabel -R $vnd"
+	checkdev $o-short-a /dev/r${vnd}a 8 'EXCEEDS PARTITION SIZE' -n -f
+	checkdev $o-short-c /dev/r${vnd}c 0 '^[0-9]+ files, ' -n -f
+	nomatch $o-short-c "$exceeds"
+	detach
+	rm -f $img $T/$o.img
+}
+
+# File systems smaller than their partition, on a partition with an
+# offset, and checked through an alternate super block: no size
+# complaint.
+fits() {
+	o=$1
+	shift
+	img=$T/$o.img
+	dd if=/dev/zero of=$img bs=512 count=0 seek=200000 2>/dev/null
+	attach $img
+	newfs -s 150000 "$@" /dev/r${vnd}c >/dev/null 2>&1 ||
+	    fail "$o: newfs -s"
+	checkdev $o-small /dev/r${vnd}c 0 '^[0-9]+ files, ' -n -f
+	nomatch $o-small "$exceeds|$unres"
+	checkdev $o-small-file $img 0 '^[0-9]+ files, ' -n -f
+	nomatch $o-small-file "$exceeds|$unres"
+	echo "a: 150000 64 4.2BSD 2048 16384 16" >$T/proto
+	disklabel -R $vnd $T/proto >/dev/null 2>&1 ||
+	    fail "$o: disklabel -R $vnd"
+	newfs "$@" /dev/r${vnd}a >$T/$o.newfs 2>&1 || fail "$o: newfs a"
+	checkdev $o-offset /dev/r${vnd}a 0 '^[0-9]+ files, ' -n -f
+	nomatch $o-offset "$exceeds|$unres"
+	checkdev $o-offset /dev/r${vnd}a 0 'clean; not checking' -p
+	checkdev $o-offset-b /dev/r${vnd}a 0 'UPDATE STANDARD SUPERBLOCK' \
+	    -y -b $(altsb $o)
+	nomatch $o-offset-b "$exceeds|$unres"
+	detach
+	rm -f $img
+}
+
+# Blocks that cannot be read: the vnd keeps the size of its backing
+# file, which is then cut inside the last cylinder group's inode table.
+unreadable() {
+	o=$1
+	shift
+	mkfs $o "$@"
+	info $T/$o.img
+	attach $T/$o.img
+	dd if=/dev/null of=$T/$o.img bs=$fsize seek=$((imin + 1)) 2>/dev/null
+	checkdev $o-unread /dev/r${vnd}c 8 'COULD NOT BE READ' -n -f
+	has $o-unread "$unres"
+	checkdev $o-unread /dev/r${vnd}c 8 "$unres" -y -f
+	detach
+	rm -f $T/$o.img
+}
+
+# A file that shares its block with the root directory: -y reallocates
+# the root, cannot finish in one pass and must say so (PLEASE RERUN
+# FSCK, exit 8, not marked clean); a second -y finishes the repair and
+# exits 0.
+rootdup() {
+	o=$1
+	shift
+	populate $o "$@"
+	img=$T/$o.img
+	$FFSEDIT $img db $ino $($FFSEDIT $img getdb 2)
+	$FFSEDIT $img unclean
+	check $o-rootdup $img 8 'DUPS/BAD IN ROOT INODE' -n -f
+	has $o-rootdup "$unres"
+	check $o-rootdup $img 8 'PLEASE RERUN FSCK' -y
+	has $o-rootdup "$unres"
+	nomatch $o-rootdup 'MARK FILE SYSTEM CLEAN'
+	check $o-rootdup $img 8 "$unres" -n
+	check $o-rootdup2 $img 0 '^[0-9]+ files, ' -y
+	nomatch $o-rootdup2 "$unres|PLEASE RERUN"
+	quiet $o-rootdup2 $img
+	rm -f $img
+}
+
+# The root inode is a regular file: -y reallocates the root and
+# reconnects the files to lost+found.  A file with two links whose
+# names were both in the old root gets one name and link count 1.
+rootfile() {
+	o=$1
+	shift
+	LINK=1
+	populate $o "$@"
+	LINK=
+	img=$T/$o.img
+	$FFSEDIT $img mode 2 0100755
+	$FFSEDIT $img unclean
+	check $o-rootfile $img 8 'ROOT INODE NOT DIRECTORY' -n -f
+	check $o-rootfile $img 0 'COUNT 2 SHOULD BE 1' -y
+	has $o-rootfile "UNREF FILE  I=$ino"
+	nomatch $o-rootfile "$unres"
+	quiet $o-rootfile $img
+	rm -f $img
+}
+
+# An inode with mode IFMT, as old bad block files had: -y keeps it as
+# a regular file, and its directory entry must say so too.
+holdbad() {
+	o=$1
+	shift
+	populate $o "$@"
+	img=$T/$o.img
+	$FFSEDIT $img mode $ino 0170644
+	$FFSEDIT $img unclean
+	check $o-holdbad $img 8 'HOLD BAD BLOCK\? no' -n -f
+	has $o-holdbad "$unres"
+	check $o-holdbad $img 0 'HOLD BAD BLOCK\? yes' -y
+	nomatch $o-holdbad "$unres"
+	quiet $o-holdbad $img
+	rm -f $img
+}
+
+# A garbage primary super block (fs_ncg) whose "last alternate" lies
+# past the end of the device: preen gives up as before, -y repairs from
+# an alternate and exits 0.  The failed read of the bogus candidate
+# does not count as an unresolved inconsistency.
+badprimary() {
+	o=$1
+	shift
+	mkfs $o 32768 "$@" -b 8192 -f 1024
+	img=$T/$o.img
+	$FFSEDIT $img sbncg 77
+	$FFSEDIT $img unclean
+	check $o-badprimary $img 8 'BAD SUPER BLOCK|CANNOT READ' -p
+	check $o-badprimary $img 0 'USING ALTERNATE SUPERBLOCK' -y
+	nomatch $o-badprimary "$unres|PLEASE RERUN"
+	quiet $o-badprimary $img
+	rm -f $img
+}
+
+# A 4.2BSD partition without fsize, frag or cpg in the label, too
+# short for the last alternate super block: the search for alternates
+# must fail, not divide by zero.
+nogeom() {
+	o=$1
+	shift
+	mkfs $o 131072 "$@" -b 16384 -f 2048 -c 4096
+	img=$T/$o.img
+	attach $img
+	echo "a: 65536 0 4.2BSD 0 0 0" >$T/proto
+	disklabel -R $vnd $T/proto >/dev/null 2>&1 ||
+	    fail "$o: disklabel -R $vnd"
+	checkdev $o-nogeom /dev/r${vnd}a 8 \
+	    'NO FILE SYSTEM GEOMETRY IN DISKLABEL' -n -f
+	checkdev $o-nogeom /dev/r${vnd}a 8 \
+	    'NO FILE SYSTEM GEOMETRY IN DISKLABEL' -y
+	detach
+	rm -f $img
 }
 
 # No super block at all: the check cannot run, so the exit status is 8.
@@ -177,6 +505,20 @@ badgeom ffs2-big 524288 -O2
 
 badblk ffs1-blk 65536 -O1
 badblk ffs2-blk 65536 -O2
+
+for v in 1 2; do
+	cleanfs ffs$v-clean 131072 -O$v
+	linkcount ffs$v-nlink 65536 -O$v
+	linkcounty ffs$v-nlink 65536 -O$v
+	shortdev ffs$v-short 131072 -O$v -b 16384 -f 2048 -c 4096
+	fits ffs$v-fits -O$v
+	unreadable ffs$v-unread 131072 -O$v -b 16384 -f 2048 -c 4096
+	rootdup ffs$v-root 65536 -O$v
+	rootfile ffs$v-root 65536 -O$v
+	holdbad ffs$v-hold 65536 -O$v
+	badprimary ffs$v-sb -O$v
+	nogeom ffs$v-geom -O$v
+done
 
 for o in 1 2; do
 	for s in 4096 77777 300001 1048599; do
