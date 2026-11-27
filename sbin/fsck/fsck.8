@@ -168,6 +168,30 @@ to all the remaining questions by replying to a question with a value of
 .It Pa /etc/fstab
 file system table
 .El
+.Sh EXIT STATUS
+.Nm
+exits 0 if all file systems were checked successfully or were skipped.
+Otherwise the exit status is non-zero:
+the exit statuses of the file system specific programs,
+described for example in
+.Xr fsck_ffs 8 ,
+are combined with a bitwise OR.
+.Pp
+When the file systems are taken from
+.Xr fstab 5 ,
+some failures stop
+.Nm
+before all file systems have been checked.
+In preen mode, a failed check of a file system with pass number 1
+stops it.
+Otherwise the file systems are checked one at a time in the order of
+.Xr fstab 5 ,
+and
+.Nm
+stops after a check that exits with 2, 4 or 12,
+for example because the root file system was modified and the system
+has to be rebooted;
+other failures do not stop it.
 .Sh SEE ALSO
 .Xr fs 5 ,
 .Xr fstab 5 ,

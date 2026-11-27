@@ -111,9 +111,22 @@ checkfstab(int flags, int maxrun, void *(*docheck)(struct fstab *),
 					else
 						continue;
 				}
-				sumstatus = (*checkit)(fs->fs_vfstype,
+				ret = (*checkit)(fs->fs_vfstype,
 				    name, fs->fs_file, auxarg, NULL);
 
+				/*
+				 * Outside preen, a failed check does not
+				 * stop the others, but a file system that
+				 * asks for a reboot (4) or for single user
+				 * mode (2) does, as before.
+				 */
+				if ((flags & CHECK_PREEN) == 0) {
+					sumstatus |= ret;
+					if (ret & (2 | 4))
+						return (sumstatus);
+					continue;
+				}
+				sumstatus = ret;
 				if (sumstatus)
 					return (sumstatus);
 			} else  {
@@ -129,7 +142,7 @@ checkfstab(int flags, int maxrun, void *(*docheck)(struct fstab *),
 			}
 		}
 		if ((flags & CHECK_PREEN) == 0)
-			return 0;
+			return (sumstatus);
 	}
 
 	if (flags & CHECK_DEBUG)
