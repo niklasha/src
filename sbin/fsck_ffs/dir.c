@@ -258,9 +258,19 @@ adjust(struct inodesc *idesc, short lcnt)
 
 	dp = ginode(idesc->id_number);
 	if (DIP(dp, di_nlink) == lcnt) {
-		if (linkup(idesc->id_number, 0) == 0)
+		if (linkup(idesc->id_number, 0) == 0) {
 			clri(idesc, "UNREF", 0);
-	} else {
+			return;
+		}
+		/*
+		 * linkup() added one reference.  A file with more links,
+		 * such as one whose other names were in a directory that
+		 * was cleared, still needs its link count adjusted.
+		 */
+		lcnt--;
+		dp = ginode(idesc->id_number);
+	}
+	if (lcnt != 0) {
 		pwarn("LINK COUNT %s", (lfdir == idesc->id_number) ? lfname :
 			((DIP(dp, di_mode) & IFMT) == IFDIR ? "DIR" : "FILE"));
 		pinode(idesc->id_number);

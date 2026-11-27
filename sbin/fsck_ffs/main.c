@@ -218,6 +218,15 @@ checkfilesys(char *filesys, char *mntpt, long auxdata, int child)
 	if (debug && preen)
 		pwarn("starting\n");
 
+	/*
+	 * Cleared if any questions answered no, or if blocks could not
+	 * be read or written, including while setup() checks the super
+	 * block it found (setup() sets it again once it has found one).
+	 * Used to decide if the superblock should be marked clean, and
+	 * for the exit status.
+	 */
+	resolved = 1;
+
 	switch ((r = setup(filesys, 0))) {
 	case 0:
 		if (preen)
@@ -235,12 +244,6 @@ checkfilesys(char *filesys, char *mntpt, long auxdata, int child)
 		return (r == 0 ? 8 : 0);
 	}
 	info_filesys = filesys;
-
-	/*
-	 * Cleared if any questions answered no. Used to decide if
-	 * the superblock should be marked clean.
-	 */
-	resolved = 1;
 
 	/*
 	 * 1: scan inodes tallying blocks used
@@ -359,12 +362,24 @@ checkfilesys(char *filesys, char *mntpt, long auxdata, int child)
 	free(sblk.b_un.b_buf);
 	free(asblk.b_un.b_buf);
 
+	if (fsmodified) {
+		if (!preen)
+			printf("\n***** FILE SYSTEM WAS MODIFIED *****\n");
+		if (rerun || !resolved)
+			printf("\n***** PLEASE RERUN FSCK *****\n");
+	}
+	/*
+	 * Inconsistencies that were not repaired (a question answered
+	 * no, as always with -n, a rerun request, or blocks that could
+	 * not be read or written) make the check fail.  A modified root
+	 * file system that cannot be reloaded still returns 4 below, so
+	 * that the system is rebooted instead of running on stale
+	 * in-core data; it has not been marked clean.
+	 */
+	if (!resolved)
+		printf("\n***** UNRESOLVED INCONSISTENCIES REMAIN *****\n");
 	if (!fsmodified)
-		return (0);
-	if (!preen)
-		printf("\n***** FILE SYSTEM WAS MODIFIED *****\n");
-	if (rerun || !resolved)
-		printf("\n***** PLEASE RERUN FSCK *****\n");
+		return (resolved ? 0 : 8);
 	if (hotroot()) {
 		struct statfs stfs_buf;
 		/*
@@ -383,7 +398,7 @@ checkfilesys(char *filesys, char *mntpt, long auxdata, int child)
 				flags |= MNT_UPDATE | MNT_RELOAD;
 				ret = mount(MOUNT_FFS, "/", flags, &args);
 				if (ret == 0)
-					return(0);
+					return (resolved ? 0 : 8);
 			}
 		}
 		if (!preen)
@@ -391,5 +406,5 @@ checkfilesys(char *filesys, char *mntpt, long auxdata, int child)
 		sync();
 		return (4);
 	}
-	return (0);
+	return (resolved ? 0 : 8);
 }

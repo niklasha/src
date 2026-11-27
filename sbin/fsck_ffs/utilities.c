@@ -349,6 +349,9 @@ ckfini(int markclean)
 		free(cgbufs);
 	}
 	pbp = pdirbp = NULL;
+	/* A block written above may have failed. */
+	if (!resolved)
+		markclean = 0;
 	if (markclean && (sblock.fs_clean & FS_ISCLEAN) == 0) {
 		/*
 		 * Mark the file system as clean, and sync the superblock.
@@ -401,13 +404,15 @@ bread(int fd, char *buf, daddr_t blk, long size)
 		}
 	}
 	printf("\n");
+	if (errs)
+		resolved = 0;
 	return (errs);
 }
 
 void
 bwrite(int fd, char *buf, daddr_t blk, long size)
 {
-	int i;
+	int i, errs;
 	char *cp;
 	off_t offset;
 
@@ -420,6 +425,7 @@ bwrite(int fd, char *buf, daddr_t blk, long size)
 		return;
 	}
 	rwerror("WRITE", blk);
+	errs = 0;
 	printf("THE FOLLOWING SECTORS COULD NOT BE WRITTEN:");
 	for (cp = buf, i = 0; i < size; i += secsize, cp += secsize)
 		if (pwrite(fd, cp, secsize, offset + i) != secsize) {
@@ -430,8 +436,12 @@ bwrite(int fd, char *buf, daddr_t blk, long size)
 			else
 				printf(" %lld,", (long long)blk +
 				    i / DEV_BSIZE);
-		}
+			errs++;
+		} else
+			fsmodified = 1;
 	printf("\n");
+	if (errs)
+		resolved = 0;
 	return;
 }
 

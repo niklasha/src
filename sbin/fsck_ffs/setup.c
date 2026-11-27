@@ -66,6 +66,7 @@ static struct disklabel *getdisklabel(char *, int);
 static int readsb(int);
 static int cmpsb(struct fs *, struct fs *);
 static int checkgeom(int);
+static daddr_t devsize(struct stat *, struct disklabel *);
 static char rdevname[PATH_MAX];
 
 long numdirs, listmax, inplast;
@@ -83,6 +84,7 @@ setup(char *dev, int isfsdb)
 	long size, asked, i, j;
 	size_t bmapsize;
 	struct disklabel *lp;
+	daddr_t devblks;
 	off_t sizepb;
 	struct stat statb;
 	struct fs proto;
@@ -210,6 +212,12 @@ found:
 		doskipclean = 0;
 		pwarn("USING ALTERNATE SUPERBLOCK AT %lld\n", (long long)bflag);
 	}
+	/*
+	 * Blocks that could not be read while looking for the super
+	 * block belonged to candidates that were rejected, not to the
+	 * file system that was found.
+	 */
+	resolved = 1;
 	if (debug)
 		printf("clean = %d\n", sblock.fs_clean);
 	if (sblock.fs_clean & FS_ISCLEAN) {
@@ -220,6 +228,25 @@ found:
 		}
 		if (!preen)
 			pwarn("** File system is already clean\n");
+	}
+	/*
+	 * Refuse a file system that extends past the end of its
+	 * partition or image file: its last blocks cannot be read, and
+	 * repairs would write past the end.  Nothing has been written
+	 * yet.
+	 */
+	if ((devblks = devsize(&statb, lp)) != -1 &&
+	    sblock.fs_size > devblks / (sblock.fs_fsize / DEV_BSIZE)) {
+		if (preen)
+			printf("%s: ", cdevname());
+		pfatal("FILE SYSTEM SIZE %lld EXCEEDS %s SIZE %lld "
+		    "(%d-BYTE BLOCKS)",
+		    (long long)sblock.fs_size * (sblock.fs_fsize / DEV_BSIZE),
+		    S_ISREG(statb.st_mode) ? "FILE" : "PARTITION",
+		    (long long)devblks, DEV_BSIZE);
+		/* Not reached in preen: pfatal() ends the line and exits. */
+		printf("\n");
+		return (0);
 	}
 	maxfsblock = sblock.fs_size;
 	maxino = sblock.fs_ncg * sblock.fs_ipg;
@@ -643,6 +670,10 @@ calcsb(char *dev, int devfd, struct fs *fs, struct disklabel *lp,
 	fs->fs_fpg = pp->p_cpg * fs->fs_frag;
 	fs->fs_bsize = fs->fs_fsize * fs->fs_frag;
 	fs->fs_nspf = DL_SECTOBLK(lp, fs->fs_fsize / lp->d_secsize);
+	if (fs->fs_frag == 0 || fs->fs_fpg == 0 || fs->fs_nspf == 0) {
+		pfatal("%s: NO FILE SYSTEM GEOMETRY IN DISKLABEL\n", dev);
+		return (0);
+	}
 	for (fs->fs_fsbtodb = 0, i = NSPF(fs); i > 1; i >>= 1)
 		fs->fs_fsbtodb++;
 	/*
@@ -656,6 +687,30 @@ calcsb(char *dev, int devfd, struct fs *fs, struct disklabel *lp,
 		fs->fs_frag);
 
 	return (1);
+}
+
+/*
+ * Return the size of the partition or image file holding the file
+ * system in DEV_BSIZE blocks, or -1 if it cannot be determined.
+ */
+static daddr_t
+devsize(struct stat *st, struct disklabel *lp)
+{
+	struct partition *pp;
+	u_int part;
+
+	if (S_ISREG(st->st_mode))
+		return (st->st_size / DEV_BSIZE);
+	if ((!S_ISCHR(st->st_mode) && !S_ISBLK(st->st_mode)) || lp == NULL ||
+	    lp->d_secsize < DEV_BSIZE || lp->d_secsize % DEV_BSIZE != 0)
+		return (-1);
+	part = DISKPART(st->st_rdev);
+	if (part >= lp->d_npartitions || part >= MAXPARTITIONS)
+		return (-1);
+	pp = &lp->d_partitions[part];
+	if (DL_GETPSIZE(pp) == 0)
+		return (-1);
+	return (DL_SECTOBLK(lp, DL_GETPSIZE(pp)));
 }
 
 static struct disklabel *

@@ -98,6 +98,14 @@ pass2(void)
 			freeino(ROOTINO);
 			if (allocdir(ROOTINO, ROOTINO, 0755) != ROOTINO)
 				errexit("CANNOT ALLOCATE ROOT INODE\n");
+			/*
+			 * The old root directory was cached in pass 1 and
+			 * its blocks are still checked below as if they
+			 * belonged to the new one, which leaves an EXTRA
+			 * '..' entry and disconnected directories behind.
+			 * Do not mark the file system clean.
+			 */
+			rerun = 1;
 			break;
 		}
 		if (reply("CONTINUE") == 0) {

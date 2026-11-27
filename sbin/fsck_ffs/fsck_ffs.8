@@ -204,6 +204,10 @@ which is assumed to be affirmative.
 The filesystem will not be opened for writing.
 This is the default for file systems to be checked that are
 concurrently mounted writable.
+If any inconsistency is found,
+.Nm
+exits with a status of 8; see
+.Sx EXIT STATUS .
 .It Fl p
 Enter preen mode:
 .Nm
@@ -309,6 +313,46 @@ If there is insufficient space, its size is increased.
 .Pp
 Because of inconsistencies between the block device and the buffer cache,
 the raw device should always be used.
+.Sh EXIT STATUS
+.Bl -tag -width Ds
+.It 0
+The file system is consistent, possibly after repairs,
+or it is clean and was not checked.
+.It 1
+A usage error occurred.
+.It 2
+In preen mode, a
+.Dv QUIT
+signal was received.
+The checks were completed, but the system should not come up multiuser.
+.It 4
+The root file system was modified and could not be reloaded.
+The system must be rebooted before it is used;
+.Xr rc 8
+does this.
+.It 8
+The check failed.
+Either the file system could not be checked at all,
+for example because no valid super block was found
+or the file system is larger than its partition;
+or preen mode found an inconsistency it does not fix;
+or inconsistencies remain unresolved, which is reported as
+.Dq UNRESOLVED INCONSISTENCIES REMAIN .
+Inconsistencies remain unresolved if a question was answered
+.Dq no ,
+which is always the case with
+.Fl n ,
+if blocks could not be read or written,
+or if
+.Nm
+has to be run again.
+In these cases
+.Nm
+does not mark the file system clean.
+.It 12
+.Nm
+was interrupted.
+.El
 .Sh DIAGNOSTICS
 The diagnostics produced by
 .Nm

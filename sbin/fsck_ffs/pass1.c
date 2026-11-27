@@ -224,6 +224,7 @@ checkinode(ino_t inumber, struct inodesc *idesc)
 		DIP_SET(dp, di_size, sblock.fs_fsize);
 		DIP_SET(dp, di_mode, IFREG|0600);
 		inodirty();
+		mode = IFREG;
 	}
 	lndb = howmany(DIP(dp, di_size), sblock.fs_bsize);
 	ndb = lndb > (u_int64_t)INT_MAX ? -1 : (int)lndb;
