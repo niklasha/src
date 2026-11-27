@@ -57,6 +57,7 @@
 #endif	/* VIRTIO_DEBUG */
 
 extern struct vmd *env;
+extern struct vmd_vm *current_vm;
 
 struct virtio_dev viornd;
 struct virtio_dev *vioscsi = NULL;
@@ -915,6 +916,7 @@ vmmci_ctl(struct virtio_dev *dev, unsigned int cmd)
 	case VMMCI_REBOOT:
 		/* Update command */
 		v->cmd = cmd;
+		v->acked = 0;
 
 		/*
 		 * vmm VMs do not support powerdown, send a reboot request
@@ -995,8 +997,11 @@ vmmci_ack(struct virtio_dev *dev, unsigned int cmd)
 		 * killing it forcefully.
 		 */
 		if (cmd == v->cmd) {
-			log_debug("%s: vm %u acknowledged shutdown request",
-			    __func__, dev->vm_id);
+			log_info("vm %s (id %u): guest acknowledged the %s "
+			    "request", current_vm->vm_params.vmc_name,
+			    dev->vm_id, cmd == VMMCI_REBOOT ? "reboot" :
+			    "shutdown");
+			v->acked = 1;
 			vm_pipe_send(&v->dev_pipe, VMMCI_SET_TIMEOUT_LONG);
 		}
 		break;
@@ -1016,13 +1021,32 @@ vmmci_timeout(int fd, short type, void *arg)
 {
 	struct virtio_dev *dev = (struct virtio_dev *)arg;
 	struct vmmci_dev *v = NULL;
+	const char *name = current_vm->vm_params.vmc_name;
+	const char *req;
+	enum vmmci_cmd cmd;
+	int acked;
 
 	if (dev->device_id != PCI_PRODUCT_VIRTIO_VMMCI)
 		fatalx("%s: device is not a vmmci device", __func__);
 	v = &dev->vmmci;
 
-	log_debug("vm %u shutdown", dev->vm_id);
-	vm_shutdown(v->cmd == VMMCI_REBOOT ? VMMCI_REBOOT : VMMCI_SHUTDOWN);
+	mutex_lock(&v->mutex);
+	cmd = v->cmd;
+	acked = v->acked;
+	mutex_unlock(&v->mutex);
+
+	req = cmd == VMMCI_REBOOT ? "reboot" : "shutdown";
+	if (cmd != VMMCI_SHUTDOWN && cmd != VMMCI_REBOOT)
+		log_debug("vm %u shutdown", dev->vm_id);
+	else if (!acked)
+		log_warnx("vm %s (id %u): no vmmci acknowledgement of the %s "
+		    "request within %d s, powering off", name, dev->vm_id,
+		    req, VMMCI_TIMEOUT_SHORT);
+	else
+		log_warnx("vm %s (id %u): guest acknowledged the %s request "
+		    "but did not stop within %d s, powering off", name,
+		    dev->vm_id, req, VMMCI_TIMEOUT_LONG);
+	vm_shutdown(cmd == VMMCI_REBOOT ? VMMCI_REBOOT : VMMCI_SHUTDOWN);
 }
 
 int

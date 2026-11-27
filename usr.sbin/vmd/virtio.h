@@ -336,6 +336,7 @@ struct vmmci_dev {
 	struct event timeout;
 	struct timeval time;
 	enum vmmci_cmd cmd;
+	int acked;			/* guest acked cmd */
 
 	pthread_mutex_t mutex;
 	struct vm_dev_pipe dev_pipe;

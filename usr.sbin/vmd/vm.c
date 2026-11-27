@@ -380,12 +380,22 @@ vm_dispatch_vmm(int fd, short event, void *arg)
 			    sizeof(verbose));
 			break;
 		case IMSG_VMDOP_VM_SHUTDOWN:
-			if (vmmci_ctl(&vmmci, VMMCI_SHUTDOWN) == -1)
+			if (vmmci_ctl(&vmmci, VMMCI_SHUTDOWN) == -1) {
+				log_warnx("vm %s (id %u): no vmmci driver "
+				    "attached in the guest for the shutdown "
+				    "request, powering off",
+				    vm->vm_params.vmc_name, vm->vm_vmid);
 				_exit(0);
+			}
 			break;
 		case IMSG_VMDOP_VM_REBOOT:
-			if (vmmci_ctl(&vmmci, VMMCI_REBOOT) == -1)
+			if (vmmci_ctl(&vmmci, VMMCI_REBOOT) == -1) {
+				log_warnx("vm %s (id %u): no vmmci driver "
+				    "attached in the guest for the reboot "
+				    "request, powering off",
+				    vm->vm_params.vmc_name, vm->vm_vmid);
 				_exit(0);
+			}
 			break;
 		case IMSG_VMDOP_PAUSE_VM:
 			vmr.vmr_result = 0;
